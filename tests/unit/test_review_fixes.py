@@ -30,6 +30,8 @@ def _reqs(eng, actor="u1"):
             if eng.store.get_request(r[0])["actor_id"] == actor]
 
 def _price_turn(eng, cid, text, vehicle="Creta", price_kind="list", variant="Cao cấp"):
+    if price_kind == "list" and "niêm yết" not in text.casefold():
+        text += " niêm yết"
     return eng.process(ev(cid, text), PC, sem([
         dict(op="START_REQUEST", request_ref="topic:price", evidence_excerpt=text,
              slot=dict(kind="vehicle", value=vehicle)),

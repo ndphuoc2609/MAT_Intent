@@ -17,37 +17,36 @@ def _canon(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
 
 def _slot_logical(slots) -> dict:
-    out = {}
-    for k, v in (slots or {}).items():
-        out[k] = v.get("value") if isinstance(v, dict) else v
-    return out
+    # Keep every field that can change grounding or policy, including lineage;
+    # random request/pending handles are mapped separately.
+    return dict(slots or {})
 
 def request_logical_key(req: dict) -> str:
-    """Handle logic của request: topic + identity slots (không dùng id ngẫu nhiên)."""
-    slots = _slot_logical(req.get("slots"))
-    ident = {k: slots[k] for k in ("vehicle", "variant") if k in slots}
-    return _canon({"topic": req.get("topic"), "identity": ident})
+    """Logical request identity with all slots/outcomes and no random request id."""
+    return _canon({k: req.get(k) for k in ("page_id", "post_id", "thread_root_id", "actor_id",
+                                           "topic", "status", "version", "desired_outcomes")} |
+                   {"slots": _slot_logical(req.get("slots"))})
 
 def pending_logical_key(pend: dict, req_by_id=None) -> str:
-    """Handle logic của pending: request logic + qtype + expected_slot + options."""
+    """Logical pending identity with proposition, status, options and basis."""
     req_key = None
     if req_by_id is not None and pend.get("request_id") in (req_by_id or {}):
         req_key = request_logical_key(req_by_id[pend["request_id"]])
-    return _canon({"request": req_key, "qtype": pend.get("qtype"),
-                   "expected_slot": pend.get("expected_slot"),
-                   "options": pend.get("options")})
+    return _canon({"request": req_key, **{k: pend.get(k) for k in
+                   ("actor_id", "status", "version", "qtype", "expected_slot", "options",
+                    "proposition", "issued_at", "expires_at", "basis_version", "basis_slots")}})
 
-def state_fingerprint(requests, pendings, recent_texts) -> str:
+def state_fingerprint(requests, pendings, recent_texts, *, context=None, policy=None) -> str:
     """Fingerprint state trước lượt: requests (logical) + pendings mở (logical)
     + recent texts. Id ngẫu nhiên KHÔNG nằm trong fingerprint (resume sang
     engine mới vẫn khớp nếu nội dung logic giống nhau)."""
     req_by_id = {r.get("id"): r for r in (requests or []) if r.get("id")}
-    reqs = sorted(request_logical_key(r) + "|" + str(r.get("status"))
-                  for r in (requests or []))
+    reqs = sorted(request_logical_key(r) for r in (requests or []))
     pends = sorted(pending_logical_key(p, req_by_id)
                    for p in (pendings or []) if p.get("status") == "OPEN")
     return hashlib.sha256(_canon({"requests": reqs, "pendings": pends,
-                                  "recent": list(recent_texts or [])}).encode()).hexdigest()
+                                  "recent": list(recent_texts or []), "context": context,
+                                  "policy": policy}).encode()).hexdigest()
 
 def full_cache_key(*, comment, parent, postcard, state_fp, system, schema,
                    model) -> str:

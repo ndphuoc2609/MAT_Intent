@@ -43,7 +43,7 @@ class MetaWebhookTests(unittest.TestCase):
             "post_id": "123_456",
             "comment_id": "456_789",
             "parent_id": "123_456",
-            "thread_root_id": "123_456",
+            "thread_root_id": "456_789",
             "text": "Creta còn màu trắng không?",
             "event_type": "create",
             "content_version": 1,

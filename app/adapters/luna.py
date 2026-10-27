@@ -5,11 +5,17 @@ ERROR dict — không bao giờ tự bịa extraction khi API lỗi.
 Prompt schema v1 đầy đủ nằm trong SYSTEM; xem config/schema_versions/semantic_v1.json.
 """
 from __future__ import annotations
-import json, os, random, time, urllib.error, urllib.request
-from ..semantics import parse_json_strict
+import json, math, os, random, time, urllib.error, urllib.request
+from pathlib import Path
+from ..semantics import normalize_model_semantic, parse_json_strict, semantic_model_json_schema
 
 MODEL = "openai/gpt-6-luna"
 PRICE = {"prompt": 0.0000001, "completion": 0.0000005}
+SCHEMA_VERSION = "1"
+SCHEMA_PATH = Path(__file__).resolve().parents[2] / "config" / "schema_versions" / "semantic_v1.json"
+with SCHEMA_PATH.open(encoding="utf-8") as _schema_file:
+    SEMANTIC_SCHEMA = json.load(_schema_file)
+STRICT_SEMANTIC_SCHEMA = semantic_model_json_schema(SCHEMA_VERSION)
 
 SYSTEM = """Bạn là semantic parser cho comment Facebook tiếng Việt của Page ô tô Hyundai.
 CHỈ trả JSON đúng schema v1, không giải thích thêm.
@@ -23,7 +29,7 @@ CHỈ trả JSON đúng schema v1, không giải thích thêm.
    "polarity": "positive|negative|conditional|unknown"}],
  "operations": [{"op": "START_REQUEST|UPDATE_SLOT|ANSWER_PENDING|CONFIRM_PENDING|REJECT_PENDING|CANCEL_REQUEST|SET_CONTACT_PREFERENCE|REQUEST_HUMAN|REPORT_COMPLAINT|SOCIAL_ACK|UNRESOLVED",
    "request_ref": "topic:<topic> hoặc id request nếu context cho",
-   "slot": {"kind": "vehicle|variant|color|location|price_kind|down_payment|datetime|dealer|service_topic|compare_vehicle", "value": "giá trị thô hoặc số, down_payment là {amount, unit|null}", "explicit": true},
+   "slot": {"kind": "vehicle|variant|color|location|price_kind|down_payment|datetime|dealer|service_topic|compare_vehicle", "value": "giá trị thô hoặc số, down_payment là {amount, unit|null}", "evidence_excerpt": "trích riêng phần chứng minh slot nếu explicit", "explicit": true, "source_message_id": "...", "source_actor_id": "...", "source_state_token": "..."},
    "evidence_excerpt": "trích nguyên văn từ comment (hoặc parent/root nếu suy luận từ đó)",
    "pending_id": "chỉ khi trả lời/xác nhận pending trong context",
    "scope": "call|public_reply|inbox|all (chỉ cho SET_CONTACT_PREFERENCE)",
@@ -41,6 +47,11 @@ QUY TẮC BẮT BUỘC:
 - Sarcasm: khen ngược/mỉa mai = present; không chắc = uncertain; không dùng số confidence.
 - different_action=true CHỈ khi hai cách hiểu đều hợp lý theo context và dẫn tới trạng thái/hiệu ứng xử lý khác nhau thật sự (VD: hủy khác đổi giờ, gửi khác không gửi). Nếu cùng dẫn tới một trạng thái/hiệu ứng, chọn cách hiểu hợp ngữ cảnh nhất và đặt different_action=false; không flag chỉ vì cách diễn đạt có thể phân tích khác nhau.
 - Evidence phải là trích nguyên văn có trong comment/parent/root đã cho; không bịa excerpt.
+- Slot explicit phải được chứng minh bởi chính evidence_excerpt (value hoặc alias đã biết phải xuất hiện trong excerpt); không dùng một từ khác trong câu để hợp thức hóa slot.
+- evidence_excerpt ở operation chứng minh intent; slot.evidence_excerpt chứng minh riêng slot. Không dùng excerpt intent để chứng minh slot nếu chúng khác nhau.
+- Slot kế thừa phải có explicit=false, source_message_id, source_actor_id và source_state_token đúng từ context; chỉ kế thừa state của cùng actor trong cùng post/thread. Không lấy thuộc tính của actor khác.
+- Không coi câu trả lời cũ của model là fact. Post là bối cảnh chung; nếu suy xe từ post đơn xe, đánh dấu explicit=false và trỏ source_message_id tới post.
+- Persona/tone chỉ áp dụng sau khi policy quyết định; không đổi sentiment, intent, polarity hoặc slot extraction.
 - down_payment: "200" không kèm đơn vị thì unit=null, KHÔNG tự gán triệu.
 - price_kind: "lăn bánh"=otr, "niêm yết"=list, "giá" chung chung thì để price_kind trống và UNRESOLVED? Không: vẫn START_REQUEST price, không đặt slot price_kind.
 - sentiment độc lập với intent; spam là scope, không phải topic.
@@ -62,6 +73,7 @@ QUY TẮC BẮT BUỘC:
 - Cụm chỉ kênh liên hệ ("đừng gọi nữa", "gửi tại đây thôi", "nhắn tin thôi", "đừng nhắn tin") = CHỈ SET_CONTACT_PREFERENCE, không START request mới, không hỏi lại nhu cầu.
 - Follow-up stock/testdrive không nêu xe/phiên bản: mang vehicle/variant từ request gần nhất của đúng người trong context sang request mới (explicit=false), không hỏi lại xe khi context đã rõ.
 - request_ref LUÔN là "topic:<topic>" (VD topic:price, topic:testdrive). KHÔNG BAO GIỜ điền pending id (q_...) vào request_ref; pending id chỉ nằm ở trường pending_id của ANSWER/CONFIRM/REJECT_PENDING.
+- Strict output yêu cầu mọi field của schema: field tùy chọn không áp dụng phải trả null; trong slot.extra, kind không dùng phải là null. Không tự tạo fact để điền field.
 """
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -80,13 +92,40 @@ def call_luna(post: str, comment: str, parent: str = "", context: str = "",
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not api_key:
         return dict(ok=False, error="Set OPENROUTER_API_KEY in the process environment", attempts=0)
-    user = (f"Post: {post}\nParent/root: {parent}\nContext (requests/pending gần nhất của đúng người): {context}\n"
-            f"Comment cần phân tích: {comment}")
+    try:
+        context_obj = parse_json_strict(context) if context else None
+    except (TypeError, ValueError):
+        context_obj = None
+    if isinstance(context_obj, dict) and context_obj.get("format") == "mat_intent_context_v1":
+        post_obj = dict(context_obj.get("postcard") or {})
+        post_obj.setdefault("text", post)
+        messages = [m for m in context_obj.get("messages", [])
+                    if isinstance(m, dict) and m.get("role") not in ("post", "current")]
+        current = next((m for m in context_obj.get("messages", [])
+                        if isinstance(m, dict) and m.get("role") == "current"), {})
+        user = json.dumps({"format": "mat_intent_input_v1", "post": post_obj,
+            "root_and_parent_messages": messages,
+            "recent_actor_messages": context_obj.get("recent", []),
+            "active_requests": context_obj.get("active_requests", []),
+            "pending": context_obj.get("pending", []),
+            "contact_blocks": context_obj.get("contact_blocks", []),
+            "prior_customer_turns": context_obj.get("prior_customer_turns", []),
+            "recent_bot_replies": context_obj.get("recent_bot_replies", []),
+            "current_comment": {"message_id": current.get("message_id"),
+                                "actor_id": current.get("actor_id"),
+                                "actor_role": current.get("role", "current"),
+                                "text": comment}}, ensure_ascii=False, separators=(",", ":"))
+    else:
+        user = (f"Post: {post}\nParent/root: {parent}\nContext (requests/pending gần nhất của đúng người): {context}\n"
+                f"Comment cần phân tích: {comment}")
     if repair_note: user += f"\nLưu ý sửa lại (chỉ sửa phần lỗi, giữ nguyên phần đúng): {repair_note}"
     payload = {"model": model, "messages": [{"role": "system", "content": SYSTEM},
                                             {"role": "user", "content": user}],
                "temperature": 0.0, "max_tokens": max_tokens,
-               "response_format": {"type": "json_object"}}
+               "response_format": {"type": "json_schema", "json_schema": {
+                   "name": "mat_intent_semantic_v1", "strict": True,
+               "schema": STRICT_SEMANTIC_SCHEMA}},
+               "provider": {"require_parameters": True}}
     last_err = None
     attempts = 0
     unknown_failed_attempt = False
@@ -115,22 +154,25 @@ def call_luna(post: str, comment: str, parent: str = "", context: str = "",
                 semantic = parse_json_strict(content)
                 if not isinstance(semantic, dict):
                     raise ValueError("model response must be a JSON object")
+                semantic = normalize_model_semantic(semantic)
             except (TypeError, ValueError) as e:
                 last_err = f"invalid model JSON: {e}"[:500]
                 break
             # A8: chỉ tính cost khi cả hai token counts là số nguyên không âm.
+            model_effective = out.get("model", model)
             cost, cost_unknown = None, True
-            if isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0
-                                               for k in ("prompt_tokens", "completion_tokens")):
-                try:
-                    cost = (usage["prompt_tokens"] * PRICE["prompt"]
-                            + usage["completion_tokens"] * PRICE["completion"])
-                    cost_unknown = False
-                except OverflowError:
-                    pass
+            reported_cost = (usage.get("cost") if isinstance(usage, dict) else None)
+            if reported_cost is None: reported_cost = out.get("cost")
+            if type(reported_cost) in (int, float) and math.isfinite(reported_cost) and reported_cost >= 0:
+                cost, cost_unknown = float(reported_cost), False
+            elif model_effective == MODEL and isinstance(usage, dict) and all(
+                    type(usage.get(k)) is int and usage[k] >= 0
+                    for k in ("prompt_tokens", "completion_tokens")):
+                cost = usage["prompt_tokens"] * PRICE["prompt"] + usage["completion_tokens"] * PRICE["completion"]
+                cost_unknown = False
             return dict(ok=True, semantic=semantic, raw_text=content, usage=usage,
                         cost_usd_est=cost, cost_unknown=cost_unknown,
-                        model_effective=out.get("model", model), attempts=attempts,
+                        model_effective=model_effective, attempts=attempts,
                         retry_cost_usd_est=0.0 if attempts > 1 and not unknown_failed_attempt else None,
                         retry_cost_unknown=attempts > 1 and unknown_failed_attempt)
         except urllib.error.HTTPError as e:

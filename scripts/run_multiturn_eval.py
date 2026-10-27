@@ -13,7 +13,7 @@ mỗi call và mỗi repair.
 Usage: python3 scripts/run_multiturn_eval.py --input datasets/multiturn/dev.jsonl \
   --out runs/mt_dev_v2.json --ckdir runs/mt_checkpoints_v2
 """
-import argparse, hashlib, json, os, sys
+import argparse, hashlib, json, os, sys, uuid
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from datetime import datetime, timezone
@@ -22,28 +22,45 @@ from app.semantics import validate_semantic
 from app.harness import make_engine
 from app.engine import Clock
 from app.facts import Facts
+from app.policy import AUTO_ACTIONS, HANDOFF_SLA_HOURS, PENDING_TTL_HOURS
 
-def fmt_context(ctx):
-    lines = []
-    if ctx["recent"]:
-        lines.append("Câu gần nhất của bạn: " + " | ".join(r["text"] for r in ctx["recent"]))
-    if ctx["active_requests"]:
-        parts = []
-        for r in ctx["active_requests"]:
-            slots = {k: v.get("value") for k, v in (r.get("slots") or {}).items()}
-            # R13: context phải có request id để model tham chiếu đúng request.
-            parts.append(f"id={r.get('id')} {r['topic']}={r['status']} slots={slots}")
-        lines.append("Requests đang mở của bạn: " + "; ".join(parts))
-    if ctx["pending"]:
-        parts = []
-        for p in ctx["pending"]:
-            if isinstance(p, dict):
-                # R13: pending phải có request_id + qtype (trước đây thiếu cả hai).
-                parts.append(f"id={p.get('id')} request_id={p.get('request_id')} loại={p.get('qtype')} hỏi='{p.get('proposition')}' cần_slot={p.get('expected_slot')} lựa_chọn={p.get('options')}")
-            else:
-                parts.append(str(p))
-        lines.append("Câu hỏi đang chờ bạn trả lời (dùng đúng id này cho ANSWER/CONFIRM_PENDING): " + "; ".join(parts))
-    return "\n".join(lines)
+CONTEXT_TOKEN_LIMIT = 12000
+CONTEXT_CHAR_LIMIT = CONTEXT_TOKEN_LIMIT * 3
+
+
+def _over_context_budget(serialized):
+    # shortcut: UTF-8 bytes/3 estimates tokens; use a provider tokenizer when one is available.
+    return len(serialized.encode("utf-8")) > CONTEXT_TOKEN_LIMIT * 3
+
+
+def fmt_context(ctx, *, prior_customer_turns=None):
+    """Serialize context as a bounded object; drop old low-priority messages whole."""
+    recent = list(ctx.get("recent") or [])
+    bot = list(ctx.get("recent_bot_replies") or [])
+    prior = list(prior_customer_turns or [])
+    messages = list(ctx.get("messages") or [])
+    if not any(m.get("role") in ("root", "parent") for m in messages if isinstance(m, dict)):
+        messages += [{"role": "parent", "text": text} for text in ctx.get("parent_texts", [])
+                     if isinstance(text, str)]
+    payload = {
+        "format": "mat_intent_context_v1", "state_token": ctx.get("state_token"),
+        "postcard": ctx.get("postcard") or {}, "messages": messages,
+        "recent": recent, "active_requests": ctx.get("active_requests") or [],
+        "pending": ctx.get("pending") or [], "contact_blocks": ctx.get("contact_blocks") or [],
+        "prior_customer_turns": prior,
+        "recent_bot_replies": [{"text": x, "verified_fact": False} for x in bot],
+    }
+    encode = lambda: json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    while _over_context_budget(encode()) and recent:
+        recent.pop()  # newest is first; discard only the oldest whole message
+    while _over_context_budget(encode()) and prior:
+        prior.pop(0)
+    while _over_context_budget(encode()) and bot:
+        bot.pop(0)
+        payload["recent_bot_replies"] = [{"text": x, "verified_fact": False} for x in bot]
+    if _over_context_budget(encode()):
+        raise ValueError("required post/root/parent/current/state context exceeds budget")
+    return encode()
 
 def snapshot(eng, page, actor):
     with eng.store.lock:
@@ -64,6 +81,7 @@ def main():
     ap.add_argument("--prior-cost", type=float, default=0.0392)
     ap.add_argument("--max-calls", type=int, default=300)
     ap.add_argument("--max-cost", type=float, default=2.00)
+    ap.add_argument("--reserve-cost", type=float, default=0.00032)
     args = ap.parse_args()
     os.makedirs(args.ckdir, exist_ok=True)
     schema = open(os.path.join(ROOT, "config", "schema_versions", "semantic_v1.json")).read()
@@ -97,7 +115,8 @@ def main():
             req_before, pend_before, out_before = snapshot(eng, "page_hyundai_sample", actor)
             # Cache key v2 (R13): gồm cả state fingerprint (requests/pendings
             # dạng logical + recent texts), không chỉ text+prompt+model.
-            from scripts.cache_key import full_cache_key, state_fingerprint, is_legacy_checkpoint
+            from scripts.cache_key import (full_cache_key, state_fingerprint, is_legacy_checkpoint,
+                                           request_logical_key, pending_logical_key)
             from scripts import budget_ledger
             actor_reqs = [r for r in req_before if r.get("actor_id") == actor]
             actor_pends = [p for p in pend_before if p.get("actor_id") == actor]
@@ -108,9 +127,29 @@ def main():
                 full_pends.append(dict(p, qtype=full.get("qtype"),
                                        expected_slot=full.get("expected_slot"),
                                        options=full.get("options")))
+            cache_context = {
+                "scope": {k: ctx.get("event", {}).get(k)
+                          for k in ("page_id", "post_id", "thread_root_id", "actor_id")},
+                "messages": [{k: m.get(k) for k in ("role", "actor_id", "text")}
+                             for m in ctx.get("messages", []) if m.get("role") != "current"],
+                "recent": [{k: m.get(k) for k in ("actor_id", "text")}
+                           for m in ctx.get("recent", [])],
+                "requests": sorted(request_logical_key(r) for r in actor_reqs),
+                "pendings": sorted(pending_logical_key(p, {r["id"]: r for r in actor_reqs})
+                                   for p in full_pends if p.get("status") == "OPEN"),
+                "contact_blocks": ctx.get("contact_blocks", []),
+            }
             state_fp = state_fingerprint(actor_reqs, full_pends,
-                                         [r["text"] for r in ctx["recent"]])
-            cache_key = full_cache_key(comment=text, parent="", postcard=pc,
+                                         [r["text"] for r in ctx["recent"]],
+                                         context=cache_context,
+                                         policy={"facts_version": eng.facts.version,
+                                                 "kill_switch": eng.kill_switch,
+                                                 "auto_actions": sorted(AUTO_ACTIONS),
+                                                 "handoff_sla_hours": HANDOFF_SLA_HOURS,
+                                                 "pending_ttl_hours": PENDING_TTL_HOURS})
+            parent_context = [m.get("text", "") for m in ctx.get("messages", [])
+                              if m.get("role") in ("root", "parent")]
+            cache_key = full_cache_key(comment=text, parent=parent_context, postcard=pc,
                                        state_fp=state_fp, system=SYSTEM, schema=schema,
                                        model=MODEL)
             ck = os.path.join(args.ckdir, f"{conv['id']}_{ti}.json")
@@ -151,24 +190,27 @@ def main():
                 return True, "ok"
             def _make_hook():
                 # Guard per-attempt (A8): adapter gọi hook này trước MỖI
-                # HTTP attempt (kể cả retry). inflight đếm attempt của call
-                # đang chạy để retry không vượt cap.
-                inflight = [0]
+                # HTTP attempt (kể cả retry); reservation ghi atomically trước network.
+                reservations = []
                 def hook():
-                    if lunk0 > 0 or run_unknown: return False
-                    if lc0 + args.prior_calls + total_calls + inflight[0] + 1 > args.max_calls:
-                        return False
-                    inflight[0] += 1
-                    return True
-                return hook
+                    reservation_id = uuid.uuid4().hex
+                    allowed, _ = budget_ledger.reserve(
+                        budget_ledger.DEFAULT_PATH, reservation_id=reservation_id,
+                        max_calls=args.max_calls, max_cost=args.max_cost,
+                        reserve_cost_usd=args.reserve_cost,
+                        prior_calls=args.prior_calls, prior_cost=args.prior_cost)
+                    if allowed: reservations.append(reservation_id)
+                    return allowed
+                return hook, reservations
             if sem is None:
                 ok, reason = _guard()
                 if not ok:
                     print(f"BUDGET STOP trước {conv['id']} turn {ti}: {reason}")
                     budget_hit = True; break
                 post_str = f"{pc.get('topic')} ({', '.join(pc.get('vehicles') or [])})"
+                call_guard, reservations = _make_hook()
                 api = call_luna(post_str, text, parent="", context=ctx_str,
-                                budget_guard=_make_hook())
+                                budget_guard=call_guard)
                 attempts, cost = api.get("attempts", 1), api.get("cost_usd_est")
                 total_calls += attempts; total_cost += cost or 0.0
                 if cost is None: run_unknown = True
@@ -179,6 +221,7 @@ def main():
                                          model=api.get("model_effective", MODEL),
                                          status=None if api.get("ok") else
                                          ("failed" if cost is not None else "unknown_cost"))
+                    budget_ledger.settle_reservations(budget_ledger.DEFAULT_PATH, reservations)
                 if api.get("ok"):
                     sem, model_eff = api["semantic"], api.get("model_effective", MODEL)
                     val_errs = validate_semantic(sem, text, [r["text"] for r in ctx["recent"]] + ctx["parent_texts"])
@@ -188,18 +231,19 @@ def main():
                             print(f"BUDGET STOP trước repair {conv['id']} turn {ti}: {reason2}")
                             budget_hit = True
                         else:
+                            repair_guard, reservations = _make_hook()
                             rep = call_luna(post_str, text, parent="", context=ctx_str,
-                                            repair_note="; ".join(val_errs),
-                                            budget_guard=_make_hook())
+                                            repair_note="; ".join(val_errs), budget_guard=repair_guard)
                             attempts += rep.get("attempts", 1); total_calls += rep.get("attempts", 1)
                             _rc = rep.get("cost_usd_est")
                             cost = (cost or 0.0) + (_rc or 0.0); total_cost += _rc or 0.0
                             if _rc is None: run_unknown = True
                             budget_ledger.record(budget_ledger.DEFAULT_PATH, run_id=os.path.basename(args.out),
                                                  kind="repair", attempts=rep.get("attempts", 1),
-                                                 cost_usd_est=rep.get("cost_usd_est") if rep.get("ok") else 0.0,
+                                                 cost_usd_est=rep.get("cost_usd_est"),
                                                  model=rep.get("model_effective", MODEL),
                                                  status=None if rep.get("ok") else "failed")
+                            budget_ledger.settle_reservations(budget_ledger.DEFAULT_PATH, reservations)
                             if rep.get("ok"):
                                 sem = rep["semantic"]
                                 val_errs = validate_semantic(sem, text, [r["text"] for r in ctx["recent"]] + ctx["parent_texts"])

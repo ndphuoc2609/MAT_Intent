@@ -11,20 +11,26 @@ from app.harness import make_engine
 from app.facts import Facts, SEED_FACTS
 from app.engine import Clock
 
-def resolve(sem, eng, actor):
+def resolve(sem, eng, event):
     if sem is None: return None
     sem = copy.deepcopy(sem)
+    scope = (event.get("page_id"), event.get("post_id"), event.get("thread_root_id"))
     def rep(obj):
         if isinstance(obj, dict):
             return {k: rep(v) for k, v in obj.items()}
         if isinstance(obj, list): return [rep(v) for v in obj]
         if obj == "$PENDING":
-            pend = eng.store.open_pending_for(actor)
+            if not all(scope): return "$PENDING_MISSING"
+            pend = eng.store.open_pending_for(event["actor_id"], page_id=scope[0],
+                                              post_id=scope[1], thread_root_id=scope[2])
             return pend[-1]["id"] if pend else "$PENDING_MISSING"
         if obj == "$OTHER_REQUEST":
-            rows = eng.store.conn.execute("SELECT id, actor_id FROM requests").fetchall()
-            for rid, a in rows:
-                if a != actor: return rid
+            if not all(scope): return "$OTHER_MISSING"
+            rows = eng.store.conn.execute(
+                "SELECT id, actor_id FROM requests WHERE page_id=? AND post_id=? AND thread_root_id=?",
+                scope).fetchall()
+            for rid, actor in rows:
+                if actor != event["actor_id"]: return rid
             return "$OTHER_MISSING"
         return obj
     return rep(sem)
@@ -64,9 +70,11 @@ def main():
     split = "all"; only = set()
     if "--split" in args: split = args[args.index("--split") + 1]
     if "--only" in args: only = set(args[args.index("--only") + 1:])
+    out_dir = os.environ.get("MAT_INTENT_CONTRACT_DIR", os.path.join(ROOT, "runs"))
+    if "--out-dir" in args: out_dir = args[args.index("--out-dir") + 1]
     path = os.path.join(ROOT, "datasets", "contract_regression", "scenarios.jsonl")
     scens = [json.loads(l) for l in open(path) if l.strip()]
-    os.makedirs(os.path.join(ROOT, "runs", "checkpoints"), exist_ok=True)
+    os.makedirs(os.path.join(out_dir, "checkpoints"), exist_ok=True)
     results = []
     for scen in scens:
         if only and scen["id"] not in only: continue
@@ -77,7 +85,7 @@ def main():
         traces = []
         for turn in scen["turns"]:
             if turn.get("advance_hours"): clock.advance(hours=turn["advance_hours"])
-            sem = resolve(turn.get("semantic"), eng, turn["event"]["actor_id"])
+            sem = resolve(turn.get("semantic"), eng, turn["event"])
             res = eng.process(turn["event"], scen["postcard"], sem)
             traces.append(dict(turn=turn["event"]["comment_id"], result={
                 k: v for k, v in res.items() if k != "audit"}))
@@ -95,7 +103,7 @@ def main():
                    actors=len({t["event"]["actor_id"] for t in scen["turns"]}),
                    passed=not fails, fails=fails)
         results.append(rec)
-        with open(os.path.join(ROOT, "runs", "checkpoints", scen["id"] + ".json"), "w") as f:
+        with open(os.path.join(out_dir, "checkpoints", scen["id"] + ".json"), "w") as f:
             json.dump(rec, f, ensure_ascii=False, indent=2)
     passed = sum(1 for r in results if r["passed"])
     by_split = {}
@@ -109,7 +117,7 @@ def main():
                    by_split=by_split, multi_turn_scenarios=multi,
                    multi_user_scenarios=multiu, error_race_scenarios=err,
                    failures=[r for r in results if not r["passed"]])
-    with open(os.path.join(ROOT, "runs", "contract_run.json"), "w") as f:
+    with open(os.path.join(out_dir, "contract_run.json"), "w") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(f"contract: {passed}/{len(results)} pass  by_split={by_split} "
           f"multi_turn={multi} multi_user={multiu} error_race={err}")

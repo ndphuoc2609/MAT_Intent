@@ -56,6 +56,7 @@ def canon_location(raw: str | None):
 
 PRICE_KINDS = {"niem yet": "list", "list": "list", "lan banh": "otr", "otr": "otr",
                "gia lan banh": "otr", "gia niem yet": "list"}
+SERVICE_TOPICS = {"bao hanh": "warranty", "warranty": "warranty"}
 def canon_price_kind(raw):
     if raw is None: return None
     return PRICE_KINDS.get(norm(str(raw)))
@@ -67,6 +68,8 @@ def canon_slot(kind: str, raw):
     if kind == "color": return canon_color(str(raw))
     if kind == "location": return canon_location(str(raw))
     if kind == "price_kind": return canon_price_kind(raw)
+    if kind == "service_topic": return SERVICE_TOPICS.get(norm(str(raw)), raw)
+    if kind == "compare_vehicle": return canon_vehicle(str(raw))
     return raw
 
 YES = {"oke", "ok", "u", "uk", "dc", "duoc", "dong y", "chot", "xac nhan", "vang",

@@ -69,7 +69,10 @@ class SandboxHTTPTests(unittest.TestCase):
         return self.request("POST", f"/api/conversations/{state['id']}/turn", {"text": text})
 
     def rows(self):
-        return [json.loads(line) for line in Path(self.ledger).read_text().splitlines()] if Path(self.ledger).exists() else []
+        if not Path(self.ledger).exists():
+            return []
+        return [row for line in Path(self.ledger).read_text().splitlines()
+                if (row := json.loads(line)).get("kind") in ("call", "repair", "retry")]
 
     def test_health_seeded_and_manual_posts(self):
         self.assertEqual(self.request("GET", "/health")[0], 200)
@@ -87,7 +90,8 @@ class SandboxHTTPTests(unittest.TestCase):
         state = self.conversation()
         def luna(post, text, **kwargs):
             self.assertIn("Creta", post)
-            self.assertIn("Creta", kwargs["parent"])
+            self.assertIn("Creta", kwargs["context"])
+            self.assertEqual(kwargs["parent"], "")
             self.assertTrue(kwargs["budget_guard"]())
             return model_result()
         with patch("sandbox.server.call_luna", side_effect=luna):
@@ -196,15 +200,18 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertFalse(result["turn"]["ok"])
         self.assertIn("ERROR_ROLLBACK", result["turn"]["routing"])
         event = self.http.app.event(conversation, comment, f"{conversation['id']}-1")
-        self.assertIn(comment, [row["text"] for row in conversation["engine"].context(
-            event, conversation["postcard"])["recent"]])
+        saved = conversation["engine"].store.conn.execute(
+            "SELECT text FROM events WHERE comment_id=?", (event["comment_id"],)).fetchone()
+        self.assertEqual(saved[0], comment)
 
     def test_prior_failed_customer_turn_reaches_luna_and_evidence_validation(self):
         state = self.conversation()
         prior = "Mình đã hỏi về Tucson tuần trước"
+        inherited = meaning(text="giá bao nhiêu", evidence="Tucson tuần trước")
+        inherited["operations"][0]["slot"]["value"] = "Tucson"
         with patch("sandbox.server.call_luna", side_effect=[
                 {"ok": False, "error": "temporary failure", "attempts": 0},
-                model_result(meaning(text="giá bao nhiêu", evidence="Tucson tuần trước"))]) as luna:
+                model_result(inherited)]) as luna:
             self.turn(state, prior)
             _, result = self.turn(state, "giá bao nhiêu")
         self.assertEqual(luna.call_args_list[1].kwargs["context"].count(prior), 1)
@@ -351,17 +358,26 @@ class SandboxHTTPTests(unittest.TestCase):
 
     def test_model_bounds_context_and_repair_note_before_openrouter(self):
         from sandbox.server import CONTEXT_CHAR_LIMIT, REPAIR_CHAR_LIMIT
+        import json
         state = self.conversation()
         conversation = self.http.app.conversations[state["id"]]
         context = {"recent": [{"text": "comment " + "x" * 10000} for _ in range(5)],
-                   "active_requests": [], "pending": [], "parent_texts": ["parent " + "p" * 50000]}
+                   "active_requests": [], "pending": [], "parent_texts": ["parent"]}
         with patch("sandbox.server.call_luna", return_value={"ok": False, "attempts": 0}) as luna:
             self.http.app.model(conversation, "current", context, "repair " + "e" * 20000)
         args, kwargs = luna.call_args
         self.assertLessEqual(len(kwargs["context"]), CONTEXT_CHAR_LIMIT + 64)
-        self.assertIn("older conversation context truncated", kwargs["context"])
-        self.assertLessEqual(len(kwargs["parent"]), 20000)
+        encoded = json.loads(kwargs["context"])
+        self.assertEqual(encoded["format"], "mat_intent_context_v1")
+        self.assertLess(len(encoded["recent"]), 5)
+        self.assertEqual(kwargs["parent"], "")
         self.assertEqual(len(kwargs["repair_note"]), REPAIR_CHAR_LIMIT)
+
+        context["parent_texts"] = ["parent " + "p" * 50000]
+        with patch("sandbox.server.call_luna") as luna:
+            with self.assertRaisesRegex(ValueError, "exceeds budget"):
+                self.http.app.model(conversation, "current", context)
+        luna.assert_not_called()
 
     def test_model_includes_only_recent_successfully_sent_bot_replies(self):
         state = self.conversation()
@@ -377,7 +393,10 @@ class SandboxHTTPTests(unittest.TestCase):
             self.http.app.model(conversation, "current", context)
         formatted = luna.call_args.kwargs["context"]
         self.assertLess(formatted.index("Earlier reply"), formatted.index("Latest reply"))
-        self.assertIn("conversational context", formatted)
+        import json
+        replies = json.loads(formatted)["recent_bot_replies"]
+        self.assertEqual(replies, [{"text": "Earlier reply", "verified_fact": False},
+                                   {"text": "Latest reply", "verified_fact": False}])
         self.assertNotIn("Blocked reply", formatted)
         self.assertNotIn("Unknown reply", formatted)
 

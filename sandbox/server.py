@@ -13,13 +13,12 @@ from urllib.parse import urlsplit
 from app.adapters.luna import MODEL, call_luna
 from app.engine import WallClock
 from app.harness import make_engine
-from app.semantics import validate_semantic
+from app.semantics import attach_context_provenance, validate_semantic
 from scripts import budget_ledger
-from scripts.run_multiturn_eval import fmt_context
+from scripts.run_multiturn_eval import CONTEXT_CHAR_LIMIT, fmt_context
 
 STATIC = Path(__file__).with_name("static")
 PROVIDER_LOCK = threading.RLock()
-CONTEXT_CHAR_LIMIT = 40000
 REPAIR_CHAR_LIMIT = 10000
 # Conservative bound for the capped prompt and the adapter's current 1,200-token output/rates.
 ATTEMPT_COST_RESERVE = 0.05
@@ -61,7 +60,9 @@ class Sandbox:
         engine = make_engine(clock=WallClock())
         conversation = dict(id=cid, page_id=post["page_id"], actor_id=actor, thread_id="root-" + cid,
                             post=post, engine=engine, history=[], counter=0)
-        conversation["postcard"] = dict(topic="vehicle", vehicles=post["vehicles"])
+        conversation["postcard"] = dict(id=post["id"], page_id=post["page_id"],
+                                        text=post["text"], title=post.get("title"),
+                                        topic="vehicle", vehicles=post["vehicles"])
         root = self.event(conversation, post["text"], conversation["thread_id"])
         root.update(actor_id="page-self:" + cid, actor_role="page_self", parent_id=None)
         engine.process(root, conversation["postcard"], None)
@@ -99,29 +100,26 @@ class Sandbox:
                                   and turn["text"] != text and turn["text"] not in existing))[-5:]
 
     def model(self, conversation, text, context, repair_note=""):
-        model_context = fmt_context(context)
         existing = [row["text"] for row in context["recent"]] + context["parent_texts"]
         customer_turns = self.prior_customer_turns(conversation, text, existing)
-        if customer_turns:
-            model_context += "\n\nPrior customer turns:\n" + "\n".join(customer_turns)
         replies = [turn["response_text"] for turn in conversation["history"]
                    if turn.get("outbound_permission") is True and
                    any(send.get("status") == "sent_to_fake_ledger" for send in turn.get("sends", [])
                        if isinstance(send, dict)) and
                    isinstance(turn.get("response_text"), str)][-5:]
-        if replies:
-            model_context += "\n\nPrior bot replies (conversational context, not verified facts):\n" + "\n".join(replies)
-        if len(model_context) > CONTEXT_CHAR_LIMIT:
-            model_context = "[older conversation context truncated]\n" + model_context[-CONTEXT_CHAR_LIMIT:]
-        inflight = 0
+        model_context = fmt_context({**context, "recent_bot_replies": replies},
+                                    prior_customer_turns=customer_turns)
+        reservations = []
         def guard():
-            nonlocal inflight
-            allowed, _ = self.budget(inflight)
-            if allowed:
-                inflight += 1
+            reservation_id = f"sandbox:{conversation['id']}:{uuid.uuid4().hex}"
+            allowed, _ = budget_ledger.reserve(
+                self.ledger_path, reservation_id=reservation_id, max_calls=300,
+                max_cost=2.00, reserve_cost_usd=ATTEMPT_COST_RESERVE,
+                prior_calls=276, prior_cost=.0854)
+            if allowed: reservations.append(reservation_id)
             return allowed
         result = call_luna(conversation["post"]["text"], text,
-                           parent="\n".join(context["parent_texts"])[-20000:], context=model_context,
+                           parent="", context=model_context,
                            repair_note=repair_note[-REPAIR_CHAR_LIMIT:], budget_guard=guard)
         attempts = result.get("attempts", 0)
         if attempts:
@@ -138,6 +136,7 @@ class Sandbox:
                                  kind="repair" if repair_note else "call", attempts=attempts,
                                  cost_usd_est=cost, model=result.get("model_effective", MODEL),
                                  status=None if result.get("ok") else "failed")
+            budget_ledger.settle_reservations(self.ledger_path, reservations)
         return result
 
     def turn(self, conversation, data):
@@ -170,15 +169,17 @@ class Sandbox:
                 if not api.get("ok"):
                     turn.update(error=api.get("error") or "Model request failed", routing=["REVIEW_MODEL_ERROR"])
                     break
-                turn["semantic"] = api.get("semantic")
+                turn["semantic"] = attach_context_provenance(api.get("semantic"), event, context,
+                                                               conversation["postcard"])
                 turn["errors"] = validate_semantic(turn["semantic"], text,
-                    [r["text"] for r in context["recent"]] + context["parent_texts"] +
+                    [conversation["post"]["text"]] + [r["text"] for r in context["recent"]] + context["parent_texts"] +
                     self.prior_customer_turns(conversation, text,
                         [r["text"] for r in context["recent"]] + context["parent_texts"]))
                 if turn["errors"]:
                     turn.update(error="Model semantics failed validation", routing=["REVIEW_SCHEMA"])
                     continue
-                result = engine.process(event, conversation["postcard"], turn["semantic"])
+                result = engine.process(event, conversation["postcard"], turn["semantic"],
+                                        expected_state_token=context["state_token"])
                 engine_processed = not any(route.startswith("ERROR_") for route in result["routing"])
                 turn.update({k: result[k] for k in ("routing", "response_text", "sends", "errors", "outbound_permission", "state_changes")})
                 turn["ok"] = not any(route.startswith(("REVIEW", "BLOCKED", "ERROR_")) for route in turn["routing"])

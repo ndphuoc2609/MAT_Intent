@@ -1,6 +1,7 @@
 """Tests offline cho hạ tầng R13/R14 (không gọi model, không dùng transport thật).
 """
 import sys, os, unittest, json, tempfile
+from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from scripts.cache_key import (full_cache_key, state_fingerprint, is_legacy_checkpoint,
                                request_logical_key, pending_logical_key)
@@ -37,6 +38,33 @@ class TestCacheKey(unittest.TestCase):
         self.assertFalse(is_legacy_checkpoint({}))
 
 class TestBudgetLedger(unittest.TestCase):
+    def test_atomic_reservations_prevent_parallel_workers_from_crossing_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "budget.jsonl")
+            def attempt(i):
+                return budget_ledger.reserve(path, reservation_id=f"worker-{i}",
+                    max_calls=2, max_cost=.10, reserve_cost_usd=.01)
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(attempt, range(8)))
+            allowed = [i for i, (ok, _) in enumerate(results) if ok]
+            self.assertEqual(len(allowed), 2)
+            self.assertEqual(budget_ledger.totals(path)[:3], (2, .02, 0))
+            budget_ledger.record(path, run_id="parallel", kind="call", attempts=2,
+                                 cost_usd_est=.015)
+            budget_ledger.settle_reservations(path, [f"worker-{i}" for i in allowed])
+            self.assertEqual(budget_ledger.totals(path)[:3], (2, .015, 0))
+
+    def test_unsettled_reservation_is_counted_and_unknown_actual_cost_still_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "budget.jsonl")
+            self.assertTrue(budget_ledger.reserve(path, reservation_id="r1", max_calls=5,
+                                                   max_cost=.1, reserve_cost_usd=.01)[0])
+            self.assertEqual(budget_ledger.breakdown(path)["reserved"], 1)
+            budget_ledger.record(path, run_id="unknown", kind="call", attempts=1,
+                                 cost_usd_est=None, status="unknown_cost")
+            budget_ledger.settle_reservations(path, ["r1"])
+            self.assertFalse(budget_ledger.guard(path)[0])
+
     def test_fractional_call_count_inputs_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "ledger.jsonl")
@@ -181,7 +209,7 @@ class TestBudgetLedger(unittest.TestCase):
             self.assertEqual(budget_ledger.totals(path), (1, 0.0, 0, 2))
             self.assertTrue(budget_ledger.guard(path)[0])
             self.assertEqual(budget_ledger.breakdown(path), dict(
-                attempted=1, completed=0, failed=1, unknown_cost=0, actual_cost_usd=0.0))
+                attempted=1, completed=0, failed=1, reserved=0, unknown_cost=0, actual_cost_usd=0.0))
 
     def test_reconciliation_must_target_one_unknown_failed_attempt_once(self):
         with tempfile.TemporaryDirectory() as tmp:

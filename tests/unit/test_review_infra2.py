@@ -29,7 +29,8 @@ def _fixture_luna(post, comment, parent="", context="", **kwargs):
                dict(op="UPDATE_SLOT", request_ref="topic:testdrive", evidence_excerpt="sáng mai",
                     slot={"kind": "datetime", "value": "sáng mai"})]
     else:
-        pid = re.search(r"id=(q_\w+)", context).group(1)
+        pending = json.loads(context)["pending"]
+        pid = pending[0]["id"]
         ops = [dict(op="CONFIRM_PENDING", request_ref="topic:testdrive", pending_id=pid,
                     evidence_excerpt="oke")]
     sem = dict(schema_version="1", sentiment="NEU", sarcasm="absent", scope="in_scope",
@@ -157,7 +158,7 @@ class TestA8Budget(unittest.TestCase):
                             "--ckdir", str(d / "cache"), "--prior-calls", "0", "--prior-cost", "0"]
                 with contextlib.redirect_stdout(io.StringIO()):
                     runner.main()
-            row, = budget._read_records(str(ledger))
+            row, = [r for r in budget._read_records(str(ledger)) if r.get("kind") == "call"]
             self.assertIsNone(row["cost_usd_est"])
             self.assertEqual(row["status"], "unknown_cost")
             self.assertEqual(budget.totals(str(ledger))[2], 1)
@@ -245,7 +246,10 @@ class TestOpenRouterCredentials(unittest.TestCase):
         self.assertNotIn(b"test-only-key", request.data)
         payload = json.loads(request.data)
         self.assertEqual(payload["model"], "openai/gpt-6-luna")
-        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+        self.assertEqual(payload["response_format"]["json_schema"]["schema"], adapter.STRICT_SEMANTIC_SCHEMA)
+        self.assertTrue(payload["provider"]["require_parameters"])
 
     def test_adapter_rejects_embedded_or_non_object_json_without_retry(self):
         semantic = json.dumps(_semantic("chào"))

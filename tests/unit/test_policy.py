@@ -38,10 +38,11 @@ class TestPolicyConsistency(unittest.TestCase):
         self.assertEqual(set(y["auto_allowed_actions"]), set(policy.AUTO_ACTIONS))
         self.assertEqual(y["pending_ttl_hours"], policy.PENDING_TTL_HOURS)
         self.assertEqual(y["handoff_sla_hours"], policy.HANDOFF_SLA_HOURS)
-    def test_pg_adapter_not_implemented(self):
+    def test_pg_adapter_has_a_versioned_shared_store(self):
         from app import pg_adapter
-        with self.assertRaises(pg_adapter.PostgresNotImplemented):
-            pg_adapter.connect("postgresql://example/db")
+        from app.state import Store
+        self.assertTrue(issubclass(pg_adapter.PostgresStore, Store))
+        self.assertEqual(pg_adapter.LATEST_VERSION, 3)
 
 if __name__ == "__main__":
     unittest.main()

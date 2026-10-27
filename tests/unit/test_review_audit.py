@@ -95,10 +95,15 @@ class TestA1Ambiguity(unittest.TestCase):
         text = "Chuyển sang 3 giờ chiều"
         value = "2026-10-25T15:00:00+07:00"
         r = e.process(ev("update_iso_datetime", text), PC, sem([
-            op("UPDATE_SLOT", req["id"], text, "datetime", value)], "testdrive"))
+            dict(op="UPDATE_SLOT", request_ref=req["id"], evidence_excerpt=text,
+                 slot=dict(kind="datetime", value=value, raw="3 giờ chiều"))], "testdrive"))
         self.assertIn("propose_test_drive_slot", r["routing"])
         updated = e.store.get_request(req["id"])
         self.assertEqual(updated["slots"]["datetime"]["value"], value)
+        self.assertFalse(updated["slots"]["datetime"]["explicit"])
+        self.assertEqual(updated["slots"]["datetime"]["source_message_id"], "td")
+        self.assertEqual(updated["slots"]["datetime"]["source_actor_id"], "uA")
+        self.assertEqual(updated["slots"]["datetime"]["source_request_id"], req["id"])
         self.assertIn("25/10 lúc 15:00", r["response_text"])
 
     def test_explicit_affirmation_phrase_confirms_yes_no_pending(self):
@@ -199,8 +204,8 @@ class TestA2PendingEvidence(unittest.TestCase):
         _, req = price_req(e, kind=None)
         pend = e.store.open_pending_for("uA", req["id"])[0]
         self.assertEqual(pend["expected_slot"], "price_kind")
-        r = e.process(ev("ans", "niêm yết"), PC, sem([
-            op("ANSWER_PENDING", req["id"], "niêm yết", "location", "list", pending_id=pend["id"])]))
+        r = e.process(ev("ans", "niêm yết Hà Nội"), PC, sem([
+            op("ANSWER_PENDING", req["id"], "Hà Nội", "location", "Hà Nội", pending_id=pend["id"])]))
         self.assertIn("REVIEW_BAD_PENDING", r["routing"])
         self.assertEqual(e.store.get_pending(pend["id"])["status"], "OPEN")
         self.assertNotIn("location", e.store.get_request(req["id"])["slots"])

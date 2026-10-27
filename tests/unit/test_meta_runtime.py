@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from meta_services.graph import MetaGraphError
 from meta_services.runtime import MetaRuntime
@@ -52,7 +53,8 @@ class MetaRuntimeTests(unittest.TestCase):
         self.runtime = MetaRuntime(
             self.graph, app_secret="secret", verify_token="verify", service_api_key="api-key",
             outbound_enabled=True, db_path=Path(self.temp.name) / "meta.db",
-            budget_path=Path(self.temp.name) / "budget.jsonl", model_call=model_call,
+            budget_path=Path(self.temp.name) / "budget.jsonl",
+            trace_path=Path(self.temp.name) / "trace.jsonl", model_call=model_call,
         )
         self.addCleanup(self.runtime.close)
 
@@ -116,6 +118,21 @@ class MetaRuntimeTests(unittest.TestCase):
     def test_no_sample_facts_are_loaded(self):
         self.assertEqual(self.runtime.engine.facts.facts, [])
 
+    def test_missing_production_budget_blocks_before_provider_request(self):
+        from app.adapters import luna
+        self.runtime.model_call = luna.call_luna
+        self.runtime.max_model_calls = None
+        self.runtime.max_model_cost = None
+        self.runtime.model_reserve = None
+        event = {"comment_id": "no-budget", "text": "Cảm ơn"}
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), \
+             patch.object(luna.urllib.request, "build_opener") as opener:
+            result = self.runtime._call_model(event, "post", "", "")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["attempts"], 0)
+        self.assertIn("budget", result["error"])
+        opener.assert_not_called()
+
     def test_temporary_graph_read_failure_retries_without_losing_the_comment(self):
         self.graph.comment_errors = 1
         self.runtime.enqueue_webhook(self.payload("456_4"))
@@ -137,6 +154,14 @@ class MetaRuntimeTests(unittest.TestCase):
         self.assertTrue(self.model_contexts)
         self.assertEqual(self.graph.replies, [])
         self.assertEqual(self.runtime.list_inbox()[0]["status"], "DONE")
+
+    def test_trace_write_failure_does_not_repeat_completed_model_decision(self):
+        with patch("scripts.model_trace.append", side_effect=OSError("disk full")):
+            self.runtime.enqueue_webhook(self.payload("456_10"))
+            self.assertTrue(self.runtime.process_next())
+        job = next(row for row in self.runtime.list_inbox() if row["comment_id"] == "456_10")
+        self.assertEqual(job["status"], "DONE")
+        self.assertTrue(job["result"]["trace_write_failed"])
 
     def test_duplicate_manual_idempotency_key_does_not_leave_sqlite_transaction_open(self):
         action = {"message": "same action"}

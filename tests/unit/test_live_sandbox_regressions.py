@@ -179,7 +179,7 @@ class TestExtraSlots(unittest.TestCase):
         td_semantic = lambda op: dict(schema_version="1", sentiment="NEU", sarcasm="absent",
             scope="in_scope", requests=[dict(topic="testdrive", desired_outcome="testdrive_propose",
             polarity="positive")], operations=[op], uncertainties=[])
-        engine.process(event("start_past_time", "Creta Hà Nội"), PC, td_semantic(dict(
+        engine.process(event("start_past_time", "Creta Hà Nội hôm nay lúc 18h"), PC, td_semantic(dict(
             op="START_REQUEST", request_ref="topic:testdrive", evidence_excerpt="Creta",
             slot=dict(kind="vehicle", value="Creta", extra={"location": "Hà Nội", "datetime": "hôm nay lúc 18h"}))))
         request_id = engine.store.active_requests("p", "u")[0]["id"]
@@ -277,9 +277,9 @@ class TestTopicOutcomeRegressions(unittest.TestCase):
         sem = dict(schema_version="1", sentiment="NEU", sarcasm="absent", scope="in_scope",
                    requests=[dict(topic="price", desired_outcome="price_list", polarity="positive"),
                              dict(topic="testdrive", desired_outcome="testdrive_propose", polarity="positive")],
-                   operations=[dict(op="START_REQUEST", request_ref="topic:price", evidence_excerpt="giá",
+                   operations=[dict(op="START_REQUEST", request_ref="topic:price", evidence_excerpt="Creta",
                                     slot=dict(kind="vehicle", value="Creta")),
-                               dict(op="START_REQUEST", request_ref="topic:testdrive", evidence_excerpt="lái thử",
+                               dict(op="START_REQUEST", request_ref="topic:testdrive", evidence_excerpt="Creta",
                                     slot=dict(kind="vehicle", value="Creta"))], uncertainties=[])
 
         engine.process(event("two_topics", "giá Creta và lái thử Creta"), PC, sem)
@@ -372,7 +372,7 @@ class TestTopicOutcomeRegressions(unittest.TestCase):
             "vehicle": "Creta", "variant": "Cao cấp", "color": "Trắng",
             "location": "Hà Nội", "price_kind": "list", "datetime": "2026-10-25T09:00:00+07:00"})
         self.assertTrue(slots["vehicle"]["explicit"])
-        self.assertFalse(slots["variant"]["explicit"])
+        self.assertTrue(slots["variant"]["explicit"])
 
     def test_invalid_extra_datetime_is_not_persisted_as_a_date(self):
         engine = make_engine(clock=Clock(T0))

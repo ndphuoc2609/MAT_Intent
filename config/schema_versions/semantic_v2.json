@@ -1,0 +1,1028 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MAT Intent semantic v2",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": "2"
+    },
+    "sentiment": {
+      "enum": [
+        "POS",
+        "NEG",
+        "NEU"
+      ]
+    },
+    "sarcasm": {
+      "enum": [
+        "present",
+        "absent",
+        "uncertain"
+      ]
+    },
+    "scope": {
+      "enum": [
+        "in_scope",
+        "out_of_scope",
+        "unknown"
+      ]
+    },
+    "requests": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "enum": [
+              "price",
+              "promo",
+              "loan",
+              "stock",
+              "spec",
+              "dealer",
+              "testdrive",
+              "buy",
+              "service",
+              "complaint",
+              "registration",
+              "social"
+            ]
+          },
+          "desired_outcome": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1
+          },
+          "polarity": {
+            "enum": [
+              "positive",
+              "negative",
+              "conditional",
+              "unknown"
+            ]
+          }
+        },
+        "required": [
+          "topic",
+          "desired_outcome",
+          "polarity"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 24,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "op": {
+                "const": "START_REQUEST"
+              },
+              "request": {
+                "type": "object",
+                "properties": {
+                  "topic": {
+                    "enum": [
+                      "price",
+                      "promo",
+                      "loan",
+                      "stock",
+                      "spec",
+                      "dealer",
+                      "testdrive",
+                      "buy",
+                      "service",
+                      "complaint",
+                      "registration",
+                      "social"
+                    ]
+                  },
+                  "desired_outcome": {
+                    "type": "string",
+                    "maxLength": 120
+                  }
+                },
+                "required": [
+                  "topic"
+                ],
+                "additionalProperties": false
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "slot": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "color",
+                      "compare_vehicle",
+                      "datetime",
+                      "dealer",
+                      "down_payment",
+                      "down_payment_unit",
+                      "location",
+                      "price_kind",
+                      "service_topic",
+                      "variant",
+                      "vehicle"
+                    ]
+                  },
+                  "value": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 256
+                      },
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "amount": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1000000000000
+                          },
+                          "unit": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "maxLength": 32
+                          }
+                        },
+                        "required": [
+                          "amount"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "raw": {
+                    "type": "string",
+                    "maxLength": 256
+                  },
+                  "evidence_excerpt": {
+                    "type": "string",
+                    "maxLength": 500,
+                    "minLength": 1
+                  },
+                  "explicit": {
+                    "type": "boolean"
+                  },
+                  "confirmed": {
+                    "type": "boolean"
+                  },
+                  "extra": {
+                    "type": "object",
+                    "maxProperties": 10,
+                    "additionalProperties": {
+                      "oneOf": [
+                        {
+                          "type": "string",
+                          "maxLength": 256
+                        },
+                        {
+                          "type": "number",
+                          "minimum": -1000000000000,
+                          "maximum": 1000000000000
+                        }
+                      ]
+                    }
+                  },
+                  "source_message_id": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "source_request_id": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "source_actor_id": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "source_state_token": {
+                    "type": "string",
+                    "maxLength": 128
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "kind": {
+                          "const": "down_payment"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "value": {
+                          "type": "object",
+                          "properties": {
+                            "amount": {
+                              "type": "number",
+                              "minimum": 0,
+                              "maximum": 1000000000000
+                            },
+                            "unit": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "maxLength": 32
+                            }
+                          },
+                          "required": [
+                            "amount"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "else": {
+                      "properties": {
+                        "value": {
+                          "oneOf": [
+                            {
+                              "type": "string",
+                              "maxLength": 256
+                            },
+                            {
+                              "type": "number",
+                              "minimum": -1000000000000,
+                              "maximum": 1000000000000
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "topic": {
+                "enum": [
+                  "price",
+                  "promo",
+                  "loan",
+                  "stock",
+                  "spec",
+                  "dealer",
+                  "testdrive",
+                  "buy",
+                  "service",
+                  "complaint",
+                  "registration",
+                  "social"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "op": {
+                "const": "UPDATE_SLOT"
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "slot": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "color",
+                      "compare_vehicle",
+                      "datetime",
+                      "dealer",
+                      "down_payment",
+                      "down_payment_unit",
+                      "location",
+                      "price_kind",
+                      "service_topic",
+                      "variant",
+                      "vehicle"
+                    ]
+                  },
+                  "value": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 256
+                      },
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "amount": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1000000000000
+                          },
+                          "unit": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "maxLength": 32
+                          }
+                        },
+                        "required": [
+                          "amount"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "raw": {
+                    "type": "string",
+                    "maxLength": 256
+                  },
+                  "evidence_excerpt": {
+                    "type": "string",
+                    "maxLength": 500,
+                    "minLength": 1
+                  },
+                  "explicit": {
+                    "type": "boolean"
+                  },
+                  "confirmed": {
+                    "type": "boolean"
+                  },
+                  "extra": {
+                    "type": "object",
+                    "maxProperties": 10,
+                    "additionalProperties": {
+                      "oneOf": [
+                        {
+                          "type": "string",
+                          "maxLength": 256
+                        },
+                        {
+                          "type": "number",
+                          "minimum": -1000000000000,
+                          "maximum": 1000000000000
+                        }
+                      ]
+                    }
+                  },
+                  "source_message_id": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "source_request_id": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "source_actor_id": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "source_state_token": {
+                    "type": "string",
+                    "maxLength": 128
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "kind": {
+                          "const": "down_payment"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "value": {
+                          "type": "object",
+                          "properties": {
+                            "amount": {
+                              "type": "number",
+                              "minimum": 0,
+                              "maximum": 1000000000000
+                            },
+                            "unit": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "maxLength": 32
+                            }
+                          },
+                          "required": [
+                            "amount"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "else": {
+                      "properties": {
+                        "value": {
+                          "oneOf": [
+                            {
+                              "type": "string",
+                              "maxLength": 256
+                            },
+                            {
+                              "type": "number",
+                              "minimum": -1000000000000,
+                              "maximum": 1000000000000
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt",
+              "request_ref",
+              "slot"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "op": {
+                "const": "ANSWER_PENDING"
+              },
+              "pending_id": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "slot": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "color",
+                      "compare_vehicle",
+                      "datetime",
+                      "dealer",
+                      "down_payment",
+                      "down_payment_unit",
+                      "location",
+                      "price_kind",
+                      "service_topic",
+                      "variant",
+                      "vehicle"
+                    ]
+                  },
+                  "value": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 256
+                      },
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "amount": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1000000000000
+                          },
+                          "unit": {
+                            "type": [
+                              "string",
+                              "null"
+                            ],
+                            "maxLength": 32
+                          }
+                        },
+                        "required": [
+                          "amount"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "raw": {
+                    "type": "string",
+                    "maxLength": 256
+                  },
+                  "evidence_excerpt": {
+                    "type": "string",
+                    "maxLength": 500,
+                    "minLength": 1
+                  },
+                  "explicit": {
+                    "type": "boolean"
+                  },
+                  "confirmed": {
+                    "type": "boolean"
+                  },
+                  "extra": {
+                    "type": "object",
+                    "maxProperties": 10,
+                    "additionalProperties": {
+                      "oneOf": [
+                        {
+                          "type": "string",
+                          "maxLength": 256
+                        },
+                        {
+                          "type": "number",
+                          "minimum": -1000000000000,
+                          "maximum": 1000000000000
+                        }
+                      ]
+                    }
+                  },
+                  "source_message_id": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "source_request_id": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "source_actor_id": {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  "source_state_token": {
+                    "type": "string",
+                    "maxLength": 128
+                  }
+                },
+                "required": [
+                  "kind",
+                  "value"
+                ],
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "kind": {
+                          "const": "down_payment"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "value": {
+                          "type": "object",
+                          "properties": {
+                            "amount": {
+                              "type": "number",
+                              "minimum": 0,
+                              "maximum": 1000000000000
+                            },
+                            "unit": {
+                              "type": [
+                                "string",
+                                "null"
+                              ],
+                              "maxLength": 32
+                            }
+                          },
+                          "required": [
+                            "amount"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "else": {
+                      "properties": {
+                        "value": {
+                          "oneOf": [
+                            {
+                              "type": "string",
+                              "maxLength": 256
+                            },
+                            {
+                              "type": "number",
+                              "minimum": -1000000000000,
+                              "maximum": 1000000000000
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt",
+              "request_ref",
+              "slot",
+              "pending_id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "op": {
+                "const": "CONFIRM_PENDING"
+              },
+              "pending_id": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt",
+              "request_ref",
+              "pending_id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "op": {
+                "const": "REJECT_PENDING"
+              },
+              "pending_id": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt",
+              "request_ref",
+              "pending_id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "op": {
+                "const": "CANCEL_REQUEST"
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt",
+              "request_ref"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "op": {
+                "const": "SET_CONTACT_PREFERENCE"
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "scope": {
+                "enum": [
+                  "call",
+                  "public_reply",
+                  "inbox",
+                  "all",
+                  "allow_call",
+                  "allow_public_reply",
+                  "allow_inbox",
+                  "allow_all"
+                ]
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt",
+              "scope"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "human_source": {
+                "enum": [
+                  "customer_explicit",
+                  "model_proposed",
+                  "policy"
+                ]
+              },
+              "op": {
+                "const": "REQUEST_HUMAN"
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "op": {
+                "const": "REPORT_COMPLAINT"
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "op": {
+                "const": "SOCIAL_ACK"
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "evidence_excerpt": {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              "op": {
+                "const": "UNRESOLVED"
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "request_ref": {
+                "type": "string",
+                "maxLength": 500
+              },
+              "source_message_id": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "op",
+              "evidence_excerpt",
+              "reason"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "uncertainties": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "properties": {
+          "alternatives": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 8,
+            "items": {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            }
+          },
+          "different_action": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "alternatives",
+          "different_action"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "intent_labels": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "enum": [
+          "price",
+          "promo",
+          "loan",
+          "stock",
+          "spec",
+          "dealer",
+          "testdrive",
+          "buy",
+          "service",
+          "complaint",
+          "registration",
+          "social"
+        ]
+      }
+    },
+    "category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 80
+    },
+    "tags": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "string",
+        "maxLength": 64
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "sentiment",
+    "sarcasm",
+    "scope",
+    "requests",
+    "operations",
+    "uncertainties",
+    "intent_labels",
+    "category",
+    "tags"
+  ],
+  "additionalProperties": false
+}

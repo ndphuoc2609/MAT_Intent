@@ -51,13 +51,16 @@ def extract_comment_events(payload, page_id: str) -> list[dict]:
             parent_id = value.get("parent_id")
             if not isinstance(parent_id, str) or not _GRAPH_ID.fullmatch(parent_id):
                 parent_id = post_id
+            thread_root_id = value.get("thread_root_id") or value.get("root_comment_id")
+            if not isinstance(thread_root_id, str) or not _GRAPH_ID.fullmatch(thread_root_id):
+                thread_root_id = comment_id if parent_id == post_id else parent_id
             events.append({
                 "page_id": page_id,
                 "actor_id": actor_id,
                 "post_id": post_id,
                 "comment_id": comment_id,
                 "parent_id": parent_id,
-                "thread_root_id": parent_id,
+                "thread_root_id": thread_root_id,
                 "text": text,
                 "event_type": "create",
                 "content_version": 1,

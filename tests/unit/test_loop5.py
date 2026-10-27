@@ -261,11 +261,11 @@ class TestMixedPrefComplaint(unittest.TestCase):
                       slot=dict(kind="vehicle", value="Creta")),
                  dict(op="UPDATE_SLOT", request_ref="topic:price", evidence_excerpt="bản cao",
                       slot=dict(kind="variant", value="Cao cấp")),
-                 dict(op="UPDATE_SLOT", request_ref="topic:price", evidence_excerpt="giá",
+                 dict(op="UPDATE_SLOT", request_ref="topic:price", evidence_excerpt="niêm yết",
                       slot=dict(kind="price_kind", value="list")),
                  dict(op="REPORT_COMPLAINT", request_ref="topic:complaint", evidence_excerpt="vụ tiền cọc",
                       reason="deposit_dispute")], topic="price")
-        r = eng.process(ev("m1", "Đừng gọi nữa, gửi giá Creta bản cao tại đây và chuyển quản lý xử lý vụ tiền cọc."), PC, s)
+        r = eng.process(ev("m1", "Đừng gọi nữa, gửi giá niêm yết Creta bản cao tại đây và chuyển quản lý xử lý vụ tiền cọc."), PC, s)
         self.assertEqual(eng.store.blocks("p", "u1"), frozenset({"call"}))
         self.assertEqual(len(r["sends"]), 1)
         self.assertIn("699.000.000", r["response_text"])

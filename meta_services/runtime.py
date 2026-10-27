@@ -7,10 +7,15 @@ import os
 import re
 import sqlite3
 import threading
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.adapters.luna import MODEL, call_luna
+from app.adapters.jev import JevOpenRouter, intent_questions
+from app.adapters.decision_fast_path import social_ack_candidate, social_ack_eligible
+from app.normalize import VEHICLES, norm
 from app.engine import Engine, WallClock
 from app.facts import Facts
 from app.state import Store
@@ -98,7 +103,11 @@ class CommentInbox:
 class MetaRuntime:
     def __init__(self, graph, *, app_secret, verify_token, service_api_key,
                  outbound_enabled=False, db_path="runs/meta_services.sqlite3",
-                 budget_path="runs/meta_services_budget.jsonl", model_call=None):
+                 database_url=None,
+                 budget_path="runs/meta_services_budget.jsonl", model_call=None,
+                 trace_path="runs/meta_services_trace.jsonl", jev_shadow_enabled=None,
+                 jev_adapter=None, jev_budget_path=None,
+                 jev_fast_path_enabled=None, jev_social_threshold=None):
         self.graph = graph
         self.page_id = graph.page_id
         self.app_secret = app_secret
@@ -106,15 +115,37 @@ class MetaRuntime:
         self.service_api_key = service_api_key
         self.outbound_enabled = bool(outbound_enabled)
         self.budget_path = str(budget_path)
+        self.trace_path = str(trace_path)
+        self.jev_budget_path = str(jev_budget_path or budget_path)
+        self.max_model_calls = _env_int("META_MODEL_MAX_CALLS")
+        self.max_model_cost = _env_float("META_MODEL_MAX_COST_USD")
+        self.model_reserve = _env_float("META_MODEL_RESERVE_USD")
+        self.jev_max_calls = _env_int("META_JEV_MAX_CALLS")
+        if self.jev_max_calls is None: self.jev_max_calls = self.max_model_calls
+        self.jev_max_cost = _env_float("META_JEV_MAX_COST_USD")
+        if self.jev_max_cost is None: self.jev_max_cost = self.max_model_cost
+        self.jev_reserve = _env_float("META_JEV_RESERVE_USD")
+        self.jev_shadow_enabled = (os.environ.get("META_JEV_SHADOW_ENABLED", "false").lower() == "true"
+                                   if jev_shadow_enabled is None else bool(jev_shadow_enabled))
+        self.jev_fast_path_enabled = (
+            os.environ.get("META_JEV_FAST_PATH_ENABLED", "false").lower() == "true"
+            if jev_fast_path_enabled is None else bool(jev_fast_path_enabled))
+        self.jev_social_threshold = (_env_float("META_JEV_SOCIAL_THRESHOLD")
+                                     if jev_social_threshold is None else jev_social_threshold)
+        self.jev_adapter = jev_adapter or JevOpenRouter()
         self.model_call = model_call or call_luna
-        if db_path != ":memory:":
-            path = Path(db_path)
-            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(path.parent, 0o700)
-            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-            os.close(fd)
-            os.chmod(path, 0o600)
-        self.store = Store(db_path)
+        if database_url:
+            from app.pg_adapter import connect as connect_postgres
+            self.store = connect_postgres(database_url)
+        else:
+            if db_path != ":memory:":
+                path = Path(db_path)
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.chmod(path.parent, 0o700)
+                fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+                os.close(fd)
+                os.chmod(path, 0o600)
+            self.store = Store(db_path)
         self.sender = MetaSender(self.graph, self.store, lambda: self.outbound_enabled)
         self.engine = Engine(self.store, Facts([]), self.sender, WallClock())
         self.inbox = CommentInbox(self.store)
@@ -131,6 +162,7 @@ class MetaRuntime:
             verify_token=os.environ.get("META_WEBHOOK_VERIFY_TOKEN", ""),
             service_api_key=os.environ.get("META_SERVICE_API_KEY", ""),
             outbound_enabled=os.environ.get("META_OUTBOUND_ENABLED", "false").lower() == "true",
+            database_url=os.environ.get("META_DATABASE_URL") or None,
         )
 
     def _recover_outbox(self):
@@ -160,20 +192,30 @@ class MetaRuntime:
         return [row[0] for row in reversed(rows) if isinstance(row[0], str)]
 
     def _call_model(self, event, post, parent, context):
-        inflight = 0
+        started = time.perf_counter()
+        reservations = []
 
         def guard():
-            nonlocal inflight
-            allowed, _ = budget_ledger.guard(
-                self.budget_path, max_calls=300, max_cost=2.00,
-                est_attempts=inflight + 1, est_cost=0.01 * (inflight + 1))
-            if allowed:
-                inflight += 1
+            reservation_id = f"meta:{event['comment_id']}:{uuid.uuid4().hex}"
+            allowed, _ = budget_ledger.reserve(
+                self.budget_path, reservation_id=reservation_id,
+                max_calls=self.max_model_calls, max_cost=self.max_model_cost,
+                reserve_cost_usd=self.model_reserve)
+            if allowed: reservations.append(reservation_id)
             return allowed
 
         result = self.model_call(
             post, event["text"], parent=parent, context=context,
             budget_guard=guard)
+        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        result["_trace"] = {"model_requested": MODEL,
+            "model_effective": result.get("model_effective", MODEL), "adapter": "luna",
+            "schema_version": "1", "prompt_version": "luna_system_v1",
+            "latency_ms": (time.perf_counter() - started) * 1000,
+            "usage": {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                      if type(usage.get(k)) is int},
+            "cost_usd": result.get("cost_usd_est"),
+            "cost_unknown": result.get("cost_unknown", True), "attempts": result.get("attempts", 0)}
         attempts = result.get("attempts", 0)
         if attempts:
             cost = result.get("cost_usd_est") if not result.get("cost_unknown", True) else None
@@ -186,6 +228,78 @@ class MetaRuntime:
                 self.budget_path, run_id=f"meta:{event['comment_id']}", kind="call",
                 attempts=attempts, cost_usd_est=cost, model=result.get("model_effective", MODEL),
                 status=None if result.get("ok") else "failed")
+            budget_ledger.settle_reservations(self.budget_path, reservations)
+        return result
+
+    def _start_jev_shadow(self, event, context):
+        if not self.jev_shadow_enabled:
+            return
+        event_hash = hashlib.sha256(event["comment_id"].encode()).hexdigest()
+
+        def run():
+            reservations = []
+            def guard():
+                reservation_id = f"jev:{event_hash}:{uuid.uuid4().hex}"
+                allowed, _ = budget_ledger.reserve(
+                    self.jev_budget_path, reservation_id=reservation_id,
+                    max_calls=self.jev_max_calls, max_cost=self.jev_max_cost,
+                    reserve_cost_usd=self.jev_reserve)
+                if allowed: reservations.append(reservation_id)
+                return allowed
+            result = self.jev_adapter.decide(context, intent_questions(), timeout=8,
+                                             budget_guard=guard)
+            if result.get("attempts"):
+                budget_ledger.record(self.jev_budget_path, run_id=event_hash, kind="shadow",
+                    attempts=result["attempts"], cost_usd_est=result.get("cost_usd_est"),
+                    model=result.get("model_effective", "typesafe/jev-1.14"),
+                    status=None if result.get("ok") else "failed")
+                budget_ledger.settle_reservations(self.jev_budget_path, reservations)
+            from scripts.model_trace import append
+            append(self.trace_path, {"event_hash": event_hash,
+                "model_requested": "typesafe/jev-1.14",
+                "model_effective": result.get("model_effective", "typesafe/jev-1.14"),
+                "provider": result.get("provider"), "adapter": "jev_decisions",
+                "schema_version": "intent_decisions_v1", "prompt_version": "jev_intent_questions_v1",
+                "latency_ms": result.get("latency_ms"), "usage": result.get("usage", {}),
+                "cost_usd": result.get("cost_usd_est"), "cost_unknown": result.get("cost_unknown", True),
+                "attempts": result.get("attempts", 0), "shadow": True,
+                "routing": ["SHADOW_COMPLETED" if result.get("ok") else "SHADOW_FAILED"]})
+        threading.Thread(target=run, name="jev-shadow", daemon=True).start()
+
+    def _try_jev_fast_path(self, event, context):
+        threshold = self.jev_social_threshold
+        if (not self.jev_fast_path_enabled or not social_ack_eligible(event.get("text")) or
+                type(threshold) not in (int, float) or not 0 <= threshold <= 1):
+            return None
+        event_hash = hashlib.sha256(event["comment_id"].encode()).hexdigest()
+        reservations = []
+        def guard():
+            reservation_id = f"jev-fast:{event_hash}:{uuid.uuid4().hex}"
+            allowed, _ = budget_ledger.reserve(
+                self.jev_budget_path, reservation_id=reservation_id,
+                max_calls=self.jev_max_calls, max_cost=self.jev_max_cost,
+                reserve_cost_usd=self.jev_reserve)
+            if allowed: reservations.append(reservation_id)
+            return allowed
+        result = self.jev_adapter.decide(context, {"social": intent_questions()["social"]},
+                                         timeout=8, budget_guard=guard)
+        if result.get("attempts"):
+            budget_ledger.record(self.jev_budget_path, run_id=event_hash, kind="fast_path",
+                attempts=result["attempts"], cost_usd_est=result.get("cost_usd_est"),
+                model=result.get("model_effective", "typesafe/jev-1.14"),
+                status=None if result.get("ok") else "failed")
+            budget_ledger.settle_reservations(self.jev_budget_path, reservations)
+        semantic = social_ack_candidate(event["text"],
+            (result.get("answers") or {}).get("social"), threshold) if result.get("ok") else None
+        result["semantic"] = semantic
+        result["_trace"] = {"event_hash": event_hash, "model_requested": "typesafe/jev-1.14",
+            "model_effective": result.get("model_effective", "typesafe/jev-1.14"),
+            "provider": result.get("provider"), "adapter": "jev_decisions",
+            "schema_version": "1" if semantic else "intent_decisions_v1",
+            "prompt_version": "jev_social_fast_path_v1", "latency_ms": result.get("latency_ms"),
+            "usage": result.get("usage", {}), "cost_usd": result.get("cost_usd_est"),
+            "cost_unknown": result.get("cost_unknown", True), "attempts": result.get("attempts", 0),
+            "routing": ["FAST_PATH_ACCEPTED" if semantic else "FAST_PATH_FALLBACK"]}
         return result
 
     def _process_event(self, event):
@@ -210,45 +324,101 @@ class MetaRuntime:
         if comment_object.get("id") and comment_object["id"] != event["post_id"]:
             return {"routing": ["IGNORED_COMMENT_POST_MISMATCH"]}
 
-        parent_text = post.get("message") or ""
+        post_text = post.get("message") or ""
+        parent_text, parent_author = post_text, self.page_id
+        parent_comment = None
         if event["parent_id"] != event["post_id"]:
-            parent = self.graph.get_comment(event["parent_id"])
-            parent_object = parent.get("object") or {}
+            parent_comment = self.graph.get_comment(event["parent_id"])
+            parent_object = parent_comment.get("object") or {}
             if parent_object.get("id") not in (None, event["post_id"]):
                 return {"routing": ["IGNORED_PARENT_POST_MISMATCH"]}
-            parent_text = parent.get("message") or parent_text
+            parent_text = parent_comment.get("message") or parent_text
+            parent_author = (parent_comment.get("from") or {}).get("id")
+
+        root_comment = parent_comment
+        root_author = parent_author
+        root_text = parent_text
+        if event["thread_root_id"] not in (event["post_id"], event["comment_id"], event["parent_id"]):
+            root_comment = self.graph.get_comment(event["thread_root_id"])
+            root_object = root_comment.get("object") or {}
+            if root_object.get("id") not in (None, event["post_id"]):
+                return {"routing": ["IGNORED_ROOT_POST_MISMATCH"]}
+            root_text = root_comment.get("message") or ""
+            root_author = (root_comment.get("from") or {}).get("id")
 
         event = {**event, "actor_role": "user", "event_dedupe_key": event["comment_id"] + ":1"}
+        post_text = post_text[:12000]
+        post_vehicles = sorted({canonical for alias, canonical in VEHICLES.items()
+                                if re.search(r"(?<!\w)" + re.escape(norm(alias)) + r"(?!\w)", norm(post_text))})
         postcard = {"id": event["post_id"], "page_id": self.page_id,
-                    "text": (post.get("message") or "")[:12000],
-                    "title": "Facebook Page post", "vehicles": [],
+                    "text": post_text, "title": post.get("title") or "Facebook Page post",
+                    "vehicles": post_vehicles,
                     "topic": "", "persona_default": "tư vấn viên",
                     "published_at": post.get("created_time")}
-        context = self.engine.context(event, postcard)
+        trusted_messages = []
+        if root_comment and event["thread_root_id"] not in (event["post_id"], event["comment_id"]):
+            trusted_messages.append({"message_id": event["thread_root_id"], "actor_id": root_author,
+                "page_id": self.page_id, "post_id": event["post_id"],
+                "thread_root_id": event["thread_root_id"], "role": "root", "text": root_text})
+        if parent_comment and event["parent_id"] not in (event["post_id"], event["comment_id"]):
+            trusted_messages.append({"message_id": event["parent_id"], "actor_id": parent_author,
+                "page_id": self.page_id, "post_id": event["post_id"],
+                "thread_root_id": event["thread_root_id"], "role": "parent", "text": parent_text})
+        context = self.engine.context(event, postcard, trusted_messages)
         context["recent_bot_replies"] = self._bot_replies(event["actor_id"])
-        if parent_text:
-            context["external_parent_text"] = parent_text[:5000]
-        model_context = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
-        if len(model_context) > 18000:
-            model_context = model_context[-18000:]
-        model = self._call_model(event, postcard["text"], parent_text[:5000], model_context)
+        from scripts.run_multiturn_eval import fmt_context
+        model_context = fmt_context(context)
+        fast_path = self._try_jev_fast_path(event, model_context)
+        trace_rows = [fast_path["_trace"]] if fast_path else []
+        if fast_path and fast_path.get("semantic"):
+            model = {"ok": True, "semantic": fast_path["semantic"], "attempts": fast_path.get("attempts", 0),
+                     "model_effective": fast_path.get("model_effective", "typesafe/jev-1.14"),
+                     "_trace": fast_path["_trace"]}
+        else:
+            if fast_path is None:
+                self._start_jev_shadow(event, model_context)
+            model = self._call_model(event, postcard["text"], "", model_context)
+            trace_rows.append(model.get("_trace"))
         semantic = model.get("semantic") if model.get("ok") else None
-        trusted_context = [postcard["text"], parent_text, *context["recent_bot_replies"]]
-        return self.engine.process(event, postcard, semantic,
-                                   trusted_context_texts=trusted_context,
-                                   trusted_source_ids={event["post_id"]: postcard["text"]})
+        trusted_context = [postcard["text"], root_text, parent_text, *context["recent_bot_replies"]]
+        source_ids = {event["post_id"]: {"text": postcard["text"], "actor_id": self.page_id, "role": "post"}}
+        for message in trusted_messages:
+            source_ids[message["message_id"]] = message
+        result = self.engine.process(event, postcard, semantic,
+                                     trusted_context_texts=trusted_context,
+                                     trusted_source_ids=source_ids,
+                                     expected_state_token=context["state_token"],
+                                     trusted_context_messages=trusted_messages)
+        result["_model_traces"] = [trace for trace in trace_rows if trace]
+        return result
 
     def process_next(self):
         job = self.inbox.claim()
         if job is None:
             return False
         comment_id, event, attempt = job
+        started = time.perf_counter()
         try:
             result = self._process_event(event)
+            model_traces = result.pop("_model_traces", [])
+            trace_write_failed = False
+            if model_traces:
+                from scripts.model_trace import append
+                for model_trace in model_traces:
+                    try:
+                        append(self.trace_path, {**model_trace,
+                            "event_hash": hashlib.sha256(comment_id.encode()).hexdigest(),
+                            "routing": model_trace.get("routing", result.get("routing", [])),
+                            "review_reasons": [x for x in result.get("routing", []) if x.startswith("REVIEW")],
+                            "pipeline_latency_ms": (time.perf_counter() - started) * 1000,
+                            "shadow": False})
+                    except OSError:
+                        trace_write_failed = True
             self.inbox.finish(comment_id, "DONE", result={
                 "routing": result.get("routing", []),
                 "outbound_permission": result.get("outbound_permission", False),
                 "response_text": result.get("response_text"),
+                "trace_write_failed": trace_write_failed,
             })
         except MetaGraphError as error:
             retryable = error.status is None or error.status in (429, 500, 502, 503, 504) or error.code == 4
@@ -304,7 +474,9 @@ class MetaRuntime:
         now = datetime.now(timezone.utc).isoformat()
         with self.store.lock:
             cur = self.store.conn.execute(
-                "INSERT OR IGNORE INTO meta_manual_writes VALUES (?,?, 'ATTEMPTING',NULL,?,?)",
+                "INSERT OR IGNORE INTO meta_manual_writes "
+                "(idempotency_key,fingerprint,status,result,created_at,updated_at) "
+                "VALUES (?,?, 'ATTEMPTING',NULL,?,?)",
                 (key, fingerprint, now, now))
             if cur.rowcount == 1:
                 self.store.conn.commit()
@@ -330,3 +502,19 @@ class MetaRuntime:
     def close(self):
         self.stop_worker()
         self.store.conn.close()
+
+
+def _env_int(name):
+    try:
+        value = os.environ.get(name)
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _env_float(name):
+    try:
+        value = float(os.environ[name])
+        return value if value >= 0 else None
+    except (KeyError, TypeError, ValueError):
+        return None

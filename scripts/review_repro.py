@@ -13,7 +13,7 @@ LƯU Ý NGUỒN GỐC — ĐỌC TRƯỚC KHI DÙNG SỐ LIỆU:
 Chạy: python3 scripts/review_repro.py [--only R01] [--list]
 """
 from __future__ import annotations
-import json, os, sys, tempfile
+import glob, json, os, sys, tempfile
 from datetime import datetime, timezone, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -243,11 +243,11 @@ def p_r02_partial_bad_pending_other():
 def p_r02_mixed_safe_kept():
     # Positive: price safe + complaint handoff trong một lượt: price vẫn gửi, complaint draft.
     eng = make_engine(clock=Clock(T0))
-    res = eng.process(ev("c1", "u1", "giá Creta bản cao và khiếu nại tiền cọc"), PC1,
-                      sem([op("START_REQUEST", ref="topic:price", text="giá Creta bản cao và khiếu nại tiền cọc"),
-                           op("UPDATE_SLOT", ref="topic:price", slot=slot("price_kind", "niêm yết"), text="giá Creta bản cao và khiếu nại tiền cọc"),
-                           op("UPDATE_SLOT", ref="topic:price", slot=slot("variant", "Cao cấp"), text="giá Creta bản cao và khiếu nại tiền cọc"),
-                           op("REPORT_COMPLAINT", ref="topic:complaint", reason="deposit", text="giá Creta bản cao và khiếu nại tiền cọc")],
+    res = eng.process(ev("c1", "u1", "giá Creta bản cao niêm yết và khiếu nại tiền cọc"), PC1,
+                      sem([op("START_REQUEST", ref="topic:price", text="giá Creta bản cao niêm yết và khiếu nại tiền cọc"),
+                           op("UPDATE_SLOT", ref="topic:price", slot=slot("price_kind", "niêm yết"), text="giá Creta bản cao niêm yết và khiếu nại tiền cọc"),
+                           op("UPDATE_SLOT", ref="topic:price", slot=slot("variant", "Cao cấp"), text="giá Creta bản cao niêm yết và khiếu nại tiền cọc"),
+                           op("REPORT_COMPLAINT", ref="topic:complaint", reason="deposit", text="giá Creta bản cao niêm yết và khiếu nại tiền cọc")],
                           reqs=[dict(topic="price", desired_outcome="price", polarity="positive"),
                                 dict(topic="complaint", desired_outcome="complaint", polarity="negative")]))
     ok = bool(res.get("sends")) and any(x["topic"] == "price" and x["status"] == "COMPLETED" for x in reqs_of(eng, "u1"))
@@ -339,11 +339,11 @@ def p_r04_independent_scope_allowed():
     # Positive: request thực sự độc lập (xe khác) vẫn được xử lý khi có handoff.
     eng = make_engine(clock=Clock(T0))
     _handoff_price(eng, "u1")
-    res = eng.process(ev("h3", "u1", "giá Tucson bản cao"), PC2,
-                      sem([op("START_REQUEST", ref="topic:price", text="giá Tucson bản cao"),
-                           op("UPDATE_SLOT", ref="topic:price", slot=slot("vehicle", "Tucson"), text="giá Tucson bản cao"),
-                           op("UPDATE_SLOT", ref="topic:price", slot=slot("price_kind", "niêm yết"), text="giá Tucson bản cao"),
-                           op("UPDATE_SLOT", ref="topic:price", slot=slot("variant", "Cao cấp"), text="giá Tucson bản cao")]))
+    res = eng.process(ev("h3", "u1", "giá Tucson bản cao niêm yết"), PC2,
+                      sem([op("START_REQUEST", ref="topic:price", text="giá Tucson bản cao niêm yết"),
+                           op("UPDATE_SLOT", ref="topic:price", slot=slot("vehicle", "Tucson"), text="giá Tucson bản cao niêm yết"),
+                           op("UPDATE_SLOT", ref="topic:price", slot=slot("price_kind", "niêm yết"), text="giá Tucson bản cao niêm yết"),
+                           op("UPDATE_SLOT", ref="topic:price", slot=slot("variant", "Cao cấp"), text="giá Tucson bản cao niêm yết")]))
     ok = bool(res.get("sends"))
     return (not ok), f"independent scope sends={len(res.get('sends', []))} (must stay working)"
 
@@ -597,23 +597,16 @@ def p_r15_policy_module_missing():
     return bug, "policy.yaml cites app/policy.py as the single source, but the module does not exist"
 
 def p_r15_pg_not_implemented():
-    # Sau sửa (theo đúng R15): PG được GHI NHÃN NOT_IMPLEMENTED rõ ràng, không
-    # phải "làm như đã có". Probe kiểm tra nhãn, không đòi Dockerfile giả.
-    import glob
-    has_adapter = os.path.exists(os.path.join(ROOT, "app", "pg_adapter.py"))
+    # Probe implementation wiring only; live PostgreSQL behavior is covered
+    # exclusively by tests/postgres against an explicitly disposable database.
+    from app.pg_adapter import LATEST_VERSION, PostgresStore
+    from app.state import Store
+    has_adapter = issubclass(PostgresStore, Store)
     compose = open(os.path.join(ROOT, "compose.yaml")).read()
-    labeled = "NOT_IMPLEMENTED" in compose and "PostgreSQL adapter" in compose
-    try:
-        from app import pg_adapter
-        raises = False
-        try:
-            pg_adapter.connect("postgresql://example/db")
-        except pg_adapter.PostgresNotImplemented:
-            raises = True
-    except Exception:
-        raises = False
-    bug = (not has_adapter) or (not labeled) or (not raises)
-    return bug, f"pg_adapter={has_adapter} compose_labeled_NOT_IMPLEMENTED={labeled} connect_raises={raises} (no Dockerfile by design; PG is labeled NOT_IMPLEMENTED, not claimed)"
+    migrations = sorted(glob.glob(os.path.join(ROOT, "migrations", "postgresql", "[0-9][0-9][0-9]_*.sql")))
+    wired = "META_DATABASE_URL" in compose
+    bug = not has_adapter or not wired or len(migrations) < LATEST_VERSION
+    return bug, f"PostgresStore={has_adapter} compose_url={wired} migrations={len(migrations)}/{LATEST_VERSION} (live DB is a separate integration gate)"
 
 PROBES = [
     ("R01", "cross_pending_confirm", p_r01_cross_pending_confirm),

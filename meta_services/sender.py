@@ -17,7 +17,8 @@ class MetaDeliveryReceiver:
         now = datetime.now(timezone.utc).isoformat()
         with self.store.lock:
             cur = self.store.conn.execute(
-                "INSERT OR IGNORE INTO meta_delivery_attempts VALUES (?,?,NULL,?)",
+                "INSERT OR IGNORE INTO meta_delivery_attempts "
+                "(dedupe_key,status,remote_id,updated_at) VALUES (?,?,NULL,?)",
                 (key, "ATTEMPTING", now))
             self.store.conn.commit()
             return cur.rowcount == 1

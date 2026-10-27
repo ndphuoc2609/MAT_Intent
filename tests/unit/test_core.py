@@ -56,7 +56,7 @@ class TestFacts(unittest.TestCase):
 class TestEngine(unittest.TestCase):
     def test_price_otr_and_duplicate(self):
         eng = make_engine()
-        s = sem([dict(op="START_REQUEST", request_ref="topic:price", evidence_excerpt="Bản cao",
+        s = sem([dict(op="START_REQUEST", request_ref="topic:price", evidence_excerpt="Creta",
                       slot=dict(kind="vehicle", value="Creta")),
                  dict(op="UPDATE_SLOT", request_ref="topic:price", evidence_excerpt="Bản cao",
                       slot=dict(kind="variant", value="Cao cấp")),
@@ -64,10 +64,10 @@ class TestEngine(unittest.TestCase):
                       slot=dict(kind="price_kind", value="otr")),
                  dict(op="UPDATE_SLOT", request_ref="topic:price", evidence_excerpt="HN",
                       slot=dict(kind="location", value="Hà Nội"))])
-        r = eng.process(ev("c1", "Bản cao lăn bánh HN bao nhiêu?"), PC, s)
+        r = eng.process(ev("c1", "Creta Bản cao lăn bánh HN bao nhiêu?"), PC, s)
         self.assertEqual(len(r["sends"]), 1)
         self.assertIn("804.440.000", r["response_text"])
-        r2 = eng.process(ev("c1", "Bản cao lăn bánh HN bao nhiêu?"), PC, s)
+        r2 = eng.process(ev("c1", "Creta Bản cao lăn bánh HN bao nhiêu?"), PC, s)
         self.assertEqual(r2["routing"], ["DUPLICATE_IGNORED"]); self.assertEqual(len(r2["sends"]), 0)
     def test_version_conflict_detected(self):
         eng = make_engine()

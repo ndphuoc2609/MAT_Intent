@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib, json, uuid
 from datetime import datetime, timedelta, timezone
 from .normalize import canon_slot, norm, parse_relative_datetime, parse_time_expression, fmt_money, yes_no
-from .semantics import validate_semantic
+from .semantics import attach_context_provenance, validate_semantic
 from .facts import Facts, calc_otr
 from .renderer import render, claim_check, claim_check_typed
 from .state import Store, FakeSender
@@ -34,9 +34,16 @@ def _slot(req, name):
     s = req["slots"].get(name)
     return s["value"] if isinstance(s, dict) else s
 
-def _set_slot(req, name, value, raw, source, explicit=True, confirmed=False, bump=True):
+def _set_slot(req, name, value, raw, source, explicit=True, confirmed=False,
+              source_request_id=None, source_actor_id=None, source_state_token=None, bump=True):
     req["slots"][name] = dict(value=value, raw=raw, source_message_id=source,
                               explicit=explicit, confirmed=confirmed)
+    if source_request_id:
+        req["slots"][name]["source_request_id"] = source_request_id
+    if source_actor_id:
+        req["slots"][name]["source_actor_id"] = source_actor_id
+    if source_state_token:
+        req["slots"][name]["source_state_token"] = source_state_token
     if bump: req["version"] += 1
 
 def _op_identity(op):
@@ -117,8 +124,9 @@ def _slot_score(req, op):
         score += 1
     return score
 
-def _new_req(page_id, actor_id, topic, outcome, comment_id, now):
-    return dict(id=str(uuid.uuid4())[:12], page_id=page_id, actor_id=actor_id,
+def _new_req(page_id, post_id, thread_root_id, actor_id, topic, outcome, comment_id, now):
+    return dict(id=str(uuid.uuid4())[:12], page_id=page_id, post_id=post_id,
+                thread_root_id=thread_root_id, actor_id=actor_id,
                 topic=topic, status="OPEN", version=1, slots={},
                 source_events=[comment_id], desired_outcomes=[outcome],
                 created_at=now, updated_at=now)
@@ -144,19 +152,26 @@ class Engine:
         riêng, không nằm trong quyền của event hiện tại.)"""
         actor = event["actor_id"]; page = event["page_id"]
         now = datetime.fromisoformat(now_iso)
-        for p in self.store.open_pending_for(actor, page_id=page):
+        for p in self.store.open_pending_for(actor, page_id=page,
+                                              post_id=event.get("post_id"),
+                                              thread_root_id=event.get("thread_root_id")):
             if p["expires_at"] and now_iso > p["expires_at"]:
                 p["status"] = "EXPIRED"; p["version"] += 1; self.store.update_pending(p)
                 req = self.store.get_request(p["request_id"])
-                if req and req["status"] == "WAITING_USER" and not self.store.open_pending_for(actor, req["id"]):
+                if req and req["status"] == "WAITING_USER" and not self.store.open_pending_for(
+                        actor, req["id"], page_id=page, post_id=event.get("post_id"),
+                        thread_root_id=event.get("thread_root_id")):
                     req["status"] = "OPEN"; req["version"] += 1; self.store.save_request(req)
-        for active in self.store.active_requests(page, actor):
+        for active in self.store.active_requests(page, actor, event.get("post_id"),
+                                                event.get("thread_root_id")):
             req = self.store.get_request(active["id"])
             if self._clear_past_testdrive_datetime(req, now):
                 req["version"] += 1; self.store.save_request(req)
         rows = self.store.conn.execute(
             "SELECT h.request_id, h.acquired_at FROM handoffs h JOIN requests r ON r.id=h.request_id "
-            "WHERE r.actor_id=? AND r.page_id=? AND h.released_at IS NULL", (actor, page)).fetchall()
+            "WHERE r.actor_id=? AND r.page_id=? AND r.post_id=? AND r.thread_root_id=? "
+            "AND h.released_at IS NULL", (actor, page, event.get("post_id"),
+                                             event.get("thread_root_id"))).fetchall()
         for rid, acq in rows:
             try: acq_dt = datetime.fromisoformat(acq)
             except Exception: continue
@@ -326,53 +341,169 @@ class Engine:
                     return "BLOCKED_STALE_FACTS"
         return None
     # ---------- context ----------
-    def context(self, event, postcard):
-        # A3: mọi truy vấn phục vụ inference đều scope (page, actor). Recent
-        # trước đây chỉ lọc actor nên Page B thấy text của Page A; parent
-        # lookup trước đây không kiểm page nên parent id có thể trỏ sang
-        # tenant khác. Parent hợp lệ phải cùng page (post của Page thì cùng
-        # page với event; actor có thể khác vì post là của Page).
+    def context(self, event, postcard, external_messages=None):
+        # Requests/pending/recent are private to page + post + thread + actor.
+        # Root and direct parent are shared context, with their authors kept.
         with self.store.lock:
-            # Bảng events không có cột page_id riêng (page nằm trong JSON
-            # payload) nên lọc bằng json_extract — vẫn là cùng một scope
-            # (page, actor), không quét tenant khác.
             rows = self.store.conn.execute(
-                "SELECT text, comment_id FROM events WHERE retracted=0 AND actor_id=? AND "
-                "json_extract(payload, '$.page_id')=? ORDER BY rowid DESC LIMIT 5",
-                (event["actor_id"], event["page_id"])).fetchall()
-            recent = [{"comment_id": r[1], "text": r[0]} for r in rows]
-            parent_texts = []
-            for key in ("parent_id", "thread_root_id"):
-                pid = event.get(key)
-                if pid:
-                    pr = self.store.conn.execute(
-                        "SELECT text, payload FROM events WHERE comment_id=? AND retracted=0", (pid,)).fetchone()
-                    if pr:
-                        try: ppage = json.loads(pr[1] or "{}").get("page_id")
-                        except Exception: ppage = None
-                        # Chỉ tin parent cùng page; không xác định được page
-                        # thì loại (fail-closed cho isolation).
-                        if ppage == event["page_id"]:
-                            parent_texts.append(pr[0])
-            active = self.store.active_requests(event["page_id"], event["actor_id"])
+                "SELECT text, comment_id, actor_id, payload FROM events WHERE retracted=0 AND actor_id=? AND "
+                "json_extract(payload, '$.page_id')=? AND json_extract(payload, '$.post_id')=? "
+                "AND json_extract(payload, '$.thread_root_id')=? AND comment_id<>? ORDER BY rowid DESC LIMIT 5",
+                (event["actor_id"], event["page_id"], event.get("post_id"),
+                 event.get("thread_root_id"), event.get("comment_id"))).fetchall()
+            recent = [{"comment_id": r[1], "message_id": r[1], "actor_id": r[2], "role": "recent", "text": r[0]}
+                      for r in rows if r[1] != event.get("comment_id")]
+            by_id = {}
+            for key, role in (("thread_root_id", "root"), ("parent_id", "parent")):
+                mid = event.get(key)
+                if (not mid or mid in (event.get("post_id"), event.get("comment_id")) or
+                        mid in by_id):
+                    continue
+                pr = self.store.conn.execute(
+                    "SELECT text, actor_id, payload FROM events WHERE comment_id=? AND retracted=0 ORDER BY rowid DESC LIMIT 1",
+                    (mid,)).fetchone()
+                if not pr: continue
+                try: payload = json.loads(pr[2] or "{}")
+                except (TypeError, ValueError): payload = {}
+                if (payload.get("page_id") == event["page_id"] and
+                        payload.get("post_id") == event.get("post_id") and
+                        payload.get("thread_root_id") == event.get("thread_root_id")):
+                    by_id[mid] = {"message_id": mid, "actor_id": pr[1], "role": role,
+                                  "text": pr[0] or ""}
+            allowed_shared = {event.get("thread_root_id"), event.get("parent_id")}
+            for message in external_messages or []:
+                if (not isinstance(message, dict) or message.get("message_id") not in allowed_shared or
+                        message.get("message_id") in (event.get("post_id"), event.get("comment_id")) or
+                        message.get("message_id") in by_id or
+                        message.get("page_id", event.get("page_id")) != event.get("page_id") or
+                        message.get("post_id", event.get("post_id")) != event.get("post_id") or
+                        message.get("thread_root_id", event.get("thread_root_id")) != event.get("thread_root_id") or
+                        not isinstance(message.get("text"), str)):
+                    continue
+                by_id[message["message_id"]] = {"message_id": message["message_id"],
+                    "actor_id": message.get("actor_id"), "role": message.get("role") or
+                    ("root" if message["message_id"] == event.get("thread_root_id") else "parent"),
+                    "text": message["text"]}
+            shared = [dict(message_id=event.get("post_id"), actor_id=postcard.get("page_id"),
+                           role="post", text=postcard.get("text") or "")]
+            shared.extend(by_id.values())
+            if all(x.get("message_id") != event.get("comment_id") for x in shared):
+                shared.append(dict(message_id=event.get("comment_id"), actor_id=event.get("actor_id"),
+                                   role="current", text=event.get("text") or ""))
+            active = self.store.active_requests(event["page_id"], event["actor_id"],
+                                                event.get("post_id"), event.get("thread_root_id"))
             pend = []
             for r in active:
-                pend += self.store.open_pending_for(event["actor_id"], r["id"])
-        return dict(event=event, postcard={k: postcard.get(k) for k in
-                    ("topic", "vehicles", "persona_default", "published_at")},
-                    recent=recent, parent_texts=parent_texts, active_requests=active, pending=pend)
+                pend += self.store.open_pending_for(
+                    event["actor_id"], r["id"], page_id=event["page_id"],
+                    post_id=event.get("post_id"), thread_root_id=event.get("thread_root_id"))
+            contact_blocks = sorted(self.store.blocks(event["page_id"], event["actor_id"]))
+        parent_texts = [x["text"] for x in shared if x["role"] in ("root", "parent")]
+        snapshot = {"scope": [event.get(k) for k in
+                              ("page_id", "post_id", "thread_root_id", "actor_id")],
+                    "postcard": postcard, "shared": shared, "recent": recent,
+                    "requests": [{k: r.get(k) for k in
+                                  ("id", "version", "topic", "status", "slots", "desired_outcomes")}
+                                 for r in active],
+                    "contact_blocks": contact_blocks,
+                    "pending": [{k: p.get(k) for k in
+                                 ("id", "request_id", "version", "status", "qtype", "expected_slot",
+                                  "options", "proposition", "basis_version", "basis_slots")}
+                                for p in pend]}
+        state_token = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True,
+                                                default=str, separators=(",", ":")).encode()).hexdigest()
+        return dict(event=event, postcard=postcard, messages=shared, recent=recent,
+                    parent_texts=parent_texts, active_requests=active, pending=pend,
+                    contact_blocks=contact_blocks,
+                    state_token=state_token)
+
+    def _trace_state_snapshot(self, event):
+        scope = (event["page_id"], event.get("post_id"), event.get("thread_root_id"), event["actor_id"])
+        rows = self.store.conn.execute(
+            "SELECT id,topic,status,version,slots,desired_outcomes FROM requests "
+            "WHERE page_id=? AND post_id=? AND thread_root_id=? AND actor_id=?",
+            scope).fetchall()
+        requests = {r[0]: {"topic": r[1], "status": r[2], "version": r[3],
+                           "slots": json.loads(r[4] or "{}"),
+                           "desired_outcomes": json.loads(r[5] or "[]")} for r in rows}
+        rows = self.store.conn.execute(
+            "SELECT p.id,p.request_id,p.status,p.version,p.proposition,p.expected_slot,p.options "
+            "FROM pending p JOIN requests r ON r.id=p.request_id "
+            "WHERE r.page_id=? AND r.post_id=? AND r.thread_root_id=? AND p.actor_id=?",
+            scope).fetchall()
+        pending = {r[0]: {"request_id": r[1], "status": r[2], "version": r[3],
+                          "proposition": r[4], "expected_slot": r[5],
+                          "options": json.loads(r[6] or "[]")} for r in rows}
+        return {"requests": requests, "pending": pending,
+                "contact_blocks": sorted(self.store.blocks(event["page_id"], event["actor_id"]))}
+
+    @staticmethod
+    def _trace_state_diff(before, after):
+        if not before or not after:
+            return []
+        changes = []
+        old_requests, new_requests = before["requests"], after["requests"]
+        for rid in sorted(new_requests.keys() - old_requests.keys()):
+            req = new_requests[rid]
+            changes.append({"kind": "request_created", "request_id": rid,
+                            "topic": req["topic"], "status": req["status"], "slots": req["slots"],
+                            "desired_outcomes": req["desired_outcomes"]})
+        for rid in sorted(old_requests.keys() & new_requests.keys()):
+            old, new = old_requests[rid], new_requests[rid]
+            if old["status"] != new["status"]:
+                changes.append({"kind": "request_status", "request_id": rid,
+                                "from": old["status"], "to": new["status"]})
+            if old["desired_outcomes"] != new["desired_outcomes"]:
+                changes.append({"kind": "request_outcomes", "request_id": rid,
+                                "from": old["desired_outcomes"], "to": new["desired_outcomes"]})
+            for name in sorted(old["slots"].keys() | new["slots"].keys()):
+                if old["slots"].get(name) != new["slots"].get(name):
+                    changes.append({"kind": "slot_changed", "request_id": rid, "slot": name,
+                                    "from": old["slots"].get(name), "to": new["slots"].get(name)})
+        for rid in sorted(old_requests.keys() - new_requests.keys()):
+            changes.append({"kind": "request_removed", "request_id": rid,
+                            "topic": old_requests[rid]["topic"]})
+        old_pending, new_pending = before["pending"], after["pending"]
+        if before.get("contact_blocks") != after.get("contact_blocks"):
+            changes.append({"kind": "contact_blocks_changed", "from": before.get("contact_blocks", []),
+                            "to": after.get("contact_blocks", [])})
+        for pid in sorted(new_pending.keys() - old_pending.keys()):
+            changes.append({"kind": "pending_created", "pending_id": pid,
+                            **new_pending[pid]})
+        for pid in sorted(old_pending.keys() & new_pending.keys()):
+            if old_pending[pid] != new_pending[pid]:
+                changes.append({"kind": "pending_changed", "pending_id": pid,
+                                "from": old_pending[pid], "to": new_pending[pid]})
+        for pid in sorted(old_pending.keys() - new_pending.keys()):
+            changes.append({"kind": "pending_removed", "pending_id": pid})
+        return changes
+
     # ---------- main ----------
     def process(self, event, postcard, semantic, now_dt=None, trusted_context_texts=None,
-                trusted_source_ids=None):
+                trusted_source_ids=None, expected_state_token=None,
+                trusted_context_messages=None):
+        trusted_source_ids = dict(trusted_source_ids or {})
+        if event.get("post_id") and (postcard.get("text") or postcard.get("vehicles")):
+            post_source = trusted_source_ids.get(event["post_id"])
+            if not isinstance(post_source, dict):
+                post_source = {"text": post_source if isinstance(post_source, str) else ""}
+                trusted_source_ids[event["post_id"]] = post_source
+            post_source.update(text=postcard.get("text", ""),
+                               actor_id=postcard.get("page_id") or event["page_id"],
+                               role="post", vehicles=list(postcard.get("vehicles") or []))
         now = now_dt or self.clock.now()
         now_iso = now.isoformat()
         page, actor = event["page_id"], event["actor_id"]
         result = dict(comment_id=event["comment_id"], routing=[], outbound_permission=False,
                       sends=[], state_changes=[], response_plan=None, response_text=None,
-                      errors=[], audit=[])
+                      errors=[], audit=[], semantic=None, semantic_version=None,
+                      intent_labels=[], category=None, tags=[], state_after=None)
         with self.store.lock:
             self.store.conn.execute("BEGIN IMMEDIATE")
+            trace_before = None
             try:
+                self.store.lock_scope(event)
+                trace_before = self._trace_state_snapshot(event)
                 dedupe = event.get("event_dedupe_key")
                 if not dedupe:
                     if event.get("event_type") in ("edit", "delete"):
@@ -382,9 +513,8 @@ class Engine:
                         dedupe = f"{event['comment_id']}:{event['event_type']}:{version}"
                     else:
                         dedupe = f"{event['comment_id']}:{event.get('content_version', 1)}"
-                exists = self.store.conn.execute(
-                    "SELECT 1 FROM events WHERE dedupe_key=?", (dedupe,)).fetchone()
-                if exists:
+                inserted = self.store.insert_event(dedupe, event, actor)
+                if inserted.rowcount == 0:
                     result["routing"].append("DUPLICATE_IGNORED"); self.store.conn.commit()
                     # A5: redelivery KHÔNG được làm mất intent đã commit nhưng
                     # chưa dispatch (crash trước dispatcher). Drain các intent
@@ -396,10 +526,6 @@ class Engine:
                     except Exception as e:
                         result["drain_error"] = str(e)
                     return result
-                self.store.conn.execute(
-                    "INSERT INTO events VALUES (?,?,?,?,?,0)",
-                    (dedupe, event["comment_id"], actor, event.get("text", ""),
-                     json.dumps(event, ensure_ascii=False)))
                 # edit/delete sau khi đã reply -> REVIEW, không tự gửi lại
                 if event.get("event_type") in ("edit", "delete"):
                     if event["event_type"] == "delete":
@@ -422,12 +548,37 @@ class Engine:
                     self.store.audit(event["comment_id"], "scope_review", result, now_iso)
                     self.store.conn.commit(); return result
                 self._sweep_expired(event, now_iso)
-                ctx = self.context(event, postcard)
+                ctx = self.context(event, postcard, trusted_context_messages)
+                if event.get("post_id") in trusted_source_ids:
+                    trusted_source_ids[event["post_id"]]["state_token"] = ctx["state_token"]
                 if semantic is None:
                     result["routing"].append("REVIEW_NO_SEMANTIC")
                     self.store.audit(event["comment_id"], "no_semantic", result, now_iso)
                     self.store.conn.commit(); return result
-                ctx_texts = [r["text"] for r in ctx["recent"]] + ctx.get("parent_texts", [])
+                if expected_state_token is not None and expected_state_token != ctx["state_token"]:
+                    result["routing"].append("REVIEW_STALE_CONTEXT")
+                    self.store.audit(event["comment_id"], "stale_context", result, now_iso)
+                    self.store.conn.commit(); return result
+                semantic = attach_context_provenance(semantic, event, ctx, postcard)
+                for message in [*ctx["messages"], *ctx["recent"]]:
+                    mid = message.get("message_id")
+                    if mid:
+                        source = trusted_source_ids.get(mid)
+                        if isinstance(source, str):
+                            source = {"text": source}
+                            trusted_source_ids[mid] = source
+                        if isinstance(source, dict):
+                            source.setdefault("text", message.get("text", ""))
+                            if message.get("actor_id") is not None:
+                                source["actor_id"] = message["actor_id"]
+                            source.update(state_token=ctx["state_token"])
+                            if message.get("role"):
+                                source["role"] = message["role"]
+                        else:
+                            trusted_source_ids[mid] = {"text": message.get("text", ""),
+                                "actor_id": message.get("actor_id"),
+                                "state_token": ctx["state_token"], "role": message.get("role")}
+                ctx_texts = [postcard.get("text", "")] + [r["text"] for r in ctx["recent"]] + ctx.get("parent_texts", [])
                 if isinstance(trusted_context_texts, (list, tuple)):
                     ctx_texts += [text for text in trusted_context_texts
                                   if isinstance(text, str) and text.strip() and len(text) <= 20000]
@@ -436,6 +587,12 @@ class Engine:
                     result["errors"] = errs; result["routing"].append("REVIEW_SCHEMA")
                     self.store.audit(event["comment_id"], "schema_error", result, now_iso)
                     self.store.conn.commit(); return result
+                result["semantic"] = semantic
+                result["semantic_version"] = semantic["schema_version"]
+                result["intent_labels"] = list(dict.fromkeys(
+                    semantic.get("intent_labels") or [r["topic"] for r in semantic.get("requests", [])]))
+                result["category"] = semantic.get("category")
+                result["tags"] = list(semantic.get("tags") or [])
                 # Gate kill-switch (khẩn cấp: chặn cả pref phase).
                 if self.kill_switch:
                     result["routing"].append("BLOCKED_KILL_SWITCH")
@@ -508,7 +665,8 @@ class Engine:
                 # chạm vào chúng — request MỚI tạo trong lượt mơ hồ thì giữ
                 # làm placeholder OPEN cho câu hỏi làm rõ tham chiếu tới.
                 pre_snapshot = {}
-                for _r in self.store.active_requests(page, actor):
+                for _r in self.store.active_requests(page, actor, event.get("post_id"),
+                                                     event.get("thread_root_id")):
                     pre_snapshot[_r["id"]] = (json.loads(json.dumps(_r["slots"], ensure_ascii=False)),
                                               _r["status"])
                 self.store.conn.execute("SAVEPOINT business")
@@ -551,7 +709,10 @@ class Engine:
                                             or _cur["status"] != _old_status):
                                     _cur["slots"] = _old_slots; _cur["status"] = _old_status
                                     _cur["version"] += 1; self.store.save_request(_cur)
-                                    for _p in self.store.open_pending_for(actor, _req["id"]):
+                                    for _p in self.store.open_pending_for(
+                                            actor, _req["id"], page_id=page,
+                                            post_id=event.get("post_id"),
+                                            thread_root_id=event.get("thread_root_id")):
                                         if _p["qtype"] == "yes_no":
                                             _p["status"] = "SUPERSEDED"; _p["version"] += 1
                                             self.store.update_pending(_p)
@@ -715,6 +876,14 @@ class Engine:
                 self.store.conn.rollback()
                 result["errors"].append(str(e)); result["routing"].append("ERROR_ROLLBACK")
                 return result
+            finally:
+                try:
+                    after = self._trace_state_snapshot(event)
+                    result["state_after"] = after
+                    result["state_changes"] = (result["state_changes"] +
+                                               self._trace_state_diff(trace_before, after))
+                except Exception:
+                    pass
     def _apply_pref_phase(self, event, semantic, result, now_iso):
         """Pref pre-phase (R08/A1b). Trả (main_ops, err|None, deferred_allows).
         CHỈ block (protective opt-out) được áp ngay trước opt-out gate.
@@ -762,7 +931,8 @@ class Engine:
         if not topic and semantic.get("requests"):
             topic = semantic["requests"][0].get("topic")
         return topic
-    def _resolve_ref(self, ref, op, page, actor, touched, by_ref):
+    def _resolve_ref(self, ref, op, page, actor, touched, by_ref,
+                     post_id=None, thread_root_id=None):
         """Pure reads. Trả (req, err, candidates); err ∈ {None, 'not_found',
         'owner', 'page', 'ambiguous'}. Tie rule: by_ref khớp trước; rồi active
         khớp identity; rồi completed/cancelled khớp identity (reopen); >1 ứng
@@ -773,6 +943,9 @@ class Engine:
             if r:
                 if r["actor_id"] != actor: return None, "owner", None
                 if r["page_id"] != page: return None, "page", None
+                if post_id is not None and (r.get("post_id") != post_id or
+                                            r.get("thread_root_id") != thread_root_id):
+                    return None, "thread", None
                 return r, None, None
             pend = self.store.get_pending(ref)
             if pend:
@@ -780,6 +953,9 @@ class Engine:
                 if pr is None: return None, "not_found", None
                 if pend["actor_id"] != actor or pr["actor_id"] != actor: return None, "owner", None
                 if pr["page_id"] != page: return None, "page", None
+                if post_id is not None and (pr.get("post_id") != post_id or
+                                            pr.get("thread_root_id") != thread_root_id):
+                    return None, "thread", None
                 return pr, None, None
             ref = "topic:" + ref
         if isinstance(ref, str) and ref.startswith("topic:"):
@@ -794,9 +970,12 @@ class Engine:
                     if best > 0: return None, "ambiguous", winners
                 if len(cands) == 1: return cands[0], None, None
                 return None, "ambiguous", cands
-            rows = self.store.conn.execute(
-                "SELECT id FROM requests WHERE page_id=? AND actor_id=? AND topic=? ORDER BY rowid",
-                (page, actor, topic)).fetchall()
+            sql = "SELECT id FROM requests WHERE page_id=? AND actor_id=? AND topic=?"
+            args = [page, actor, topic]
+            if post_id is not None and thread_root_id is not None:
+                sql += " AND post_id=? AND thread_root_id=?"
+                args.extend((post_id, thread_root_id))
+            rows = self.store.conn.execute(sql + " ORDER BY rowid", args).fetchall()
             all_reqs = [r for r in [self.store.get_request(rid) for (rid,) in rows] if r]
             veh, var = _op_identity(op) if op else (None, None)
             active = [r for r in all_reqs if r["status"] in ("OPEN", "WAITING_USER", "READY")]
@@ -883,37 +1062,69 @@ class Engine:
             if t == "SOCIAL_ACK": continue
             if t == "UNRESOLVED": return "REVIEW_UNRESOLVED", None, blocked_idx, canon
             if t == "SET_CONTACT_PREFERENCE": continue  # đã áp ở pre-phase
-            # Provenance canonical (A6): op-level là canonical; slot-level
-            # nếu có thì PHẢI khớp op-level, không được tự ý khác. Trước
-            # đây validator chỉ kiểm op-level còn _apply_slot đọc slot-level
-            # nên slot source giả lọt qua.
+            # Operation evidence may describe the user's intent while the slot
+            # value comes from a different, explicitly identified message.
             op_src = op.get("source_message_id")
-            slot_src = (op.get("slot") or {}).get("source_message_id")
-            if op_src and slot_src and op_src != slot_src:
+            slot = op.get("slot") if isinstance(op.get("slot"), dict) else {}
+            slot_src = slot.get("source_message_id")
+            slot_source_id = slot_src or op_src
+            canon[i] = slot_source_id
+            op_excerpt = op.get("evidence_excerpt") or ""
+            slot_excerpt = slot.get("evidence_excerpt") or op_excerpt
+            if (slot and slot.get("explicit", True) and not op_src and
+                    norm(op.get("evidence_excerpt", "")) not in norm(event.get("text", ""))):
                 return "REVIEW_PROVENANCE", None, blocked_idx, canon
-            src_id = op_src or slot_src
-            canon[i] = src_id
-            if src_id:
-                trusted_source = trusted_source_ids.get(src_id)
+            if op_src:
+                trusted_source = trusted_source_ids.get(op_src)
                 if trusted_source is not None:
-                    ex = op.get("evidence_excerpt") or ""
-                    if not isinstance(trusted_source, str) or (ex and norm(ex) not in norm(trusted_source)):
+                    source_text = trusted_source.get("text") if isinstance(trusted_source, dict) else trusted_source
+                    source_actor = (trusted_source.get("actor_id") if isinstance(trusted_source, dict)
+                                    else event.get("page_id") if op_src == event.get("post_id") else None)
+                    op_source_owner_ok = (source_actor == actor or
+                                          op_src == event.get("post_id") and source_actor == page or
+                                          op_src in (event.get("parent_id"), event.get("thread_root_id")))
+                    if (not isinstance(source_text, str) or
+                            op_excerpt and norm(op_excerpt) not in norm(source_text) or
+                            not op_source_owner_ok):
                         return "REVIEW_PROVENANCE", None, blocked_idx, canon
-                elif src_id not in (event.get("parent_id"), event.get("thread_root_id"), "root"):
+                else:
                     row = self.store.conn.execute(
-                        "SELECT text, payload FROM events WHERE comment_id=?", (src_id,)).fetchone()
+                        "SELECT text, payload FROM events WHERE comment_id=?", (op_src,)).fetchone()
                     if not row: return "REVIEW_PROVENANCE", None, blocked_idx, canon
                     try: payload = json.loads(row[1] or "{}")
                     except Exception: payload = {}
                     if payload.get("page_id") != page: return "REVIEW_PROVENANCE", None, blocked_idx, canon
-                    if payload.get("actor_id") != actor and src_id not in (event.get("parent_id"), event.get("thread_root_id")):
+                    if (payload.get("post_id") != event.get("post_id") or
+                            payload.get("thread_root_id") != event.get("thread_root_id")):
                         return "REVIEW_PROVENANCE", None, blocked_idx, canon
-                    # Evidence phải nằm trong CHÍNH source đó, không chỉ nằm
-                    # đâu đó trong context (trước đây excerpt ở lượt cũ cũng
-                    # qua vì validator kiểm event/context chung).
-                    ex = op.get("evidence_excerpt") or ""
-                    if ex and norm(ex) not in norm(row[0] or ""):
+                    if (payload.get("actor_id") != actor and
+                            op_src not in (event.get("parent_id"), event.get("thread_root_id"))):
                         return "REVIEW_PROVENANCE", None, blocked_idx, canon
+                    if op_excerpt and norm(op_excerpt) not in norm(row[0] or ""):
+                        return "REVIEW_PROVENANCE", None, blocked_idx, canon
+            if slot and slot_source_id:
+                source = trusted_source_ids.get(slot_source_id)
+                if not isinstance(source, dict):
+                    return "REVIEW_PROVENANCE", None, blocked_idx, canon
+                source_text = source.get("text") or ""
+                source_actor = source.get("actor_id")
+                post_inference = (slot_source_id == event.get("post_id") and
+                                  source.get("role") == "post" and slot.get("explicit", True) is False and
+                                  slot.get("kind") == "vehicle" and
+                                  canon_slot("vehicle", slot.get("value")) in
+                                  {canon_slot("vehicle", v) for v in source.get("vehicles", [])})
+                inferred = slot.get("explicit", True) is False
+                if (inferred and (slot_source_id == event.get("comment_id") or
+                                  source.get("state_token") != slot.get("source_state_token") or
+                                  source_actor != slot.get("source_actor_id")) or
+                        source_actor != actor and not post_inference or
+                        slot.get("explicit", True) and source_actor != actor or
+                        slot_excerpt and norm(slot_excerpt) not in norm(source_text) and
+                        not (post_inference and any(
+                            norm(slot_excerpt) == norm(vehicle) and
+                            canon_slot("vehicle", vehicle) == canon_slot("vehicle", slot.get("value"))
+                            for vehicle in source.get("vehicles", [])))):
+                    return "REVIEW_PROVENANCE", None, blocked_idx, canon
             if t == "START_REQUEST":
                 topic = self._start_topic(op, semantic)
                 topic_start_counts[topic] = topic_start_counts.get(topic, 0) + 1
@@ -925,7 +1136,8 @@ class Engine:
                 # mỗi START dùng identity của chính nó, không dùng identity
                 # cuối lượt cho mọi check.
                 veh, var = _start_identity(ops, ref, op)
-                if topic and self.store.handoff_for_scope(page, actor, topic, veh, var):
+                if topic and self.store.handoff_for_scope(page, actor, topic, veh, var,
+                                                          event.get("post_id"), event.get("thread_root_id")):
                     blocked_idx.add(i)
                     continue
                 # Virtual request cho op sau cùng turn resolve (chưa tạo thật).
@@ -949,11 +1161,13 @@ class Engine:
                 else:
                     by_ref[ref] = vreq
                 continue
-            req, err, cands = self._resolve_ref(op.get("request_ref"), op, page, actor, touched, by_ref)
+            req, err, cands = self._resolve_ref(op.get("request_ref"), op, page, actor, touched, by_ref,
+                                                event.get("post_id"), event.get("thread_root_id"))
             if err == "ambiguous":
                 return None, dict(topic=op.get("request_ref"), candidates=cands), blocked_idx, canon
             if err == "owner": return "REVIEW_OWNER", None, blocked_idx, canon
             if err == "page": return "REVIEW_PAGE_SCOPE", None, blocked_idx, canon
+            if err == "thread": return "REVIEW_THREAD_SCOPE", None, blocked_idx, canon
             if err == "not_found":
                 if t in ("REQUEST_HUMAN", "REPORT_COMPLAINT"): continue  # apply tạo rồi handoff
                 return "REVIEW_BAD_REF", None, blocked_idx, canon
@@ -1002,7 +1216,12 @@ class Engine:
             key = f"{event['comment_id']}:reply"
             row = self.store.conn.execute("SELECT status FROM outbox WHERE dedupe_key=?", (key,)).fetchone()
             if row and row[0] == "SENT": return  # không ghi đè row đã SENT
-            self.store.conn.execute("INSERT OR REPLACE INTO outbox VALUES (?,?,?,?,?,?,?,?,?)",
+            self.store.conn.execute(
+                "INSERT INTO outbox(dedupe_key,request_id,purpose,version,status,payload,created_at,claimed_at,claimed_by) "
+                "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(dedupe_key) DO UPDATE SET "
+                "request_id=excluded.request_id,purpose=excluded.purpose,version=excluded.version,"
+                "status=excluded.status,payload=excluded.payload,created_at=excluded.created_at,"
+                "claimed_at=NULL,claimed_by=NULL",
                 (key, None, purpose, 1, status,
                  json.dumps(payload or dict(text=text), ensure_ascii=False), now_iso, None, None))
             return
@@ -1010,7 +1229,12 @@ class Engine:
             key = f"{event['comment_id']}:{req['id']}:{purpose}:{req['version']}"
             row = self.store.conn.execute("SELECT status FROM outbox WHERE dedupe_key=?", (key,)).fetchone()
             if row and row[0] == "SENT": continue
-            self.store.conn.execute("INSERT OR REPLACE INTO outbox VALUES (?,?,?,?,?,?,?,?,?)",
+            self.store.conn.execute(
+                "INSERT INTO outbox(dedupe_key,request_id,purpose,version,status,payload,created_at,claimed_at,claimed_by) "
+                "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(dedupe_key) DO UPDATE SET "
+                "request_id=excluded.request_id,purpose=excluded.purpose,version=excluded.version,"
+                "status=excluded.status,payload=excluded.payload,created_at=excluded.created_at,"
+                "claimed_at=NULL,claimed_by=NULL",
                 (key, req["id"], purpose, req["version"], status,
                  json.dumps(payload or dict(text=text), ensure_ascii=False), now_iso, None, None))
     def _outbox_intended(self, event, touched, purpose, payload, now_iso):
@@ -1058,7 +1282,8 @@ class Engine:
                             if topic_start_counts[topic] <= len(topic_outcomes) else topic)
                 _ref = op.get("request_ref") or f"topic:{topic}"
                 _veh, _var = _start_identity(ops, _ref, op)
-                if topic and self.store.handoff_for_scope(page, actor, topic, _veh, _var):
+                if topic and self.store.handoff_for_scope(page, actor, topic, _veh, _var,
+                                                          event.get("post_id"), event.get("thread_root_id")):
                     _block_handoff(); continue  # A4: skip riêng START này
                 start_counts[_ref] = start_counts.get(_ref, 0) + 1
                 if start_counts[_ref] > 1:
@@ -1071,7 +1296,7 @@ class Engine:
                     if _ident_match(_t, topic, _veh, _var) and _t.get("desired_outcomes") == [_outcome]: _dup = _t; break
                 if _dup is not None:
                     if op.get("slot"):
-                        self._apply_slot(_dup, op, event, _canon); self.store.save_request(_dup)
+                        self._apply_slot(_dup, op, event, _canon, ctx.get("state_token")); self.store.save_request(_dup)
                     if _ref not in multi_refs: by_ref[_ref] = _dup
                     continue
                 # Reuse request cùng identity đang mở; khác identity -> tạo mới
@@ -1084,25 +1309,27 @@ class Engine:
                 # của nó (lỗi: hỏi giá Tucson lại sửa request giá Creta).
                 existing = None
                 if _veh is not None or _var is not None:
-                    for a in self.store.active_requests(page, actor):
+                    for a in self.store.active_requests(page, actor, event.get("post_id"),
+                                                        event.get("thread_root_id")):
                         if _ident_match(self.store.get_request(a["id"]), topic, _veh, _var) and \
                                 self.store.get_request(a["id"]).get("desired_outcomes") == [_outcome]:
                             existing = self.store.get_request(a["id"]); break
                 if existing:
                     req = existing
                     if op.get("slot"):
-                        self._apply_slot(req, op, event, _canon); self.store.save_request(req)
+                        self._apply_slot(req, op, event, _canon, ctx.get("state_token")); self.store.save_request(req)
                 else:
-                    req = _new_req(page, actor, topic,
+                    req = _new_req(page, event.get("post_id"), event.get("thread_root_id"), actor, topic,
                                    _outcome,
                                    event["comment_id"], now_iso)
                     self.store.insert_request(req)
                     if op.get("slot"):
-                        self._apply_slot(req, op, event, _canon); self.store.save_request(req)
+                        self._apply_slot(req, op, event, _canon, ctx.get("state_token")); self.store.save_request(req)
                 if _ref not in multi_refs: by_ref[_ref] = req
                 if req not in touched: touched.append(req)
                 continue
-            req, err, _cands = self._resolve_ref(op.get("request_ref"), op, page, actor, touched, by_ref)
+            req, err, _cands = self._resolve_ref(op.get("request_ref"), op, page, actor, touched, by_ref,
+                                                 event.get("post_id"), event.get("thread_root_id"))
             if err == "ambiguous":
                 result["errors"].append(f"ambiguous request_ref: {op.get('request_ref')}")
                 result["routing"].append("REVIEW_REF_AMBIGUOUS"); return touched, None
@@ -1112,10 +1339,14 @@ class Engine:
             if err == "page":
                 result["errors"].append("page scope mismatch"); result["routing"].append("REVIEW_PAGE_SCOPE")
                 return touched, None
+            if err == "thread":
+                result["errors"].append("post/thread scope mismatch"); result["routing"].append("REVIEW_THREAD_SCOPE")
+                return touched, None
             if req is None and t in ("REQUEST_HUMAN", "REPORT_COMPLAINT"):
                 # Khiếu nại có thể đến khi chưa có request mở: tạo rồi handoff.
                 topic = op["request_ref"][6:] if str(op.get("request_ref", "")).startswith("topic:") else "complaint"
-                req = _new_req(page, actor, topic, topic, event["comment_id"], now_iso)
+                req = _new_req(page, event.get("post_id"), event.get("thread_root_id"),
+                               actor, topic, topic, event["comment_id"], now_iso)
                 self.store.insert_request(req)
             if req is None:
                 result["errors"].append(f"request_ref not found: {op.get('request_ref')}")
@@ -1135,14 +1366,14 @@ class Engine:
             if req["id"] and self.store.handoff(req["id"]):
                 _block_handoff(); continue  # A4: skip riêng op này
             if t == "UPDATE_SLOT":
-                self._apply_slot(req, op, event, _canon); self.store.save_request(req)
+                self._apply_slot(req, op, event, _canon, ctx.get("state_token")); self.store.save_request(req)
             elif t in ("ANSWER_PENDING", "CONFIRM_PENDING", "REJECT_PENDING"):
                 perr = self._validate_pending(op, req, event, now_iso)
                 if perr:
                     result["routing"].append(perr); return touched, None
                 pend = self.store.get_pending(op.get("pending_id") or "")
                 if t == "ANSWER_PENDING":
-                    self._apply_slot(req, op, event, _canon)
+                    self._apply_slot(req, op, event, _canon, ctx.get("state_token"))
                     pend["status"] = "ANSWERED"; pend["version"] += 1; self.store.update_pending(pend)
                     self.store.save_request(req)
                 elif t == "CONFIRM_PENDING":
@@ -1156,7 +1387,9 @@ class Engine:
                     self.store.add_proposal_rejection(
                         req["id"], _canon_slot_values(req["slots"]), now_iso)
             elif t == "CANCEL_REQUEST":
-                for p in self.store.open_pending_for(actor, req["id"]):
+                for p in self.store.open_pending_for(actor, req["id"], page_id=page,
+                                                      post_id=event.get("post_id"),
+                                                      thread_root_id=event.get("thread_root_id")):
                     p["status"] = "SUPERSEDED"; p["version"] += 1; self.store.update_pending(p)
                 req["status"] = "CANCELLED"; req["version"] += 1; self.store.save_request(req)
             elif t in ("REQUEST_HUMAN", "REPORT_COMPLAINT"):
@@ -1176,21 +1409,27 @@ class Engine:
             if op.get("request_ref") and op.get("request_ref") not in multi_refs:
                 by_ref[op["request_ref"]] = req
         return touched, None
-    def _apply_slot(self, req, op, event, canonical=None):
+    def _apply_slot(self, req, op, event, canonical=None, state_token=None):
         """Normalize primary and extra values, bumping the version once per op."""
         slot = op.get("slot") or {}
         slots = [slot]
         for kind, raw in (slot.get("extra") or {}).items():
             if kind == slot.get("kind"): continue
-            slots.append(dict(kind=kind, value=raw, explicit=False,
-                              source_message_id=slot.get("source_message_id")))
+            slots.append(dict(kind=kind, value=raw, explicit=slot.get("explicit", True),
+                              source_message_id=slot.get("source_message_id"),
+                              source_request_id=slot.get("source_request_id"),
+                              source_actor_id=slot.get("source_actor_id"),
+                              source_state_token=slot.get("source_state_token")))
         # Clear dependencies from the old vehicle before applying this turn's variant/color.
         for value_slot in sorted(slots, key=lambda s: s.get("kind") != "vehicle"):
-            self._apply_slot_value(req, value_slot, event, canonical)
+            self._apply_slot_value(req, value_slot, event, canonical, state_token)
         req["version"] += 1
 
     def _supersede_testdrive_proposals(self, req):
-        for pend in self.store.open_pending_for(req["actor_id"], req["id"]):
+        for pend in self.store.open_pending_for(req["actor_id"], req["id"],
+                                                 page_id=req.get("page_id"),
+                                                 post_id=req.get("post_id"),
+                                                 thread_root_id=req.get("thread_root_id")):
             if pend["qtype"] == "yes_no":
                 pend["status"] = "SUPERSEDED"; pend["version"] += 1; self.store.update_pending(pend)
 
@@ -1206,18 +1445,20 @@ class Engine:
         self._supersede_testdrive_proposals(req)
         return True
 
-    def _apply_slot_value(self, req, slot, event, canonical=None):
+    def _apply_slot_value(self, req, slot, event, canonical=None, state_token=None):
         """Apply one value with validated provenance; preserve unchanged inherited slots."""
-        kind, raw = slot.get("kind"), slot.get("value")
+        kind, slot_value = slot.get("kind"), slot.get("value")
+        raw = slot.get("raw") if isinstance(slot.get("raw"), str) else slot_value
         if kind == "down_payment_unit":
             dp = _slot(req, "down_payment")
             if isinstance(dp, dict):
-                dp = dict(dp); dp["unit"] = raw
+                dp = dict(dp); dp["unit"] = slot_value
                 _set_slot(req, "down_payment", dp, raw,
                           canonical if canonical is not None else event["comment_id"],
-                          explicit=True, bump=False)
+                          explicit=True, source_actor_id=event["actor_id"], bump=False)
                 return
-        value = canon_slot(kind, raw) if kind in ("vehicle", "variant", "color", "location", "price_kind") else raw
+        value = canon_slot(kind, slot_value)
+        inherited_datetime = None
         if kind == "datetime" and isinstance(raw, str):
             tk, tv = parse_time_expression(raw, self.clock.now())
             if tk == "exact":
@@ -1232,6 +1473,8 @@ class Engine:
                 cur = _slot(req, "datetime")
                 if isinstance(cur, str):
                     try:
+                        current_slot = req["slots"].get("datetime")
+                        inherited_datetime = current_slot if isinstance(current_slot, dict) else None
                         hour, minute = tv if isinstance(tv, tuple) else (tv, 0)
                         value = datetime.fromisoformat(cur).replace(hour=hour, minute=minute, second=0, microsecond=0).isoformat()
                         if datetime.fromisoformat(value) < self.clock.now():
@@ -1259,11 +1502,21 @@ class Engine:
             req["slots"].pop("variant", None); req["slots"].pop("color", None)
         old = req["slots"].get(kind)
         new_explicit = slot.get("explicit", True)
+        if inherited_datetime and inherited_datetime.get("source_message_id"):
+            source_id = inherited_datetime["source_message_id"]
+            _set_slot(req, kind, value, raw, source_id, explicit=False,
+                      source_request_id=req["id"],
+                      source_actor_id=inherited_datetime.get("source_actor_id") or req["actor_id"],
+                      source_state_token=state_token, bump=False)
+            return
         # A6: canonical (nếu có) thắng mọi nguồn khác và đã được validate ở
         # _validate_ops; chỉ khi không có canonical mới dùng logic kế thừa.
         if canonical is not None:
             _set_slot(req, kind, value, raw, canonical,
-                      explicit=new_explicit, confirmed=slot.get("confirmed", False), bump=False)
+                      explicit=new_explicit, confirmed=slot.get("confirmed", False),
+                      source_request_id=slot.get("source_request_id"),
+                      source_actor_id=slot.get("source_actor_id") or event["actor_id"],
+                      source_state_token=slot.get("source_state_token"), bump=False)
         elif old is not None and old.get("value") == value and not slot.get("source_message_id"):
             pass  # kế thừa y hệt: giữ nguyên nguồn + explicit gốc
         else:
@@ -1271,7 +1524,10 @@ class Engine:
             if src_id is None:
                 src_id = event["comment_id"] if new_explicit else None
             _set_slot(req, kind, value, raw, src_id,
-                      explicit=new_explicit, confirmed=slot.get("confirmed", False), bump=False)
+                      explicit=new_explicit, confirmed=slot.get("confirmed", False),
+                      source_request_id=slot.get("source_request_id"),
+                      source_actor_id=slot.get("source_actor_id") or event["actor_id"],
+                      source_state_token=slot.get("source_state_token"), bump=False)
     # ---------- flow / plan ----------
     def _ask(self, req, event, qtype, slot, options, proposition, now_iso):
         exp = (now_iso[:10] and (datetime.fromisoformat(now_iso) + timedelta(hours=PENDING_TTL_HOURS)).isoformat())
@@ -1501,7 +1757,10 @@ class Engine:
                 except Exception: dt = None
             # Đề xuất cũ bị thay bằng đề xuất mới khi slot đổi: supersede pending mở.
             if vehicle and loc and dt:
-                for pend in self.store.open_pending_for(req["actor_id"], req["id"]):
+                for pend in self.store.open_pending_for(req["actor_id"], req["id"],
+                                                         page_id=req.get("page_id"),
+                                                         post_id=req.get("post_id"),
+                                                         thread_root_id=req.get("thread_root_id")):
                     if pend["qtype"] == "yes_no":
                         pend["status"] = "SUPERSEDED"; pend["version"] += 1; self.store.update_pending(pend)
             if not vehicle or not loc or not dt:

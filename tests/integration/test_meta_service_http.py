@@ -57,6 +57,7 @@ class MetaServiceHTTPTests(unittest.TestCase):
             service_api_key="private-api-key", outbound_enabled=True,
             db_path=Path(self.temp.name) / "meta.db",
             budget_path=Path(self.temp.name) / "budget.jsonl",
+            trace_path=Path(self.temp.name) / "trace.jsonl",
             model_call=lambda *args, **kwargs: {"ok": False, "attempts": 0},
         )
         self.addCleanup(self._close)

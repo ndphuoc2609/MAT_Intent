@@ -5,7 +5,7 @@ Checkpoint từng ca: runs/api_checkpoints/<case_id>.json (resume không gọi l
 Budget guard: pre-estimate 0.00032/call; dừng nếu vượt $2.00 hoặc 300 calls tích lũy.
 """
 from __future__ import annotations
-import json, os, sys, hashlib
+import json, os, sys, hashlib, uuid
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from app.harness import make_engine
@@ -65,13 +65,15 @@ def main():
     total_calls = total_cost = 0.0
     results = []
     def _make_hook():
-        _inflight = [0]
+        reservations = []
         def hook():
-            if _lunk0 > 0 or _run_unknown: return False
-            if _lc0 + total_calls + _inflight[0] + 1 > 300: return False
-            _inflight[0] += 1
-            return True
-        return hook
+            reservation_id = uuid.uuid4().hex
+            allowed, _ = budget_ledger.reserve(
+                budget_ledger.DEFAULT_PATH, reservation_id=reservation_id,
+                max_calls=300, max_cost=2.00, reserve_cost_usd=0.00032)
+            if allowed: reservations.append(reservation_id)
+            return allowed
+        return hook, reservations
     for case in cases:
         ck = os.path.join(ckdir, case["id"] + ".json")
         case_key = full_cache_key(comment=case["comment"], parent=case.get("parent", ""),
@@ -102,16 +104,18 @@ def main():
             if _lc0 + total_calls + 1 > 300 or _lcost0 + total_cost + 0.00032 > 2.00 or _lunk0 > 0 or _run_unknown:
                 print(f"BUDGET STOP trước {case['id']}: ledger baseline calls={_lc0} cost~{_lcost0:.4f} unknown={_lunk0}, run calls={total_calls}"); break
             post = f"{case['postcard'].get('topic', '')} — xe: {', '.join(case['postcard'].get('vehicles', []))}"
+            call_guard, reservations = _make_hook()
             api = call_luna(post, case["comment"], parent=case.get("parent", ""),
-                            budget_guard=_make_hook())
+                            budget_guard=call_guard)
             total_calls += api.get("attempts", 1)
             if api.get("ok"): total_cost += api.get("cost_usd_est") or 0.0
             if api.get("cost_usd_est") is None: _run_unknown = True
             budget_ledger.record(budget_ledger.DEFAULT_PATH, run_id="api_eval",
                                  kind="call", attempts=api.get("attempts", 1),
-                                 cost_usd_est=api.get("cost_usd_est") if api.get("ok") else 0.0,
+                                 cost_usd_est=api.get("cost_usd_est"),
                                  model=api.get("model_effective", MODEL),
                                  status=None if api.get("ok") else "failed")
+            budget_ledger.settle_reservations(budget_ledger.DEFAULT_PATH, reservations)
             if not api.get("ok"):
                 rec = dict(cache_key_v2=case_key, id=case["id"], family=case["family"], ok=False, error=api.get("error"),
                            attempts=api.get("attempts", 1), cost_usd_est=0, routing="ERROR",
@@ -124,17 +128,18 @@ def main():
                 if _lc0 + total_calls + 1 > 300 or _lcost0 + total_cost + 0.00032 > 2.00 or _lunk0 > 0 or _run_unknown:
                     print(f"BUDGET STOP trước repair {case['id']}")
                 else:
+                    repair_guard, reservations = _make_hook()
                     rep = call_luna(post, case["comment"], parent=case.get("parent", ""),
-                                    repair_note="; ".join(errs),
-                                    budget_guard=_make_hook())
+                                    repair_note="; ".join(errs), budget_guard=repair_guard)
                     total_calls += rep.get("attempts", 1)
                     if rep.get("ok"): total_cost += rep.get("cost_usd_est") or 0.0
                     if rep.get("cost_usd_est") is None: _run_unknown = True
                     budget_ledger.record(budget_ledger.DEFAULT_PATH, run_id="api_eval",
                                          kind="repair", attempts=rep.get("attempts", 1),
-                                         cost_usd_est=rep.get("cost_usd_est") if rep.get("ok") else 0.0,
+                                         cost_usd_est=rep.get("cost_usd_est"),
                                          model=rep.get("model_effective", MODEL),
                                          status=None if rep.get("ok") else "failed")
+                    budget_ledger.settle_reservations(budget_ledger.DEFAULT_PATH, reservations)
                     if rep.get("ok"):
                         sem2 = rep["semantic"]
                         errs2 = validate_semantic(sem2, case["comment"], [case.get("parent", "")])

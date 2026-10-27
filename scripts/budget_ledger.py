@@ -12,7 +12,8 @@ Khi đó guard chi phí KHÔNG xác minh được -> fail-closed: chặn spend t
 vẫn đếm bình thường.
 """
 from __future__ import annotations
-import json, math, os
+import fcntl, json, math, os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 DEFAULT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -33,6 +34,51 @@ def _read_records(path):
                 try: records.append(json.loads(line))
                 except (ValueError, RecursionError): records.append(None)
     return records
+
+
+@contextmanager
+def _locked(path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    stream = open(path, "a+", encoding="utf-8")
+    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    stream.seek(0)
+    records = []
+    for line in stream:
+        if not line.strip(): continue
+        try: records.append(json.loads(line))
+        except (ValueError, RecursionError): records.append(None)
+    try:
+        yield stream, records
+    finally:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
+
+
+def _append_locked(stream, row):
+    stream.seek(0, os.SEEK_END)
+    stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+
+
+def _active_reservations(records):
+    reserved, settled, invalid = {}, set(), 0
+    for rec in records:
+        if not isinstance(rec, dict): continue
+        if rec.get("kind") == "reservation":
+            rid = rec.get("reservation_id")
+            if not isinstance(rid, str) or not rid or rid in reserved:
+                invalid += 1
+            else:
+                reserved[rid] = rec
+        elif rec.get("kind") == "reservation_settlement":
+            rid = rec.get("reservation_id")
+            if not isinstance(rid, str) or not rid or rid in settled:
+                invalid += 1
+            else:
+                settled.add(rid)
+    invalid += len(settled - reserved.keys())
+    return {rid: row for rid, row in reserved.items() if rid not in settled}, invalid
 
 def _reconciled_costs(records):
     targets, events = {}, {}
@@ -61,14 +107,15 @@ def _reconciled_costs(records):
             costs[key] = rows[0][1]
     return costs, valid_rows
 
-def totals(path=DEFAULT_PATH):
-    """Trả (calls, cost_known, unknown_count, entries). File không có -> 0."""
+def totals_from_records(records):
+    """Compute ledger totals from a snapshot already protected by its file lock."""
     calls, cost, unknown, n = 0, 0.0, 0, 0
-    records = _read_records(path)
     reconciled, valid_rows = _reconciled_costs(records)
     for i, rec in enumerate(records):
         n += 1
         if i in valid_rows: continue
+        if isinstance(rec, dict) and rec.get("kind") in ("reservation", "reservation_settlement"):
+            continue
         if isinstance(rec, dict) and rec.get("kind") == "reconcile":
             unknown += 1
             continue
@@ -84,7 +131,19 @@ def totals(path=DEFAULT_PATH):
             else: unknown += 1
         else:
             cost += float(rec.get("cost_usd_est") or 0)
+    active, invalid_reservations = _active_reservations(records)
+    unknown += invalid_reservations
+    for reservation in active.values():
+        calls += 1
+        amount = reservation.get("reserve_cost_usd")
+        if _valid_amount(amount): cost += float(amount)
+        else: unknown += 1
     return calls, cost, unknown, n
+
+
+def totals(path=DEFAULT_PATH):
+    """Trả (calls, cost_known, unknown_count, entries). File không có -> 0."""
+    return totals_from_records(_read_records(path))
 
 def record(path, *, run_id, kind, attempts, cost_usd_est, model="", note="", status=None):
     """Append một attempt. kind: 'call' | 'repair' | 'retry'. status:
@@ -92,7 +151,6 @@ def record(path, *, run_id, kind, attempts, cost_usd_est, model="", note="", sta
     cost None -> 'unknown_cost', ngược lại 'completed'). Báo cáo tách
     attempted/reserved/completed/failed/actual cost/unknown cost bằng
     breakdown() thay vì cộng gộp một số duy nhất."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     if not _valid_amount(cost_usd_est):
         cost_usd_est = None
     if status is None:
@@ -103,8 +161,8 @@ def record(path, *, run_id, kind, attempts, cost_usd_est, model="", note="", sta
            "cost_unknown": cost_usd_est is None,
            "status": status,
            "model": model, "note": note}
-    with open(path, "a") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    with _locked(path) as (stream, _):
+        _append_locked(stream, rec)
     return rec
 
 def reconcile_unknown_cost(path=DEFAULT_PATH, *, original_ts, run_id, cost_usd_est, reason):
@@ -113,34 +171,84 @@ def reconcile_unknown_cost(path=DEFAULT_PATH, *, original_ts, run_id, cost_usd_e
         raise ValueError("reconciliation target must identify an attempt")
     if not _valid_amount(cost_usd_est) or not isinstance(reason, str) or not reason.strip():
         raise ValueError("reconciliation needs a known non-negative cost and reason")
-    records = _read_records(path)
-    targets = [r for r in records if isinstance(r, dict) and r.get("ts") == original_ts
-               and r.get("run_id") == run_id and r.get("status") in ("failed", "unknown_cost")
-               and type(r.get("attempts")) is int and r["attempts"] > 0
-               and not _valid_amount(r.get("cost_usd_est"))]
-    if len(targets) != 1:
-        raise ValueError("reconciliation target must be one unknown-cost attempt")
-    if any(isinstance(r, dict) and r.get("kind") == "reconcile"
-           and r.get("reconciles") == {"ts": original_ts, "run_id": run_id} for r in records):
-        raise ValueError("attempt already has a reconciliation")
-    rec = {"ts": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
-           "kind": "reconcile", "attempts": 0, "cost_usd_est": float(cost_usd_est),
-           "cost_unknown": False, "status": "reconciled",
-           "reconciles": {"ts": original_ts, "run_id": run_id}, "reason": reason.strip()}
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    with _locked(path) as (stream, records):
+        targets = [r for r in records if isinstance(r, dict) and r.get("ts") == original_ts
+                   and r.get("run_id") == run_id and r.get("status") in ("failed", "unknown_cost")
+                   and type(r.get("attempts")) is int and r["attempts"] > 0
+                   and not _valid_amount(r.get("cost_usd_est"))]
+        if len(targets) != 1:
+            raise ValueError("reconciliation target must be one unknown-cost attempt")
+        if any(isinstance(r, dict) and r.get("kind") == "reconcile"
+               and r.get("reconciles") == {"ts": original_ts, "run_id": run_id} for r in records):
+            raise ValueError("attempt already has a reconciliation")
+        rec = {"ts": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
+               "kind": "reconcile", "attempts": 0, "cost_usd_est": float(cost_usd_est),
+               "cost_unknown": False, "status": "reconciled",
+               "reconciles": {"ts": original_ts, "run_id": run_id}, "reason": reason.strip()}
+        _append_locked(stream, rec)
     return rec
 
+
+def reserve(path=DEFAULT_PATH, *, reservation_id, max_calls, max_cost,
+            reserve_cost_usd, prior_calls=0, prior_cost=0.0):
+    """Atomically reserve one model attempt before opening the network request."""
+    if not isinstance(reservation_id, str) or not reservation_id:
+        return False, "invalid reservation id"
+    for name, value in (("max_calls", max_calls), ("max_cost", max_cost),
+                        ("reserve_cost_usd", reserve_cost_usd),
+                        ("prior_calls", prior_calls), ("prior_cost", prior_cost)):
+        if (not _valid_amount(value) or
+                name in ("max_calls", "prior_calls") and type(value) is not int):
+            return False, f"invalid budget input: {name}; spend blocked fail-closed"
+    try:
+        with _locked(path) as (stream, records):
+            calls, cost, unknown, _ = totals_from_records(records)
+            if unknown:
+                return False, "cost unknown in ledger; spend blocked fail-closed"
+            calls += prior_calls; cost += prior_cost
+            if calls + 1 > max_calls:
+                return False, f"calls {calls}+1 > {max_calls}"
+            if cost + reserve_cost_usd > max_cost:
+                return False, f"cost {cost:.5f}+{reserve_cost_usd:.5f} > {max_cost}"
+            active, bad = _active_reservations(records)
+            if bad or reservation_id in active or any(
+                    isinstance(row, dict) and row.get("kind") == "reservation" and
+                    row.get("reservation_id") == reservation_id for row in records):
+                return False, "invalid or duplicate reservation; spend blocked fail-closed"
+            row = {"ts": datetime.now(timezone.utc).isoformat(), "kind": "reservation",
+                   "reservation_id": reservation_id, "attempts": 1,
+                   "reserve_cost_usd": float(reserve_cost_usd), "status": "reserved"}
+            _append_locked(stream, row)
+            return True, "reserved"
+    except OSError:
+        return False, "budget ledger unavailable; spend blocked fail-closed"
+
+
+def settle_reservations(path=DEFAULT_PATH, reservation_ids=()):
+    """Release reservations only after the attempt result has been recorded."""
+    ids = list(reservation_ids)
+    if not ids: return 0
+    with _locked(path) as (stream, records):
+        active, invalid = _active_reservations(records)
+        if invalid or len(set(ids)) != len(ids) or any(rid not in active for rid in ids):
+            raise ValueError("cannot settle unknown or duplicate budget reservation")
+        now = datetime.now(timezone.utc).isoformat()
+        for rid in ids:
+            _append_locked(stream, {"ts": now, "kind": "reservation_settlement",
+                                    "reservation_id": rid, "status": "settled"})
+    return len(ids)
+
 def breakdown(path=DEFAULT_PATH):
-    """Tách attempted/completed/failed/unknown_cost/actual cost (A8)."""
-    attempted = completed = failed = unknown_cost = 0
+    """Tách attempted/reserved/completed/failed/unknown cost."""
+    attempted = reserved_count = completed = failed = unknown_cost = 0
     cost = 0.0
     records = _read_records(path)
     reconciled, valid_rows = _reconciled_costs(records)
     for i, rec in enumerate(records):
         if i in valid_rows: continue
         if not isinstance(rec, dict): continue
+        if rec.get("kind") in ("reservation", "reservation_settlement"):
+            continue
         if rec.get("kind") == "reconcile":
             unknown_cost += 1
             continue
@@ -159,8 +267,17 @@ def breakdown(path=DEFAULT_PATH):
         elif st != "failed":
             completed += a
             cost += float(rec.get("cost_usd_est") or 0)
+    active, invalid = _active_reservations(records)
+    reserved_count = len(active)
+    attempted += reserved_count
+    unknown_cost += invalid
+    for row in active.values():
+        if _valid_amount(row.get("reserve_cost_usd")):
+            cost += float(row["reserve_cost_usd"])
+        else:
+            unknown_cost += 1
     return dict(attempted=attempted, completed=completed, failed=failed,
-                unknown_cost=unknown_cost, actual_cost_usd=cost)
+                reserved=reserved_count, unknown_cost=unknown_cost, actual_cost_usd=cost)
 
 def guard(path=DEFAULT_PATH, *, max_calls=300, max_cost=2.00, est_attempts=1,
           est_cost=0.0, cost_unknown=False, prior_calls=0, prior_cost=0.0):
