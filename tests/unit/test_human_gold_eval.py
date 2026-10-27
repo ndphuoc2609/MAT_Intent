@@ -49,6 +49,13 @@ class HumanGoldEvalTests(unittest.TestCase):
         self.assertTrue(report["boundary_groups"])
         self.assertEqual(report["boundary_groups"][0]["size"], 2)
 
+    def test_handoff_to_reply_is_a_critical_action_mismatch(self):
+        gold = [{**row(1, "thread", "actor", 1), "action": "HANDOFF"}]
+        prediction = [{"id": "1", "action": "REPLY"}]
+        report = score(gold, prediction)
+        self.assertEqual(report["all"]["critical_errors"], 1)
+        self.assertEqual(report["all"]["critical_error_assessed"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

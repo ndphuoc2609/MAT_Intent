@@ -1,6 +1,7 @@
 """SQLite-compatible state store; PostgreSQL shares these state operations."""
 from __future__ import annotations
 import json, sqlite3, threading, uuid
+from datetime import datetime, timezone
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events(dedupe_key TEXT PRIMARY KEY, comment_id TEXT,
@@ -31,6 +32,10 @@ CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applie
 
 class EventPayloadConflict(ValueError):
     """An idempotency key was reused for a different event payload."""
+
+
+class IntentLeaseLost(RuntimeError):
+    """The API attempt no longer owns a live processing lease."""
 
 class Store:
     def __init__(self, path=":memory:"):
@@ -80,6 +85,17 @@ class Store:
     def lock_scope(self, event):
         """SQLite already serializes this connection's transaction."""
         return None
+    def assert_intent_lease(self, event_id, attempt_token):
+        lock_clause = " FOR UPDATE" if hasattr(self.conn, "raw") else ""
+        row = self.conn.execute(
+            "SELECT status,lease_owner,lease_until FROM intent_api_events WHERE event_id=?" + lock_clause,
+            (event_id,)).fetchone()
+        try:
+            live = row and datetime.fromisoformat(row[2]) > datetime.now(timezone.utc)
+        except (TypeError, ValueError):
+            live = False
+        if not row or row[0] != "PROCESSING" or row[1] != attempt_token or not live:
+            raise IntentLeaseLost("intent processing lease is no longer live")
     def insert_event(self, dedupe, event, actor):
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO events(dedupe_key,comment_id,actor_id,text,payload,retracted) "

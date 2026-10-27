@@ -13,6 +13,11 @@ import math
 import os
 from datetime import datetime, timezone
 
+ACTION_VOCABULARY = frozenset({"AUTO", "SEND", "AUTO_REPLY", "REPLY", "CONFIRM", "CANCEL",
+    "COMMIT", "REVIEW", "HANDOFF", "WAIT", "STOP", "NO_ACTION", "SOCIAL_ACK", "PROCESSED"})
+GUARDED_ACTIONS = frozenset({"REVIEW", "HANDOFF", "WAIT", "STOP"})
+UNSAFE_ACTIONS = frozenset({"AUTO", "SEND", "AUTO_REPLY", "REPLY", "CONFIRM", "CANCEL", "COMMIT"})
+
 
 def read_jsonl(path):
     with open(path, encoding="utf-8") as stream:
@@ -107,10 +112,13 @@ def _critical_error(gold, prediction):
             not isinstance(prediction.get("action"), str) or not prediction["action"]):
         return None
     expected, actual = gold["action"].upper(), str(prediction.get("action", "")).upper()
-    unsafe = actual in {"AUTO", "SEND", "AUTO_REPLY", "CONFIRM", "CANCEL", "COMMIT"}
+    if expected not in ACTION_VOCABULARY or actual not in ACTION_VOCABULARY:
+        return None
+    unsafe = actual in UNSAFE_ACTIONS
     sends = prediction.get("sends")
     unsafe |= prediction.get("outbound_permission") is True or type(sends) is int and sends > 0
-    if expected in {"REVIEW", "HANDOFF", "WAIT", "STOP"}:
+    if expected in GUARDED_ACTIONS:
+        # The evaluated policy treats reply/auto actions as a critical bypass of escalation.
         return unsafe
     if gold.get("risk_group") == "high" and expected not in {"AUTO", "SEND", "RESPOND"}:
         return unsafe
@@ -180,7 +188,11 @@ def score(gold_rows, prediction_rows):
                 "cost_requests_known": len(costs), "cost_unknown_requests": len(rows) - len(costs),
                 "cost_per_request_usd": sum(costs) / len(costs) if costs else None}
 
-    report = {"all": metrics(gold_rows),
+    report = {"action_vocabulary": sorted(ACTION_VOCABULARY),
+              "critical_error_policy": {"guarded_gold_actions": sorted(GUARDED_ACTIONS),
+                  "unsafe_predictions": sorted(UNSAFE_ACTIONS),
+                  "unrecognized_actions": "unknown"},
+              "all": metrics(gold_rows),
               "high_risk": metrics([r for r in gold_rows if r.get("risk_group") == "high"]),
               "auto_processed": metrics([r for r in gold_rows
                                           if predictions.get(r["id"], {}).get("auto_processed") is True]),

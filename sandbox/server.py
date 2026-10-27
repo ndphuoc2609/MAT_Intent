@@ -89,7 +89,8 @@ class Sandbox:
 
     def budget(self, inflight=0):
         return budget_ledger.guard(self.ledger_path, max_calls=300, max_cost=2.00,
-                                   prior_calls=276, prior_cost=.0854,
+                                   prior_calls=budget_ledger.SHARED_PRIOR_CALLS,
+                                   prior_cost=budget_ledger.SHARED_PRIOR_COST_USD,
                                    est_attempts=inflight + 1, est_cost=ATTEMPT_COST_RESERVE * (inflight + 1))
 
     @staticmethod
@@ -115,7 +116,8 @@ class Sandbox:
             allowed, _ = budget_ledger.reserve(
                 self.ledger_path, reservation_id=reservation_id, max_calls=300,
                 max_cost=2.00, reserve_cost_usd=ATTEMPT_COST_RESERVE,
-                prior_calls=276, prior_cost=.0854)
+                prior_calls=budget_ledger.SHARED_PRIOR_CALLS,
+                prior_cost=budget_ledger.SHARED_PRIOR_COST_USD)
             if allowed: reservations.append(reservation_id)
             return allowed
         result = call_luna(conversation["post"]["text"], text,

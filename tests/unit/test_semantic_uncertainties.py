@@ -51,6 +51,30 @@ class TestUncertaintyValidation(unittest.TestCase):
                 uncertainty = {"alternatives": alternatives, "different_action": True}
                 self.assertTrue(validate_semantic(semantic([uncertainty]), "oke", []))
 
+    @staticmethod
+    def slot_semantic(text, value, excerpt, kind="vehicle"):
+        return {
+            "schema_version": "1", "sentiment": "NEU", "sarcasm": "absent",
+            "scope": "in_scope", "requests": [{"topic": "price", "desired_outcome": "price_otr",
+                "polarity": "positive"}], "uncertainties": [],
+            "operations": [{"op": "START_REQUEST", "request_ref": "topic:price",
+                "evidence_excerpt": "Giá", "slot": {"kind": kind, "value": value,
+                    "raw": excerpt, "explicit": True, "evidence_excerpt": excerpt}}],
+        }
+
+    def test_explicit_slot_value_and_its_evidence_must_be_in_current_comment(self):
+        forged = self.slot_semantic("Giá lăn bánh Creta bao nhiêu?", "Tucson", "Tucson")
+        self.assertTrue(validate_semantic(forged, "Giá lăn bánh Creta bao nhiêu?", []))
+
+        fabricated_excerpt = self.slot_semantic("Giá lăn bánh Creta bao nhiêu?", "Creta", "Tucson")
+        self.assertTrue(validate_semantic(fabricated_excerpt, "Giá lăn bánh Creta bao nhiêu?", []))
+
+    def test_slot_alias_is_supported_but_negated_value_is_not(self):
+        alias = self.slot_semantic("Giá xe bản cao nhé", "Cao cấp", "bản cao", "variant")
+        self.assertEqual(validate_semantic(alias, "Giá xe bản cao nhé", []), [])
+        negated = self.slot_semantic("Không lấy Tucson, cho hỏi giá Creta", "Tucson", "Tucson")
+        self.assertTrue(validate_semantic(negated, "Không lấy Tucson, cho hỏi giá Creta", []))
+
 
 if __name__ == "__main__":
     unittest.main()

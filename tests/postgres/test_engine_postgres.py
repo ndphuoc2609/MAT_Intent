@@ -257,3 +257,108 @@ class PostgreSqlEngineTests(unittest.TestCase):
         self.assertEqual(next(iter(result["state_after"]["requests"].values()))["slots"]
                          ["variant"]["value"], "Cao cấp")
 
+    def test_intent_api_expired_lease_fences_old_worker_and_restart_replays_review(self):
+        from tests.unit.test_intent_api import request, semantic_for
+        from app.intent_api import IntentService
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def blocking_model(post, comment, **kwargs):
+            calls.append(comment)
+            entered.set()
+            release.wait(5)
+            return {"ok": True, "semantic": semantic_for(comment), "attempts": 0}
+        first_service = IntentService(store=connect(self.dsn), api_key="pg-test-key",
+                                      model_call=blocking_model)
+        second_service = IntentService(store=connect(self.dsn), api_key="pg-test-key",
+                                       model_call=blocking_model)
+        self.addCleanup(first_service.close)
+        self.addCleanup(second_service.close)
+        first_service.lease_seconds = second_service.lease_seconds = 1
+        data = request("pg-lease-" + uuid.uuid4().hex, root_id="lease-root-" + uuid.uuid4().hex)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(first_service.process, data)
+            self.assertTrue(entered.wait(3))
+            second_service.store.conn.execute(
+                "UPDATE intent_api_events SET lease_until=? WHERE event_id=?",
+                ("2000-01-01T00:00:00+00:00", data["event_id"]))
+            expired = second_service.process(data)
+            release.set()
+            first_result = first.result(timeout=8)
+        self.assertEqual(expired[0], 200)
+        self.assertEqual(expired[1]["status"], "REVIEW")
+        self.assertEqual(first_result[0], 409)
+        self.assertEqual(first_result[1]["status"], "WORKER_LEASE_LOST")
+        self.assertEqual(first_service.get_event(data["event_id"])["status"], "REVIEW")
+        rows = first_service.store.conn.execute("SELECT count(*) FROM requests WHERE thread_root_id=?",
+                                                (data["thread_id"],)).fetchone()
+        self.assertEqual(rows[0], 0)
+        restarted = IntentService(store=connect(self.dsn), api_key="pg-test-key",
+                                  model_call=blocking_model)
+        self.addCleanup(restarted.close)
+        replay = restarted.process(data)
+        self.assertEqual(replay[0], 200)
+        self.assertTrue(replay[1]["idempotent_replay"])
+        self.assertEqual(len(calls), 1)
+
+    def test_intent_api_crash_after_inference_is_durable_review_after_restart(self):
+        from tests.unit.test_intent_api import request, semantic_for
+        from app.intent_api import IntentService
+        calls = []
+        def model_call(post, comment, **kwargs):
+            calls.append(comment)
+            return {"ok": True, "semantic": semantic_for(comment), "attempts": 0}
+        first_service = IntentService(store=connect(self.dsn), api_key="pg-test-key",
+                                      model_call=model_call)
+        self.addCleanup(first_service.close)
+        first_service.lease_seconds = 1
+        data = request("pg-crash-after-inference-" + uuid.uuid4().hex,
+                       root_id="crash-root-" + uuid.uuid4().hex)
+        first_service.engine.process = lambda *args, **kwargs: (_ for _ in ()).throw(SystemExit())
+        with self.assertRaises(SystemExit):
+            first_service.process(data)
+        row = first_service.get_event(data["event_id"])
+        self.assertEqual(row["status"], "PROCESSING")
+        first_service.store.conn.execute(
+            "UPDATE intent_api_events SET lease_until=? WHERE event_id=?",
+            ("2000-01-01T00:00:00+00:00", data["event_id"]))
+        restarted = IntentService(store=connect(self.dsn), api_key="pg-test-key",
+                                  model_call=model_call)
+        self.addCleanup(restarted.close)
+        result = restarted.process(data)
+        self.assertEqual(result[0], 200)
+        self.assertEqual(result[1]["status"], "REVIEW")
+        self.assertIn("REVIEW_INFERENCE_OUTCOME_UNKNOWN", result[1]["decision"]["routing"])
+        self.assertEqual(len(calls), 1)
+
+    def test_intent_api_state_and_result_roll_back_together_and_event_is_retryable(self):
+        from tests.unit.test_intent_api import request, semantic_for
+        from app.intent_api import IntentService
+        calls = []
+        def model_call(post, comment, **kwargs):
+            calls.append(comment)
+            return {"ok": True, "semantic": semantic_for(comment), "attempts": 0}
+        service = IntentService(store=connect(self.dsn), api_key="pg-test-key", model_call=model_call)
+        self.addCleanup(service.close)
+        data = request("pg-commit-failure-" + uuid.uuid4().hex,
+                       root_id="commit-root-" + uuid.uuid4().hex)
+        service.store.conn.execute("""CREATE FUNCTION fail_completed_result() RETURNS trigger
+            LANGUAGE plpgsql AS $$ BEGIN
+              IF NEW.status = 'COMPLETED' THEN RAISE EXCEPTION 'injected result-commit failure'; END IF;
+              RETURN NEW;
+            END $$""")
+        service.store.conn.execute("CREATE TRIGGER fail_result BEFORE UPDATE ON intent_api_events "
+            "FOR EACH ROW EXECUTE FUNCTION fail_completed_result()")
+        failed = service.process(data)
+        self.assertEqual(failed[0], 503)
+        self.assertEqual(failed[1]["status"], "PROCESSING_ERROR")
+        self.assertEqual(service.get_event(data["event_id"])["status"], "PENDING")
+        count = service.store.conn.execute("SELECT count(*) FROM requests WHERE thread_root_id=?",
+                                           (data["thread_id"],)).fetchone()
+        self.assertEqual(count[0], 0)
+        service.store.conn.execute("DROP TRIGGER fail_result ON intent_api_events")
+        service.store.conn.execute("DROP FUNCTION fail_completed_result()")
+        succeeded = service.process(data)
+        self.assertEqual(succeeded[0], 200, succeeded)
+        self.assertEqual(service.get_event(data["event_id"])["status"], "COMPLETED")
+        self.assertEqual(len(calls), 2)
+

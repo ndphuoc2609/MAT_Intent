@@ -384,17 +384,25 @@ class Engine:
             for message in external_messages or []:
                 if (not isinstance(message, dict) or message.get("message_id") not in allowed_shared or
                         message.get("message_id") in (event.get("post_id"), event.get("comment_id")) or
-                        message.get("message_id") in by_id or
                         message.get("page_id", event.get("page_id")) != event.get("page_id") or
                         message.get("post_id", event.get("post_id")) != event.get("post_id") or
                         message.get("thread_root_id", event.get("thread_root_id")) != event.get("thread_root_id") or
                         not isinstance(message.get("text"), str)):
                     continue
-                by_id[message["message_id"]] = {"message_id": message["message_id"],
+                if message["message_id"] in by_id:
+                    semantic = message.get("semantic")
+                    if (isinstance(semantic, dict) and
+                            not validate_semantic(semantic, message["text"], [])):
+                        by_id[message["message_id"]]["semantic"] = semantic
+                    continue
+                item = {"message_id": message["message_id"],
                     "actor_id": message.get("actor_id"), "role": message.get("role") or
                     ("root" if message["message_id"] == event.get("thread_root_id") else "parent"),
                     "text": message["text"], "parent_id": message.get("parent_id"),
                     "event_time": message.get("event_time")}
+                if isinstance(message.get("semantic"), dict):
+                    item["semantic"] = message["semantic"]
+                by_id[message["message_id"]] = item
             shared = [dict(message_id=event.get("post_id"), actor_id=postcard.get("page_id"),
                            role="post", text=postcard.get("text") or "")]
             shared.extend(by_id.values())
@@ -516,7 +524,7 @@ class Engine:
     # ---------- main ----------
     def process(self, event, postcard, semantic, now_dt=None, trusted_context_texts=None,
                 trusted_source_ids=None, expected_state_token=None,
-                trusted_context_messages=None):
+                trusted_context_messages=None, attempt_token=None, attempt_result_callback=None):
         trusted_source_ids = dict(trusted_source_ids or {})
         if event.get("post_id") and (postcard.get("text") or postcard.get("vehicles")):
             post_source = trusted_source_ids.get(event["post_id"])
@@ -536,8 +544,23 @@ class Engine:
         with self.store.lock:
             self.store.conn.execute("BEGIN IMMEDIATE")
             trace_before = None
+            state_trace_committed = False
             try:
                 self.store.lock_scope(event)
+                if attempt_token:
+                    self.store.assert_intent_lease(event["event_dedupe_key"], attempt_token)
+                def commit_attempt():
+                    nonlocal state_trace_committed
+                    if attempt_token:
+                        self.store.assert_intent_lease(event["event_dedupe_key"], attempt_token)
+                    if attempt_result_callback:
+                        after = self._trace_state_snapshot(event)
+                        result["state_after"] = after
+                        result["state_changes"] = (result["state_changes"] +
+                                                   self._trace_state_diff(trace_before, after))
+                        attempt_result_callback(result)
+                    self.store.conn.commit()
+                    state_trace_committed = bool(attempt_result_callback)
                 trace_before = self._trace_state_snapshot(event)
                 dedupe = event.get("event_dedupe_key")
                 if not dedupe:
@@ -550,7 +573,7 @@ class Engine:
                         dedupe = f"{event['comment_id']}:{event.get('content_version', 1)}"
                 inserted = self.store.insert_event(dedupe, event, actor)
                 if inserted.rowcount == 0:
-                    result["routing"].append("DUPLICATE_IGNORED"); self.store.conn.commit()
+                    result["routing"].append("DUPLICATE_IGNORED"); commit_attempt()
                     # A5: redelivery KHÔNG được làm mất intent đã commit nhưng
                     # chưa dispatch (crash trước dispatcher). Drain các intent
                     # tồn đọng ngay tại đây (claim nguyên tử nên an toàn dù
@@ -573,11 +596,11 @@ class Engine:
                     if sent_before:
                         result["routing"].append("REVIEW_EDIT_AFTER_REPLY" if event["event_type"] == "edit" else "RETRACTED")
                         self.store.audit(event["comment_id"], "edit_delete_after_reply", result, now_iso)
-                        self.store.conn.commit(); return result
+                        commit_attempt(); return result
                     if event["event_type"] == "delete":
-                        result["routing"].append("RETRACTED"); self.store.conn.commit(); return result
+                        result["routing"].append("RETRACTED"); commit_attempt(); return result
                 if event.get("actor_role") == "page_self":
-                    result["routing"].append("PAGE_SELF_IGNORED"); self.store.conn.commit(); return result
+                    result["routing"].append("PAGE_SELF_IGNORED"); commit_attempt(); return result
                 if isinstance(semantic, dict) and semantic.get("scope") in ("out_of_scope", "unknown"):
                     scope_errors = validate_semantic(semantic, event.get("text", ""), [])
                     if scope_errors:
@@ -585,9 +608,15 @@ class Engine:
                         result["routing"].append("REVIEW_SCHEMA")
                         self.store.audit(event["comment_id"], "schema_error", result, now_iso)
                     else:
+                        result["semantic"] = semantic
+                        result["semantic_version"] = semantic["schema_version"]
+                        result["intent_labels"] = list(dict.fromkeys(
+                            semantic.get("intent_labels") or [r["topic"] for r in semantic.get("requests", [])]))
+                        result["category"] = semantic.get("category")
+                        result["tags"] = list(semantic.get("tags") or [])
                         result["routing"].append("REVIEW_SCOPE")
                         self.store.audit(event["comment_id"], "scope_review", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 self._sweep_expired(event, now_iso)
                 ctx = self.context(event, postcard, trusted_context_messages)
                 if event.get("post_id") in trusted_source_ids:
@@ -595,14 +624,14 @@ class Engine:
                 if semantic is None:
                     result["routing"].append("REVIEW_NO_SEMANTIC")
                     self.store.audit(event["comment_id"], "no_semantic", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 if expected_state_token is not None and expected_state_token != ctx["state_token"]:
                     result["routing"].append("REVIEW_STALE_CONTEXT")
                     self.store.audit(event["comment_id"], "stale_context", result, now_iso)
                     # Keep the API inbox event durable, but let this engine event
                     # be retried with a fresh snapshot and the same idempotency key.
                     self.store.conn.execute("DELETE FROM events WHERE dedupe_key=?", (dedupe,))
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 semantic = attach_context_provenance(semantic, event, ctx, postcard)
                 for message in [*ctx["messages"], *ctx["recent"], *ctx.get("state_sources", [])]:
                     mid = message.get("message_id")
@@ -631,7 +660,7 @@ class Engine:
                 if errs:
                     result["errors"] = errs; result["routing"].append("REVIEW_SCHEMA")
                     self.store.audit(event["comment_id"], "schema_error", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 result["semantic"] = semantic
                 result["semantic_version"] = semantic["schema_version"]
                 result["intent_labels"] = list(dict.fromkeys(
@@ -642,7 +671,7 @@ class Engine:
                 if self.kill_switch:
                     result["routing"].append("BLOCKED_KILL_SWITCH")
                     self.store.audit(event["comment_id"], "blocked", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 # Pref pre-phase (R08/A1b): CHỈ block (protective opt-out)
                 # được áp trước opt-out gate; unblock/allow_all là MỞ RỘNG
                 # quyền nên bị hoãn lại tới sau risk gates (xem allow phase
@@ -652,7 +681,7 @@ class Engine:
                 if pref_err:
                     result["routing"].append(pref_err)
                     self.store.audit(event["comment_id"], "review", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 # Opt-out gates trên blocks HIỆU LỰC: blocks hiện tại trừ các
                 # kênh mà lượt này xin mở lại. Nhờ vậy "allow_all khi đang bị
                 # chặn" vẫn qua gate được, nhưng "allow_call khi đang bị chặn
@@ -667,11 +696,11 @@ class Engine:
                 if "all" in eff_blocks:
                     result["routing"].append("BLOCKED_OPT_OUT_ALL")
                     self.store.audit(event["comment_id"], "blocked", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 if "public_reply" in eff_blocks:
                     result["routing"].append("BLOCKED_OPT_OUT_PUBLIC")
                     self.store.audit(event["comment_id"], "blocked", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 # Validation phase (R01/R09/A4/A6): pure reads, CHƯA ghi
                 # business state. Trả thêm: indices của ops bị HANDOFF-block
                 # (được tách khỏi main_ops để phần còn lại vẫn xử lý được)
@@ -683,7 +712,7 @@ class Engine:
                 if verr:
                     result["routing"].append(verr)
                     self.store.audit(event["comment_id"], "review", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 main_ops_eff = [o for i, o in enumerate(main_ops) if i not in blocked_idx]
                 if blocked_idx:
                     result["routing"].append("BLOCKED_HANDOFF")
@@ -695,13 +724,13 @@ class Engine:
                     # cũng rỗng nên không vào nhánh này — vẫn đi tiếp tới
                     # allow phase và processed_no_reply.)
                     self.store.audit(event["comment_id"], "blocked", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 # Risk gate TRƯỚC apply (R02): sarcasm = meaning không tin cậy
                 # -> không commit business gì từ lượt này.
                 if semantic.get("sarcasm") in ("present", "uncertain"):
                     result["routing"].append("REVIEW_SARCASM")
                     self.store.audit(event["comment_id"], "sarcasm_review", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 # Business savepoint (R02): mọi ghi business state nằm trong
                 # này; REVIEW/BLOCKED sau apply/plan -> rollback, chỉ giữ
                 # ingest + sweep + pref + audit.
@@ -726,7 +755,7 @@ class Engine:
                     self.store.conn.execute("ROLLBACK TO SAVEPOINT business")
                     self.store.conn.execute("RELEASE SAVEPOINT business")
                     self.store.audit(event["comment_id"], "review", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 # Ambiguity gate SAU apply (A1, thay quy tắc session 3):
                 # lượt mơ hồ KHÔNG gửi gì. Request MỚI trong lượt vẫn giữ làm
                 # placeholder OPEN (VD conditional_stock_then_book). Nhưng
@@ -765,7 +794,7 @@ class Engine:
                                                      {"request_id": _req["id"]}, now_iso)
                         self.store.conn.execute("RELEASE SAVEPOINT business")
                     self.store.audit(event["comment_id"], "ambiguous_review", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 # Allow phase (A1b): chỉ tới đây (đã qua validation + sarcasm
                 # gate + ambiguity gate) thì unblock/allow mới được áp. Lượt
                 # REVIEW_SARCASM / REVIEW_AMBIGUOUS / REVIEW_SCHEMA / BLOCKED
@@ -780,7 +809,7 @@ class Engine:
                     # Mọi phần đều bị khóa (không còn touched sau apply):
                     # không gửi gì, chỉ audit + commit.
                     self.store.audit(event["comment_id"], "blocked", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 if not touched:
                     self.store.conn.execute("RELEASE SAVEPOINT business")
                     if "SOCIAL_ACK" in result["routing"]:
@@ -795,7 +824,7 @@ class Engine:
                         # (redelivery bị dedupe chặn).
                         self._outbox_intended(event, [], "reply", payload, now_iso)
                         self.store.audit(event["comment_id"], "processed", result, now_iso)
-                        self.store.conn.commit()
+                        commit_attempt()
                         status, sres = self._dispatch(event, [], "reply", result["response_text"], now_iso, payload)
                         if status == "SENT":
                             result["outbound_permission"] = True; result["sends"].append(sres)
@@ -805,7 +834,7 @@ class Engine:
                             result["routing"].append("SEND_UNKNOWN")
                         return result
                     self.store.audit(event["comment_id"], "processed_no_reply", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 # Flow + plan cho từng request được chạm. Tách phần auto-safe khỏi
                 # phần HANDOFF: gửi chỉ phần safe, phần handoff chỉ vào draft.
                 per, actions = [], []
@@ -862,7 +891,7 @@ class Engine:
                     self.store.conn.execute("ROLLBACK TO SAVEPOINT business")
                     self.store.conn.execute("RELEASE SAVEPOINT business")
                     self.store.audit(event["comment_id"], "claim_review", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 result["response_text"] = safe_text if safe else ho_text
                 result["response_plan"] = dict(parts=[x for (_, p, _, _) in per for x in p],
                                                facts_allowed=safe_nums + ho_nums, actions=actions,
@@ -873,7 +902,7 @@ class Engine:
                     self._outbox(event, [r for (r, _, _) in ho], "handoff_draft", ho_text, "NEEDS_REVIEW", now_iso)
                     self.store.conn.execute("RELEASE SAVEPOINT business")
                     self.store.audit(event["comment_id"], "processed", result, now_iso)
-                    self.store.conn.commit(); return result
+                    commit_attempt(); return result
                 if safe:
                     plan_versions = {r["id"]: r["version"] for (r, _, _) in safe}
                     plan_facts_version = self.facts.version
@@ -885,7 +914,7 @@ class Engine:
                         self.store.conn.execute("ROLLBACK TO SAVEPOINT business")
                         self.store.conn.execute("RELEASE SAVEPOINT business")
                         self.store.audit(event["comment_id"], "blocked_dispatch", result, now_iso)
-                        self.store.conn.commit(); return result
+                        commit_attempt(); return result
                     payload = dict(dedupe_key=f"{event['comment_id']}:reply",
                                    text=safe_text, comment_id=event["comment_id"])
                     self._outbox_intended(event, [r for (r, _, _) in safe], "reply", payload, now_iso)
@@ -894,7 +923,7 @@ class Engine:
                         self._outbox(event, draft_reqs, "handoff_draft", ho_text or safe_text, "NEEDS_REVIEW", now_iso)
                     self.store.conn.execute("RELEASE SAVEPOINT business")
                     self.store.audit(event["comment_id"], "processed", result, now_iso)
-                    self.store.conn.commit()
+                    commit_attempt()
                     # --- dispatcher phase (R03): claim -> recheck -> send.
                     def recheck():
                         return self._dispatch_precheck(page, actor, safe, plan_versions, plan_facts_version, plan_used, self.clock.now().isoformat())
@@ -916,7 +945,7 @@ class Engine:
                 result["routing"].append("REVIEW_NO_AUTO_ACTION")
                 self.store.conn.execute("RELEASE SAVEPOINT business")
                 self.store.audit(event["comment_id"], "processed", result, now_iso)
-                self.store.conn.commit(); return result
+                commit_attempt(); return result
             except EventPayloadConflict as e:
                 self.store.conn.rollback()
                 result["errors"].append(str(e)); result["routing"].append("EVENT_ID_CONFLICT")
@@ -929,8 +958,9 @@ class Engine:
                 try:
                     after = self._trace_state_snapshot(event)
                     result["state_after"] = after
-                    result["state_changes"] = (result["state_changes"] +
-                                               self._trace_state_diff(trace_before, after))
+                    if not state_trace_committed:
+                        result["state_changes"] = (result["state_changes"] +
+                                                   self._trace_state_diff(trace_before, after))
                 except Exception:
                     pass
     def _apply_pref_phase(self, event, semantic, result, now_iso):

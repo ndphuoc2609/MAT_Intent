@@ -61,6 +61,8 @@ def main():
     # A8: baseline ledger đọc MỘT LẦN (trước đây mỗi case đọc lại totals()
     # sau khi record -> double count cùng một call).
     _lc0, _lcost0, _lunk0, _ = budget_ledger.totals()
+    _prior_calls, _prior_cost = (budget_ledger.SHARED_PRIOR_CALLS,
+                                 budget_ledger.SHARED_PRIOR_COST_USD)
     _run_unknown = False
     total_calls = total_cost = 0.0
     results = []
@@ -70,7 +72,8 @@ def main():
             reservation_id = uuid.uuid4().hex
             allowed, _ = budget_ledger.reserve(
                 budget_ledger.DEFAULT_PATH, reservation_id=reservation_id,
-                max_calls=300, max_cost=2.00, reserve_cost_usd=0.00032)
+                max_calls=300, max_cost=2.00, reserve_cost_usd=0.00032,
+                prior_calls=_prior_calls, prior_cost=_prior_cost)
             if allowed: reservations.append(reservation_id)
             return allowed
         return hook, reservations
@@ -101,7 +104,8 @@ def main():
             api = dict(ok=True, semantic=sem, attempts=0, cost_usd_est=0,
                        usage=None, model_effective=MODEL)
         else:
-            if _lc0 + total_calls + 1 > 300 or _lcost0 + total_cost + 0.00032 > 2.00 or _lunk0 > 0 or _run_unknown:
+            if (_lc0 + _prior_calls + total_calls + 1 > 300 or
+                    _lcost0 + _prior_cost + total_cost + 0.00032 > 2.00 or _lunk0 > 0 or _run_unknown):
                 print(f"BUDGET STOP trước {case['id']}: ledger baseline calls={_lc0} cost~{_lcost0:.4f} unknown={_lunk0}, run calls={total_calls}"); break
             post = f"{case['postcard'].get('topic', '')} — xe: {', '.join(case['postcard'].get('vehicles', []))}"
             call_guard, reservations = _make_hook()
@@ -125,7 +129,8 @@ def main():
             errs = validate_semantic(sem, case["comment"], [case.get("parent", "")])
             if errs and api.get("attempts", 1) < 3:
                 # 1 lần repair, guard TRƯỚC repair (R14; trước đây không có).
-                if _lc0 + total_calls + 1 > 300 or _lcost0 + total_cost + 0.00032 > 2.00 or _lunk0 > 0 or _run_unknown:
+                if (_lc0 + _prior_calls + total_calls + 1 > 300 or
+                        _lcost0 + _prior_cost + total_cost + 0.00032 > 2.00 or _lunk0 > 0 or _run_unknown):
                     print(f"BUDGET STOP trước repair {case['id']}")
                 else:
                     repair_guard, reservations = _make_hook()
@@ -191,6 +196,9 @@ def main():
                    api_errors=sum(1 for r in scored if not r.get("ok")),
                    topic_exact=exact, topic_recall_mean=recall, routing_match=rout,
                    total_calls=total_calls, total_cost_usd_est=total_cost,
+                   prior_calls=_prior_calls, prior_cost_usd=_prior_cost,
+                   cumulative_calls=_lc0 + _prior_calls + total_calls,
+                   cumulative_cost_usd=_lcost0 + _prior_cost + total_cost,
                    model_requested=MODEL, results=results)
     os.makedirs(os.path.dirname(os.path.join(ROOT, out_path)), exist_ok=True)
     json.dump(summary, open(os.path.join(ROOT, out_path), "w"), ensure_ascii=False, indent=2)

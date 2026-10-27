@@ -93,6 +93,9 @@ class IntentApiServiceTests(unittest.TestCase):
 
         context = json.loads(self.calls[1][2])
         self.assertEqual(context["postcard"]["vehicles"], ["Creta"])
+        root_message = next(m for m in context["messages"] if m["role"] in ("root", "root_parent"))
+        self.assertEqual(root_message["actor_id"], "A")
+        self.assertEqual(root_message["semantic"]["intent_labels"], ["price"])
         current = [m for m in context["messages"] if m["role"] == "current"]
         self.assertEqual(current[0]["actor_id"], "A")
         parent = [m for m in context["messages"] if m["role"] in ("parent", "root_parent")]
@@ -163,6 +166,87 @@ class IntentApiServiceTests(unittest.TestCase):
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[next(iter(requests))]["slots"]["variant"]["value"], "Cao cấp")
 
+    def test_engine_rollback_is_not_reported_or_persisted_as_success(self):
+        with patch.object(self.service.engine, "_apply_ops", side_effect=RuntimeError("rollback probe")):
+            code, result = self.post(request("event-engine-rollback"))
+        self.assertEqual(code, 503, result)
+        self.assertEqual(result["status"], "PROCESSING_ERROR")
+        self.assertEqual(self.service.get_event("event-engine-rollback")["status"], "PENDING")
+        self.assertEqual(self.service.engine.context(
+            {"page_id": "brand-01", "post_id": "post-01", "thread_root_id": "root-1", "actor_id": "A"},
+            {"id": "post-01", "page_id": "brand-01", "text": "Thông tin Creta", "vehicles": ["Creta"]}
+        )["active_requests"], [])
+
+    def test_context_conflict_replay_returns_same_structured_conflict_without_model_call(self):
+        self.post(request("event-context-root"))
+        before = len(self.calls)
+        conflict = request("event-context-conflict", actor="B", current_id="reply-conflict",
+            text="Oke", root_actor="A", root_text="Giá lăn bánh Tucson bao nhiêu?")
+        first_code, first = self.post(conflict)
+        second_code, second = self.post(conflict)
+        self.assertEqual(first_code, 409)
+        self.assertEqual(second_code, 409)
+        self.assertEqual({k: v for k, v in first.items() if k != "idempotent_replay"},
+                         {k: v for k, v in second.items() if k != "idempotent_replay"})
+        self.assertFalse(first["idempotent_replay"])
+        self.assertTrue(second["idempotent_replay"])
+        self.assertEqual(first["status"], "CONTEXT_CONFLICT")
+        self.assertEqual(len(self.calls), before)
+
+    def test_root_and_parent_same_id_must_match_actor_and_text(self):
+        conflict = request("event-root-parent-conflict", current_id="reply", text="Oke",
+            parent={"id": "root-1", "actor_id": "B", "text": "different"})
+        self.assertEqual(self.post(conflict)[0], 422)
+
+    def test_explicit_slot_from_model_must_not_write_unproven_value(self):
+        forged = semantic_for("Giá lăn bánh Creta bao nhiêu?")
+        forged["operations"][0]["slot"] = {"kind": "vehicle", "value": "Tucson",
+            "raw": "Tucson", "explicit": True, "evidence_excerpt": "Tucson"}
+        self.service.model_call = lambda *args, **kwargs: {"ok": True, "semantic": forged, "attempts": 0}
+        code, result = self.post(request("event-slot-forgery"))
+        self.assertEqual(code, 200, result)
+        self.assertTrue(any(r in ("REVIEW_SCHEMA", "REVIEW_PROVENANCE")
+                            for r in result["decision"]["routing"]))
+        self.assertEqual(result["state_after"]["requests"], {})
+
+    def test_scope_review_returns_the_validated_semantic(self):
+        out_of_scope = {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent",
+            "scope": "out_of_scope", "requests": [], "uncertainties": [],
+            "operations": [{"op": "UNRESOLVED", "reason": "other topic", "evidence_excerpt": "xin chào"}]}
+        self.service.model_call = lambda *args, **kwargs: {"ok": True, "semantic": out_of_scope, "attempts": 0}
+        code, result = self.post(request("event-scope-review", text="xin chào"))
+        self.assertEqual(code, 200)
+        self.assertEqual(result["status"], "REVIEW")
+        self.assertEqual(result["semantic"]["scope"], "out_of_scope")
+        self.assertIn("REVIEW_SCOPE", result["decision"]["routing"])
+
+    def test_expired_lease_fences_worker_before_state_commit(self):
+        entered, release = threading.Event(), threading.Event()
+        self.service.lease_seconds = 1
+        def slow_model(post, comment, **kwargs):
+            entered.set()
+            release.wait(3)
+            return {"ok": True, "semantic": semantic_for(comment), "attempts": 0}
+        self.service.model_call = slow_model
+        second = IntentService(store=self.store, api_key="local-test-key", model_call=slow_model)
+        second.lease_seconds = 1
+        payload = request("event-expired-lease")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(self.service.process, payload)
+            self.assertTrue(entered.wait(2))
+            self.store.conn.execute("UPDATE intent_api_events SET lease_until=? WHERE event_id=?",
+                                    ("2000-01-01T00:00:00+00:00", payload["event_id"]))
+            self.store.conn.commit()
+            from app.intent_api import validate_request
+            second_claim = second._claim(validate_request(payload))
+            release.set()
+            first_result = first.result(timeout=5)
+        self.assertEqual(second_claim[0], "replay")
+        self.assertNotEqual(first_result[1].get("status"), "PROCESSED")
+        self.assertEqual(first_result[1].get("status"), "WORKER_LEASE_LOST")
+        self.assertEqual(self.service.get_event(payload["event_id"])["status"], "REVIEW")
+        self.assertEqual(self.store.active_requests("brand-01", "A", "post-01", "root-1"), [])
+
     def test_missing_live_provider_and_budget_is_reported_without_calling_model(self):
         from app.adapters.luna import call_luna
         store = Store(":memory:")
@@ -194,6 +278,28 @@ class IntentApiServiceTests(unittest.TestCase):
         self.assertEqual(replay_status, 200)
         self.assertTrue(replay["idempotent_replay"])
         self.assertEqual(len(calls), 1)
+
+    def test_shared_legacy_budget_baseline_blocks_api_and_sandbox_at_cap(self):
+        from app.adapters.luna import call_luna
+        from sandbox.server import Sandbox
+        from scripts import budget_ledger
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = os.path.join(directory, "budget.jsonl")
+            budget_ledger.record(ledger, run_id="fixture", kind="call", attempts=24,
+                                 cost_usd_est=0.01)
+            service = IntentService(store=Store(":memory:"), api_key="local-test-key",
+                model_call=call_luna, budget_path=ledger)
+            self.addCleanup(service.close)
+            service.budget_max_calls = 300
+            service.budget_max_cost = 2.0
+            service.budget_reserve = 0.00032
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "offline-placeholder"}):
+                status, result = service.process(request("event-budget-cap"))
+            self.assertEqual(status, 503)
+            self.assertEqual(result["status"], "MODEL_UNAVAILABLE")
+            self.assertTrue(any("exhausted" in reason for reason in result["reasons"]))
+            self.assertFalse(Sandbox(ledger).budget()[0])
+            self.assertEqual(budget_ledger.totals(ledger)[0], 24)
 
     def test_http_api_auth_health_readiness_post_and_event_read(self):
         server = create_server(self.service, host="127.0.0.1", port=0)
@@ -228,6 +334,18 @@ class IntentApiServiceTests(unittest.TestCase):
         self.assertEqual(response.status, 200, result)
         self.assertEqual(result["semantic_version"], "2")
         self.assertEqual(get("/v1/events/event-http", "local-test-key")[0], 200)
+
+        failed_payload = request("event-http-engine-failure", root_id="http-error-root")
+        with patch.object(self.service.engine, "_apply_ops", side_effect=RuntimeError("rollback probe")):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/v1/intent", body=json.dumps(failed_payload).encode(), headers={
+                "Authorization": "Bearer local-test-key", "Content-Type": "application/json"})
+            failed_response = conn.getresponse()
+            failed = json.loads(failed_response.read())
+            conn.close()
+        self.assertEqual(failed_response.status, 503, failed)
+        self.assertEqual(failed["status"], "PROCESSING_ERROR")
+        self.assertEqual(self.service.get_event("event-http-engine-failure")["status"], "PENDING")
 
     def test_jev_shadow_is_bounded_and_trace_contains_no_comment_text(self):
         started, release, completed = threading.Event(), threading.Event(), threading.Event()
@@ -274,6 +392,8 @@ class IntentApiServiceTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual(counts["max_active"], 2)
             self.assertNotIn("private comment text", json.dumps(rows))
+            self.assertTrue(all(row["question_keys"] and row["decisions"] for row in rows))
+            self.assertEqual(rows[0]["decisions"]["price"], {"type": "noul", "probability": 0.2})
 
 
 if __name__ == "__main__":

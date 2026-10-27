@@ -15,14 +15,14 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .adapters.jev import JevOpenRouter, intent_questions
+from .adapters.jev import JevOpenRouter, intent_questions, validate_answers
 from .adapters.luna import PINNED_MODEL, call_luna
 from .context import fmt_context
 from .engine import Engine, WallClock
 from .facts import Facts
 from .pg_adapter import connect as connect_postgres
 from .semantics import upgrade_semantic
-from .state import EventPayloadConflict, FakeSender, Store
+from .state import EventPayloadConflict, FakeSender, IntentLeaseLost, Store
 
 API_VERSION = "1"
 SCHEMA_VERSION = "2"
@@ -88,6 +88,9 @@ def validate_request(data):
     current = _validate_message(data.get("current"), "current")
     if root["id"] != thread_id:
         raise ValueError("thread_id must equal root.id")
+    if parent and parent["id"] == root["id"] and (
+            parent["actor_id"] != root["actor_id"] or parent["text"] != root["text"]):
+        raise ValueError("parent must match root when parent.id equals root.id")
     if current["id"] == thread_id and (current["actor_id"] != root["actor_id"] or
                                         current["text"] != root["text"]):
         raise ValueError("current must match root when current.id equals thread_id")
@@ -115,6 +118,10 @@ def _json_value(value):
 
 def _result_status(routing):
     routes = [str(x) for x in (routing or [])]
+    if any(x.startswith("ERROR_") for x in routes):
+        return "PROCESSING_ERROR"
+    if any("CONFLICT" in x for x in routes):
+        return "CONTEXT_CONFLICT"
     if any(x.startswith("REVIEW") for x in routes):
         return "REVIEW"
     if any("HANDOFF" in x for x in routes):
@@ -144,6 +151,9 @@ class IntentService:
         self.budget_max_calls = _env_int("INTENT_MODEL_MAX_CALLS")
         self.budget_max_cost = _env_float("INTENT_MODEL_MAX_COST_USD")
         self.budget_reserve = _env_float("INTENT_MODEL_RESERVE_USD")
+        from scripts import budget_ledger
+        self.budget_prior_calls = budget_ledger.SHARED_PRIOR_CALLS
+        self.budget_prior_cost = budget_ledger.SHARED_PRIOR_COST_USD
         self.jev_adapter = jev_adapter or JevOpenRouter()
         self.jev_shadow_enabled = (os.environ.get("INTENT_JEV_SHADOW_ENABLED", "false").lower() == "true"
                                    if jev_shadow_enabled is None else bool(jev_shadow_enabled))
@@ -207,6 +217,8 @@ class IntentService:
                 try:
                     from scripts import budget_ledger
                     calls, cost, unknown, _ = budget_ledger.totals(self.budget_path)
+                    calls += self.budget_prior_calls
+                    cost += self.budget_prior_cost
                     if unknown:
                         reasons.append("model budget ledger contains unknown or invalid entries")
                     elif calls >= self.budget_max_calls:
@@ -227,6 +239,8 @@ class IntentService:
                 try:
                     from scripts import budget_ledger
                     calls, cost, unknown, _ = budget_ledger.totals(self.jev_budget_path)
+                    calls += self.budget_prior_calls
+                    cost += self.budget_prior_cost
                     if unknown:
                         reasons.append("Jev budget ledger contains unknown or invalid entries")
                     elif calls >= self.jev_max_calls:
@@ -283,34 +297,37 @@ class IntentService:
                         (_canonical(uncertain), "inference_outcome_unknown", now_text, request["event_id"]))
                     self.store.conn.commit()
                     return "replay", uncertain
+                attempt_token = f"{self.worker_id}:{uuid.uuid4().hex}"
                 self.store.conn.execute(
                     "UPDATE intent_api_events SET status='PROCESSING',attempts=attempts+1,lease_owner=?,"
                     "lease_until=?,last_error=NULL,updated_at=? WHERE event_id=?",
-                    (self.worker_id, lease_until, now_text, request["event_id"]))
+                    (attempt_token, lease_until, now_text, request["event_id"]))
                 self.store.conn.commit()
-                return "claimed", None
+                return "claimed", attempt_token
             except Exception:
                 self.store.conn.rollback()
                 raise
 
-    def _finish(self, event_id, status, result=None, error=None):
+    def _finish(self, event_id, attempt_token, status, result=None, error=None, *, allow_expired=False):
         now = datetime.now(timezone.utc).isoformat()
         with self.store.lock:
+            live_clause = "" if allow_expired else " AND lease_until>?"
             cur = self.store.conn.execute(
                 "UPDATE intent_api_events SET status=?,result=?,last_error=?,lease_owner=NULL,lease_until=NULL,"
-                "updated_at=? WHERE event_id=? AND status='PROCESSING' AND lease_owner=?",
+                "updated_at=? WHERE event_id=? AND status='PROCESSING' AND lease_owner=?" + live_clause,
                 (status, _canonical(result) if result is not None else None, error, now,
-                 event_id, self.worker_id))
+                 event_id, attempt_token, *([] if allow_expired else [now])))
             self.store.conn.commit()
             return cur.rowcount == 1
 
-    def _persist_context_messages(self, request, event):
+    def _persist_context_messages(self, request, event, attempt_token):
         messages = [dict(request["root"], role="root")]
         if request.get("parent") and request["parent"]["id"] != request["root"]["id"]:
             messages.append(dict(request["parent"], role="parent"))
         with self.store.lock:
             self.store.conn.execute("BEGIN IMMEDIATE")
             try:
+                self.store.assert_intent_lease(request["event_id"], attempt_token)
                 for message in messages:
                     if message["id"] == event["comment_id"]:
                         continue
@@ -329,6 +346,9 @@ class IntentService:
                                 any(existing.get(key) != event.get(key) for key in
                                     ("page_id", "post_id", "thread_root_id"))):
                             raise EventPayloadConflict("context message conflicts with stored thread history")
+                        stored_semantic = self._stored_message_semantic(event, message)
+                        if stored_semantic:
+                            message["semantic"] = stored_semantic
                         continue
                     context_event = {
                         "page_id": event["page_id"], "post_id": event["post_id"],
@@ -342,17 +362,34 @@ class IntentService:
                     dedupe = "context:" + ":".join((event["page_id"], event["post_id"],
                                                       event["thread_root_id"], message["id"]))
                     self.store.insert_event(dedupe, context_event, message["actor_id"])
+                self.store.assert_intent_lease(request["event_id"], attempt_token)
                 self.store.conn.commit()
             except Exception:
                 self.store.conn.rollback()
                 raise
         return [{"message_id": message["id"], "actor_id": message["actor_id"],
                  "text": message["text"], "role": message["role"],
+                 **({"semantic": message["semantic"]} if message.get("semantic") else {}),
                  "page_id": event["page_id"], "post_id": event["post_id"],
                  "thread_root_id": event["thread_root_id"],
                  "parent_id": message.get("parent_id", event["thread_root_id"]
                      if message["role"] == "parent" else None),
                  "event_time": message.get("event_time")} for message in messages]
+
+    def _stored_message_semantic(self, event, message):
+        row = self.store.conn.execute(
+            "SELECT result FROM intent_api_events WHERE comment_id=? AND actor_id=? AND page_id=? "
+            "AND post_id=? AND thread_root_id=? AND status IN ('COMPLETED','REVIEW') "
+            "ORDER BY seq DESC LIMIT 1", (message["id"], message["actor_id"], event["page_id"],
+                event["post_id"], event["thread_root_id"])).fetchone()
+        try:
+            from .semantics import validate_semantic
+            semantic = json.loads(row[0]).get("semantic") if row and row[0] else None
+            if isinstance(semantic, dict) and not validate_semantic(semantic, message["text"], []):
+                return semantic
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return None
 
     @staticmethod
     def _base_result(event_id, status, semantic, engine_result, trace):
@@ -387,8 +424,28 @@ class IntentService:
         if claim == "processing":
             return 202, {"api_version": API_VERSION, "event_id": request["event_id"], "status": "PROCESSING"}
         if claim == "replay":
-            existing["idempotent_replay"] = True
-            return 200, existing
+            if not isinstance(existing, dict):
+                existing = {"api_version": API_VERSION, "event_id": request["event_id"],
+                            "status": "REVIEW", "semantic": None,
+                            "decision": {"routing": ["REVIEW_RESULT_UNAVAILABLE"],
+                                         "reason": "stored event result is unavailable",
+                                         "outbound_effects_enabled": False},
+                            "state_changes": [], "state_after": None,
+                            "trace": {"reason": "missing persisted result"},
+                            "idempotent_replay": True}
+            else:
+                existing = dict(existing)
+                existing["idempotent_replay"] = True
+            return (409 if existing.get("status") == "CONTEXT_CONFLICT" else 200), existing
+        attempt_token = existing
+
+        def finish(status, result=None, error=None, *, allow_expired=False):
+            return self._finish(request["event_id"], attempt_token, status, result, error,
+                                allow_expired=allow_expired)
+
+        def lease_lost_response():
+            return 409, {"api_version": API_VERSION, "event_id": request["event_id"],
+                         "status": "WORKER_LEASE_LOST", "error": "event attempt lost its lease"}
 
         readiness = self.readiness()
         if not readiness["ok"]:
@@ -400,7 +457,8 @@ class IntentService:
                         "schema_version": SCHEMA_VERSION, "prompt_version": "luna_system_v2",
                         "cost_usd": None, "cost_unknown": True}, "reasons": readiness["reasons"],
                         "idempotent_replay": False}
-            self._finish(request["event_id"], "PENDING", error="model_or_service_not_ready")
+            if not finish("PENDING", response, "model_or_service_not_ready"):
+                return lease_lost_response()
             return 503, response
 
         event = {
@@ -415,16 +473,16 @@ class IntentService:
                     "text": request["post"]["text"], "vehicles": request["post"]["vehicles"]}
         started = time.perf_counter()
         try:
-            trusted_messages = self._persist_context_messages(request, event)
+            trusted_messages = self._persist_context_messages(request, event, attempt_token)
             semantic = None
             model_trace = None
             engine_result = None
+            committed_response = None
             for inference_attempt in range(3):
-                snapshot = self._prepare_context(event, postcard, trusted_messages)
+                snapshot = self._prepare_context(event, postcard, trusted_messages, attempt_token)
                 model_context = fmt_context(snapshot)
                 if inference_attempt == 0:
                     self._start_jev_shadow(request, event, model_context)
-                model_started = time.perf_counter()
                 model_result = self._call_model(request, postcard, event, model_context)
                 model_trace = model_result.pop("_intent_trace", {})
                 if not model_result.get("ok"):
@@ -433,28 +491,64 @@ class IntentService:
                         {"routing": ["MODEL_UNAVAILABLE"], "state_changes": [], "state_after": None},
                         {**trace, "reason": "model budget blocked" if trace.get("budget_blocked")
                          else "semantic model unavailable"})
-                    self._finish(request["event_id"], "PENDING", error="model_unavailable")
+                    if not finish("PENDING", response, "model_unavailable"):
+                        return lease_lost_response()
                     return 503, response
                 semantic = upgrade_semantic(model_result.get("semantic"))
                 if not isinstance(semantic, dict) or semantic.get("schema_version") != SCHEMA_VERSION:
                     response = self._base_result(request["event_id"], "REVIEW", None,
                         {"routing": ["REVIEW_SCHEMA"], "state_changes": [], "state_after": None},
                         {**model_trace, "reason": "semantic schema is invalid"})
-                    self._finish(request["event_id"], "REVIEW", response, "review_schema")
+                    if not finish("REVIEW", response, "review_schema"):
+                        return lease_lost_response()
                     return 200, response
+
+                def persist_engine_result(engine_result):
+                    nonlocal committed_response
+                    routes = engine_result.get("routing", [])
+                    status = _result_status(routes)
+                    if "REVIEW_STALE_CONTEXT" in routes or status in ("PROCESSING_ERROR", "CONTEXT_CONFLICT"):
+                        return
+                    semantic_out = engine_result.get("semantic")
+                    semantic_out = upgrade_semantic(semantic_out) if semantic_out else None
+                    trace = {**model_trace,
+                        "model_requested": model_result.get("model_requested", self.model),
+                        "model_effective": model_result.get("model_effective", self.model),
+                        "schema_version": SCHEMA_VERSION,
+                        "prompt_version": model_result.get("prompt_version", "luna_system_v2"),
+                        "state_snapshot_version": hashlib.sha256(snapshot["state_token"].encode()).hexdigest()[:24],
+                        "routing": routes,
+                        "review_reason": next((r for r in routes if r.startswith("REVIEW")), None),
+                        "pipeline_latency_ms": round((time.perf_counter() - started) * 1000, 3)}
+                    response = self._base_result(request["event_id"], status, semantic_out,
+                                                 engine_result, trace)
+                    final_state = "REVIEW" if status == "REVIEW" else "COMPLETED"
+                    now = datetime.now(timezone.utc).isoformat()
+                    cur = self.store.conn.execute(
+                        "UPDATE intent_api_events SET status=?,result=?,last_error=NULL,lease_owner=NULL,"
+                        "lease_until=NULL,updated_at=? WHERE event_id=? AND status='PROCESSING' "
+                        "AND lease_owner=? AND lease_until>?",
+                        (final_state, _canonical(response), now, request["event_id"], attempt_token, now))
+                    if cur.rowcount != 1:
+                        raise IntentLeaseLost("intent lease lost before atomic result commit")
+                    committed_response = (200, response)
+
                 engine_result = self.engine.process(
                     event, postcard, semantic, expected_state_token=snapshot["state_token"],
                     trusted_context_messages=trusted_messages,
+                    attempt_token=attempt_token,
+                    attempt_result_callback=persist_engine_result,
                     trusted_context_texts=[request["post"]["text"], request["root"]["text"],
                                            request["parent"]["text"] if request.get("parent") else ""],
                     trusted_source_ids={request["post"]["id"]: {
                         "text": request["post"]["text"], "actor_id": request["page_id"], "role": "post",
                         "vehicles": request["post"]["vehicles"]}})
-                model_trace["model_latency_ms"] = round((time.perf_counter() - model_started) * 1000, 3)
                 if "REVIEW_STALE_CONTEXT" not in engine_result.get("routing", []):
                     break
                 if inference_attempt == 2:
                     break
+            if committed_response is not None:
+                return committed_response
             semantic_out = engine_result.get("semantic") if engine_result else None
             semantic_out = upgrade_semantic(semantic_out) if semantic_out else None
             status = _result_status(engine_result.get("routing"))
@@ -467,27 +561,66 @@ class IntentService:
                      "review_reason": next((r for r in routes if r.startswith("REVIEW")), None),
                      "pipeline_latency_ms": round((time.perf_counter() - started) * 1000, 3)}
             response = self._base_result(request["event_id"], status, semantic_out, engine_result, trace)
+            if status == "PROCESSING_ERROR":
+                response["decision"]["reason"] = "engine state transaction rolled back"
+                response["trace"]["error_code"] = "ENGINE_ROLLBACK"
+                if not finish("PENDING", response, "engine_rollback"):
+                    return lease_lost_response()
+                return 503, response
+            if status == "CONTEXT_CONFLICT":
+                response["decision"]["reason"] = "engine rejected conflicting event context"
+                if not finish("REVIEW", response, "engine_event_conflict"):
+                    return lease_lost_response()
+                return 409, response
             final_state = "REVIEW" if status == "REVIEW" else "COMPLETED"
-            self._finish(request["event_id"], final_state, response)
+            if not finish(final_state, response):
+                return lease_lost_response()
             return 200, response
         except EventPayloadConflict:
-            self._finish(request["event_id"], "REVIEW", error="context_conflict")
-            return 409, {"api_version": API_VERSION, "event_id": request["event_id"],
-                         "status": "CONTEXT_CONFLICT", "error": "root or parent conflicts with stored thread history"}
+            response = {"api_version": API_VERSION, "event_id": request["event_id"],
+                "status": "CONTEXT_CONFLICT", "semantic": None,
+                "decision": {"routing": ["CONTEXT_CONFLICT"],
+                    "reason": "root or parent conflicts with stored thread history",
+                    "outbound_effects_enabled": False}, "state_changes": [],
+                "state_after": None, "trace": {"reason": "stored context identity conflict"},
+                "idempotent_replay": False}
+            if not finish("REVIEW", response, "context_conflict"):
+                return lease_lost_response()
+            return 409, response
         except BudgetLedgerWriteFailure:
             response = self._base_result(request["event_id"], "REVIEW", None,
                 {"routing": ["REVIEW_BUDGET_LEDGER"], "state_changes": [], "state_after": None},
                 {"reason": "model call outcome could not be recorded in the budget ledger",
                  "schema_version": SCHEMA_VERSION, "prompt_version": "luna_system_v2",
                  "cost_usd": None, "cost_unknown": True})
-            self._finish(request["event_id"], "REVIEW", response, "budget_ledger_write_failed")
+            if not finish("REVIEW", response, "budget_ledger_write_failed"):
+                return lease_lost_response()
             return 503, response
+        except IntentLeaseLost:
+            response = {"api_version": API_VERSION, "event_id": request["event_id"],
+                "status": "REVIEW", "semantic": None,
+                "decision": {"routing": ["REVIEW_LEASE_LOST"],
+                    "reason": "event attempt lost its live lease before state commit",
+                    "outbound_effects_enabled": False}, "state_changes": [],
+                "state_after": None, "trace": {"reason": "attempt fencing rejected stale worker"},
+                "idempotent_replay": False}
+            if finish("REVIEW", response, "lease_lost", allow_expired=True):
+                return 409, response
+            return lease_lost_response()
         except Exception as exc:
             # Persist only the exception class: the provider/db error may contain user text or credentials.
-            self._finish(request["event_id"], "PENDING", error=type(exc).__name__)
-            return 503, {"api_version": API_VERSION, "event_id": request["event_id"],
+            response = {"api_version": API_VERSION, "event_id": request["event_id"],
                          "status": "PROCESSING_ERROR", "error_code": type(exc).__name__,
-                         "error": "event could not be completed safely"}
+                         "error": "event could not be completed safely",
+                         "decision": {"routing": ["PROCESSING_ERROR"],
+                            "reason": "event could not be completed safely",
+                            "outbound_effects_enabled": False},
+                         "state_changes": [], "state_after": None,
+                         "trace": {"reason": "processing exception"},
+                         "idempotent_replay": False}
+            if not finish("PENDING", response, type(exc).__name__):
+                return lease_lost_response()
+            return 503, response
 
     def _call_model(self, request, postcard, event, context):
         reservations = []
@@ -500,7 +633,8 @@ class IntentService:
             reservation_id = f"intent:{event_hash}:{uuid.uuid4().hex}"
             allowed, reason = budget_ledger.reserve(self.budget_path, reservation_id=reservation_id,
                 max_calls=self.budget_max_calls, max_cost=self.budget_max_cost,
-                reserve_cost_usd=self.budget_reserve)
+                reserve_cost_usd=self.budget_reserve, prior_calls=self.budget_prior_calls,
+                prior_cost=self.budget_prior_cost)
             if allowed:
                 reservations.append(reservation_id)
             else:
@@ -569,12 +703,23 @@ class IntentService:
                     rid = f"intent-jev:{event_hash}:{uuid.uuid4().hex}"
                     allowed, _ = budget_ledger.reserve(self.jev_budget_path, reservation_id=rid,
                         max_calls=self.jev_max_calls, max_cost=self.jev_max_cost,
-                        reserve_cost_usd=self.jev_reserve)
+                        reserve_cost_usd=self.jev_reserve, prior_calls=self.budget_prior_calls,
+                        prior_cost=self.budget_prior_cost)
                     if allowed:
                         reservations.append(rid)
                     return allowed
-                result = self.jev_adapter.decide({"context": context}, intent_questions(),
+                questions = intent_questions()
+                result = self.jev_adapter.decide({"context": context}, questions,
                     timeout=min(self.model_timeout, 10), budget_guard=guard)
+                if not isinstance(result, dict):
+                    result = {"ok": False, "error": "invalid Jev adapter response", "attempts": 0}
+                answers = {}
+                if result.get("ok"):
+                    try:
+                        answers = validate_answers(result.get("answers"), questions)
+                    except (TypeError, ValueError):
+                        result["ok"] = False
+                        result["error"] = "invalid Jev answer schema"
                 attempts = result.get("attempts") if type(result.get("attempts")) is int else 0
                 if attempts:
                     from scripts import budget_ledger
@@ -585,12 +730,11 @@ class IntentService:
                         model=result.get("model_effective", "typesafe/jev-1.14"),
                         status=None if result.get("ok") else "failed")
                     ledger_recorded = True
-                answers = result.get("answers") if isinstance(result.get("answers"), dict) else {}
                 trace = {"event_hash": event_hash, "adapter": "jev_decisions", "shadow": True,
                     "model_requested": "typesafe/jev-1.14",
                     "model_effective": result.get("model_effective", "typesafe/jev-1.14"),
                     "provider": result.get("provider"), "schema_version": "jev_intent_decisions_v1",
-                    "prompt_version": "jev_intent_questions_v1",
+                    "prompt_version": "jev_intent_questions_v1", "question_version": "jev_intent_questions_v1",
                     "question_keys": sorted(intent_questions()),
                     "decisions": {key: {"type": answer.get("type"), "probability": answer.get("noul")}
                                   for key, answer in answers.items() if isinstance(answer, dict)},
@@ -619,14 +763,16 @@ class IntentService:
             _JEV_SLOTS.release()
             return False
 
-    def _prepare_context(self, event, postcard, messages):
+    def _prepare_context(self, event, postcard, messages, attempt_token):
         now = datetime.now(timezone.utc).isoformat()
         with self.store.lock:
             self.store.conn.execute("BEGIN IMMEDIATE")
             try:
+                self.store.assert_intent_lease(event["event_dedupe_key"], attempt_token)
                 self.store.lock_scope(event)
                 self.engine._sweep_expired(event, now)
                 snapshot = self.engine.context(event, postcard, messages)
+                self.store.assert_intent_lease(event["event_dedupe_key"], attempt_token)
                 self.store.conn.commit()
                 return snapshot
             except Exception:

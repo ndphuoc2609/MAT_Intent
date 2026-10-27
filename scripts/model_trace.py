@@ -11,7 +11,7 @@ def append(path, trace):
     allowed = {"event_hash", "model_requested", "model_effective", "provider", "adapter",
                "schema_version", "prompt_version", "routing", "review_reasons",
                "latency_ms", "pipeline_latency_ms", "usage", "cost_usd", "cost_unknown",
-               "attempts", "shadow"}
+               "attempts", "shadow", "question_version", "question_keys", "decisions"}
     row = {k: trace[k] for k in allowed if k in trace}
     row["ts"] = datetime.now(timezone.utc).isoformat()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

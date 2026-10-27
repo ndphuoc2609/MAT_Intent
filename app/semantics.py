@@ -354,7 +354,11 @@ def _positive_slot_evidence(kind, value, slot, evidence_texts, source_texts=()):
             amount_aliases.add(str(int(amount)))
         unit_alias = norm(str(unit)) if isinstance(unit, str) and unit.strip() else None
         for excerpt in evidence_texts:
-            containing = [t for t in source_texts if norm(excerpt) in norm(t)] or [excerpt]
+            containing = [t for t in source_texts if norm(excerpt) in norm(t)]
+            if source_texts and not containing:
+                continue
+            if not source_texts:
+                containing = [excerpt]
             if any(any(_positive_mention(t, alias) for alias in amount_aliases) and
                    (unit_alias is None or _positive_mention(t, unit_alias)) for t in containing):
                 return True
@@ -364,7 +368,8 @@ def _positive_slot_evidence(kind, value, slot, evidence_texts, source_texts=()):
             return False
         return any(_positive_mention(whole, norm(value))
                    for excerpt in evidence_texts
-                   for whole in ([t for t in source_texts if norm(excerpt) in norm(t)] or [excerpt]))
+                   for whole in ([t for t in source_texts if norm(excerpt) in norm(t)] or
+                                 ([] if source_texts else [excerpt])))
     if kind == "down_payment":
         return False
     for source in evidence_texts:
@@ -373,7 +378,11 @@ def _positive_slot_evidence(kind, value, slot, evidence_texts, source_texts=()):
             for alias in aliases:
                 for match in re.finditer(r"(?<!\w)" + re.escape(alias) + r"(?!\w)", nsource):
                     # An excerpt may omit a negation immediately before it.
-                    containing = [t for t in source_texts if norm(source) in norm(t)] or [source]
+                    containing = [t for t in source_texts if norm(source) in norm(t)]
+                    if source_texts and not containing:
+                        continue
+                    if not source_texts:
+                        containing = [source]
                     positive = False
                     for whole in containing:
                         if _positive_mention(whole, alias):
@@ -568,18 +577,16 @@ def validate_semantic(sem, event_text: str, context_texts: list[str]) -> list[st
                 if (slot.get("explicit", True) is not False and "kind" in slot and "value" in slot
                         and isinstance(op.get("evidence_excerpt"), str)):
                     slot_excerpt = slot.get("evidence_excerpt") or op["evidence_excerpt"]
-                    supported = _positive_slot_evidence(
+                    excerpt_in_event = isinstance(event_text, str) and norm(slot_excerpt) in norm(event_text)
+                    supported = excerpt_in_event and _positive_slot_evidence(
                         slot.get("kind"), slot["value"], slot, [slot_excerpt], [event_text])
-                    if not supported:
-                        supported = _positive_slot_evidence(
-                            slot.get("kind"), slot["value"], slot, [event_text], [event_text])
                     if not supported:
                         errs.append(f"operations[{i}] slot evidence does not support its value")
                 if isinstance(slot.get("extra"), dict):
                     for extra_kind, extra_value in slot["extra"].items():
-                        if (not _positive_slot_evidence(extra_kind, extra_value,
-                                                         {"raw": str(extra_value)},
-                                                         [event_text], [event_text])):
+                        # Extra values have no per-slot excerpt field in v1/v2.
+                        if not _positive_slot_evidence(extra_kind, extra_value,
+                                {"raw": str(extra_value)}, [event_text], [event_text]):
                             errs.append(f"operations[{i}] extra slot evidence does not support {extra_kind}")
         if t == "SET_CONTACT_PREFERENCE" and op.get("scope") not in CONTACT_SCOPES:
             errs.append(f"operations[{i}] bad contact scope")

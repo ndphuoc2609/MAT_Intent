@@ -23,6 +23,12 @@ ledger before every live model call and reserves each attempt (including Luna
 retries) atomically. Unknown or unreadable ledger entries stop model calls.
 Never clear or reset the ledger to make the service ready.
 
+The existing sandbox usage before the ledger is represented once by
+`SHARED_PRIOR_CALLS` / `SHARED_PRIOR_COST_USD` in `scripts/budget_ledger.py`;
+it is not copied into the ledger. The API and sandbox apply that same baseline
+when checking their cap. Keep their ledger path and approved cap aligned when
+both are used, or calls from one path will not be visible to the other.
+
 ```sh
 python3.12 -m venv .venv
 . .venv/bin/activate
