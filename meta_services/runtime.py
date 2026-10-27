@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from app.adapters.luna import MODEL, call_luna
 from app.adapters.jev import JevOpenRouter, intent_questions
 from app.adapters.decision_fast_path import social_ack_candidate, social_ack_eligible
 from app.normalize import VEHICLES, norm
-from app.engine import Engine, WallClock
+from app.engine import CLAIM_LEASE_SECONDS, Engine, WallClock
 from app.facts import Facts
 from app.state import Store
 from scripts import budget_ledger
@@ -28,11 +29,21 @@ from .webhook import extract_comment_events
 
 
 _IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9._:-]{8,128}\Z")
+_SHADOW_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jev-shadow")
+_SHADOW_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _event_hash(event):
+    identity = [event.get(key) for key in
+                ("page_id", "post_id", "thread_root_id", "actor_id", "comment_id")]
+    return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
 
 
 class CommentInbox:
-    def __init__(self, store):
+    def __init__(self, store, *, lease_seconds=180):
         self.store = store
+        self.worker_id = uuid.uuid4().hex
+        self.lease_seconds = lease_seconds
         with store.lock:
             store.conn.execute("""CREATE TABLE IF NOT EXISTS meta_inbox(
                 comment_id TEXT PRIMARY KEY, event TEXT NOT NULL, status TEXT NOT NULL,
@@ -42,7 +53,13 @@ class CommentInbox:
             columns = {row[1] for row in store.conn.execute("PRAGMA table_info(meta_inbox)")}
             if "next_attempt_at" not in columns:
                 store.conn.execute("ALTER TABLE meta_inbox ADD COLUMN next_attempt_at TEXT")
-            store.conn.execute("UPDATE meta_inbox SET status='PENDING' WHERE status='PROCESSING'")
+            if "lease_owner" not in columns:
+                store.conn.execute("ALTER TABLE meta_inbox ADD COLUMN lease_owner TEXT")
+            if "lease_until" not in columns:
+                store.conn.execute("ALTER TABLE meta_inbox ADD COLUMN lease_until TEXT")
+            legacy_lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
+            store.conn.execute("UPDATE meta_inbox SET lease_until=? "
+                               "WHERE status='PROCESSING' AND lease_until IS NULL", (legacy_lease,))
             store.conn.execute("""CREATE TABLE IF NOT EXISTS meta_manual_writes(
                 idempotency_key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
                 status TEXT NOT NULL, result TEXT, created_at TEXT NOT NULL,
@@ -58,12 +75,22 @@ class CommentInbox:
                 "VALUES (?,?, 'PENDING',0,?,?,NULL,NULL,NULL)",
                 (event["comment_id"], json.dumps(event, ensure_ascii=False), now, now))
             self.store.conn.commit()
+            if cur.rowcount == 0:
+                row = self.store.conn.execute(
+                    "SELECT event FROM meta_inbox WHERE comment_id=?", (event["comment_id"],)).fetchone()
+                if row and json.loads(row[0]) != event:
+                    raise ValueError("event_id payload conflict")
             return cur.rowcount == 1
 
     def claim(self):
         with self.store.lock:
             self.store.conn.execute("BEGIN IMMEDIATE")
-            now = datetime.now(timezone.utc).isoformat()
+            now_dt = datetime.now(timezone.utc)
+            now = now_dt.isoformat()
+            lease_until = (now_dt + timedelta(seconds=self.lease_seconds)).isoformat()
+            self.store.conn.execute(
+                "UPDATE meta_inbox SET status='PENDING', lease_owner=NULL, lease_until=NULL "
+                "WHERE status='PROCESSING' AND (lease_until IS NULL OR lease_until<=?)", (now,))
             row = self.store.conn.execute(
                 "SELECT comment_id,event,attempts FROM meta_inbox WHERE status='PENDING' "
                 "AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY rowid LIMIT 1", (now,)
@@ -71,10 +98,13 @@ class CommentInbox:
             if not row:
                 self.store.conn.commit()
                 return None
-            self.store.conn.execute(
+            claimed = self.store.conn.execute(
                 "UPDATE meta_inbox SET status='PROCESSING', attempts=attempts+1, updated_at=?, "
-                "next_attempt_at=NULL WHERE comment_id=?",
-                (now, row[0]))
+                "next_attempt_at=NULL, lease_owner=?, lease_until=? WHERE comment_id=? AND status='PENDING'",
+                (now, self.worker_id, lease_until, row[0]))
+            if claimed.rowcount != 1:
+                self.store.conn.rollback()
+                return None
             self.store.conn.commit()
             return row[0], json.loads(row[1]), row[2] + 1
 
@@ -83,12 +113,13 @@ class CommentInbox:
         next_attempt = ((datetime.now(timezone.utc) + timedelta(seconds=retry_after)).isoformat()
                         if status == "PENDING" and retry_after else None)
         with self.store.lock:
-            self.store.conn.execute(
-                "UPDATE meta_inbox SET status=?, updated_at=?, last_error=?, result=?, next_attempt_at=? "
-                "WHERE comment_id=?",
+            cur = self.store.conn.execute(
+                "UPDATE meta_inbox SET status=?, updated_at=?, last_error=?, result=?, next_attempt_at=?, "
+                "lease_owner=NULL, lease_until=NULL WHERE comment_id=? AND status='PROCESSING' AND lease_owner=?",
                 (status, now, error, json.dumps(result, ensure_ascii=False) if result is not None else None,
-                 next_attempt, comment_id))
+                 next_attempt, comment_id, self.worker_id))
             self.store.conn.commit()
+            return cur.rowcount == 1
 
     def list(self, limit=50):
         with self.store.lock:
@@ -170,7 +201,9 @@ class MetaRuntime:
         self.engine.reconcile_unknown()
         with self.store.lock:
             self.store.conn.execute("UPDATE outbox SET status='BLOCKED' WHERE status='INTENDED'")
-            self.store.conn.execute("UPDATE outbox SET status='UNKNOWN' WHERE status='CLAIMED'")
+            expired = (datetime.now(timezone.utc) - timedelta(seconds=CLAIM_LEASE_SECONDS)).isoformat()
+            self.store.conn.execute("UPDATE outbox SET status='UNKNOWN' WHERE status='CLAIMED' AND claimed_at<=?",
+                                    (expired,))
             self.store.conn.commit()
 
     def enqueue_webhook(self, payload):
@@ -181,14 +214,17 @@ class MetaRuntime:
             queued += int(self.inbox.enqueue(event))
         return queued
 
-    def _bot_replies(self, actor_id):
+    def _bot_replies(self, actor_id, post_id, thread_root_id):
         with self.store.lock:
             rows = self.store.conn.execute(
                 "SELECT json_extract(o.payload,'$.text') FROM outbox o "
                 "WHERE o.purpose='reply' AND o.status='SENT' AND EXISTS ("
                 "SELECT 1 FROM events e WHERE e.comment_id=json_extract(o.payload,'$.comment_id') "
-                "AND e.actor_id=? AND json_extract(e.payload,'$.page_id')=?) "
-                "ORDER BY o.created_at DESC LIMIT 5", (actor_id, self.page_id)).fetchall()
+                "AND e.actor_id=? AND json_extract(e.payload,'$.page_id')=? "
+                "AND json_extract(e.payload,'$.post_id')=? "
+                "AND json_extract(e.payload,'$.thread_root_id')=?) "
+                "ORDER BY o.created_at DESC LIMIT 5",
+                (actor_id, self.page_id, post_id, thread_root_id)).fetchall()
         return [row[0] for row in reversed(rows) if isinstance(row[0], str)]
 
     def _call_model(self, event, post, parent, context):
@@ -204,13 +240,15 @@ class MetaRuntime:
             if allowed: reservations.append(reservation_id)
             return allowed
 
-        result = self.model_call(
-            post, event["text"], parent=parent, context=context,
-            budget_guard=guard)
+        model_args = dict(parent=parent, context=context, budget_guard=guard)
+        if self.model_call is call_luna:
+            model_args["schema_version"] = "2"
+        result = self.model_call(post, event["text"], **model_args)
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
         result["_trace"] = {"model_requested": MODEL,
             "model_effective": result.get("model_effective", MODEL), "adapter": "luna",
-            "schema_version": "1", "prompt_version": "luna_system_v1",
+            "schema_version": result.get("schema_version", "2"),
+            "prompt_version": result.get("prompt_version", "luna_system_v2"),
             "latency_ms": (time.perf_counter() - started) * 1000,
             "usage": {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")
                       if type(usage.get(k)) is int},
@@ -232,46 +270,60 @@ class MetaRuntime:
         return result
 
     def _start_jev_shadow(self, event, context):
-        if not self.jev_shadow_enabled:
-            return
-        event_hash = hashlib.sha256(event["comment_id"].encode()).hexdigest()
+        if not self.jev_shadow_enabled or not _SHADOW_SLOTS.acquire(blocking=False):
+            return False
+        event_hash = _event_hash(event)
 
         def run():
             reservations = []
-            def guard():
-                reservation_id = f"jev:{event_hash}:{uuid.uuid4().hex}"
-                allowed, _ = budget_ledger.reserve(
-                    self.jev_budget_path, reservation_id=reservation_id,
-                    max_calls=self.jev_max_calls, max_cost=self.jev_max_cost,
-                    reserve_cost_usd=self.jev_reserve)
-                if allowed: reservations.append(reservation_id)
-                return allowed
-            result = self.jev_adapter.decide(context, intent_questions(), timeout=8,
-                                             budget_guard=guard)
-            if result.get("attempts"):
-                budget_ledger.record(self.jev_budget_path, run_id=event_hash, kind="shadow",
-                    attempts=result["attempts"], cost_usd_est=result.get("cost_usd_est"),
-                    model=result.get("model_effective", "typesafe/jev-1.14"),
-                    status=None if result.get("ok") else "failed")
-                budget_ledger.settle_reservations(self.jev_budget_path, reservations)
-            from scripts.model_trace import append
-            append(self.trace_path, {"event_hash": event_hash,
-                "model_requested": "typesafe/jev-1.14",
-                "model_effective": result.get("model_effective", "typesafe/jev-1.14"),
-                "provider": result.get("provider"), "adapter": "jev_decisions",
-                "schema_version": "intent_decisions_v1", "prompt_version": "jev_intent_questions_v1",
-                "latency_ms": result.get("latency_ms"), "usage": result.get("usage", {}),
-                "cost_usd": result.get("cost_usd_est"), "cost_unknown": result.get("cost_unknown", True),
-                "attempts": result.get("attempts", 0), "shadow": True,
-                "routing": ["SHADOW_COMPLETED" if result.get("ok") else "SHADOW_FAILED"]})
-        threading.Thread(target=run, name="jev-shadow", daemon=True).start()
+            try:
+                def guard():
+                    reservation_id = f"jev:{event_hash}:{uuid.uuid4().hex}"
+                    allowed, _ = budget_ledger.reserve(
+                        self.jev_budget_path, reservation_id=reservation_id,
+                        max_calls=self.jev_max_calls, max_cost=self.jev_max_cost,
+                        reserve_cost_usd=self.jev_reserve)
+                    if allowed: reservations.append(reservation_id)
+                    return allowed
+                result = self.jev_adapter.decide(context, intent_questions(), timeout=8,
+                                                 budget_guard=guard)
+                if result.get("attempts"):
+                    budget_ledger.record(self.jev_budget_path, run_id=event_hash, kind="shadow",
+                        attempts=result["attempts"], cost_usd_est=result.get("cost_usd_est"),
+                        model=result.get("model_effective", "typesafe/jev-1.14"),
+                        status=None if result.get("ok") else "failed")
+                    budget_ledger.settle_reservations(self.jev_budget_path, reservations)
+                answers = result.get("answers") if isinstance(result.get("answers"), dict) else {}
+                decisions = {key: {"type": value.get("type"), "probability": value.get("noul")}
+                             for key, value in answers.items()
+                             if isinstance(value, dict) and type(value.get("noul")) in (int, float)}
+                from scripts.model_trace import append
+                append(self.trace_path, {"event_hash": event_hash,
+                    "model_requested": "typesafe/jev-1.14",
+                    "model_effective": result.get("model_effective", "typesafe/jev-1.14"),
+                    "provider": result.get("provider"), "adapter": "jev_decisions",
+                    "schema_version": "intent_decisions_v1", "prompt_version": "jev_intent_questions_v1",
+                    "question_keys": sorted(intent_questions()), "decisions": decisions,
+                    "latency_ms": result.get("latency_ms"), "usage": result.get("usage", {}),
+                    "cost_usd": result.get("cost_usd_est"), "cost_unknown": result.get("cost_unknown", True),
+                    "attempts": result.get("attempts", 0), "shadow": True,
+                    "routing": ["SHADOW_COMPLETED" if result.get("ok") else "SHADOW_FAILED"]})
+            finally:
+                _SHADOW_SLOTS.release()
+        try:
+            _SHADOW_POOL.submit(run)
+            return True
+        except RuntimeError:
+            _SHADOW_SLOTS.release()
+            return False
 
-    def _try_jev_fast_path(self, event, context):
+    def _try_jev_fast_path(self, event, context, *, has_pending=False):
         threshold = self.jev_social_threshold
-        if (not self.jev_fast_path_enabled or not social_ack_eligible(event.get("text")) or
+        if (not self.jev_fast_path_enabled or
+                not social_ack_eligible(event.get("text"), has_pending=has_pending) or
                 type(threshold) not in (int, float) or not 0 <= threshold <= 1):
             return None
-        event_hash = hashlib.sha256(event["comment_id"].encode()).hexdigest()
+        event_hash = _event_hash(event)
         reservations = []
         def guard():
             reservation_id = f"jev-fast:{event_hash}:{uuid.uuid4().hex}"
@@ -365,10 +417,11 @@ class MetaRuntime:
                 "page_id": self.page_id, "post_id": event["post_id"],
                 "thread_root_id": event["thread_root_id"], "role": "parent", "text": parent_text})
         context = self.engine.context(event, postcard, trusted_messages)
-        context["recent_bot_replies"] = self._bot_replies(event["actor_id"])
+        context["recent_bot_replies"] = self._bot_replies(
+            event["actor_id"], event["post_id"], event["thread_root_id"])
         from scripts.run_multiturn_eval import fmt_context
         model_context = fmt_context(context)
-        fast_path = self._try_jev_fast_path(event, model_context)
+        fast_path = self._try_jev_fast_path(event, model_context, has_pending=bool(context.get("pending")))
         trace_rows = [fast_path["_trace"]] if fast_path else []
         if fast_path and fast_path.get("semantic"):
             model = {"ok": True, "semantic": fast_path["semantic"], "attempts": fast_path.get("attempts", 0),
@@ -414,12 +467,23 @@ class MetaRuntime:
                             "shadow": False})
                     except OSError:
                         trace_write_failed = True
-            self.inbox.finish(comment_id, "DONE", result={
+            saved_result = {
                 "routing": result.get("routing", []),
                 "outbound_permission": result.get("outbound_permission", False),
                 "response_text": result.get("response_text"),
                 "trace_write_failed": trace_write_failed,
-            })
+            }
+            routing = result.get("routing", [])
+            if "REVIEW_STALE_CONTEXT" in routing:
+                if attempt < 3:
+                    self.inbox.finish(comment_id, "PENDING", error="stale_context",
+                                      result=saved_result, retry_after=min(2 ** attempt, 8))
+                else:
+                    self.inbox.finish(comment_id, "REVIEW", error="stale_context", result=saved_result)
+            elif any(str(route).startswith("REVIEW") for route in routing):
+                self.inbox.finish(comment_id, "REVIEW", error="review_required", result=saved_result)
+            else:
+                self.inbox.finish(comment_id, "DONE", result=saved_result)
         except MetaGraphError as error:
             retryable = error.status is None or error.status in (429, 500, 502, 503, 504) or error.code == 4
             if retryable and attempt < 3:

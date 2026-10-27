@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from meta_services.graph import MetaGraphError
-from meta_services.runtime import MetaRuntime
+from meta_services.runtime import CommentInbox, MetaRuntime
 
 
 def social_semantic(text):
@@ -58,21 +58,40 @@ class MetaRuntimeTests(unittest.TestCase):
         )
         self.addCleanup(self.runtime.close)
 
-    def payload(self, cid):
+    def payload(self, cid, parent_id="123_456"):
         return {"object": "page", "entry": [{"id": "123", "changes": [{
             "field": "feed", "value": {"item": "comment", "verb": "add",
-                "comment_id": cid, "post_id": "123_456", "parent_id": "123_456",
+                "comment_id": cid, "post_id": "123_456", "parent_id": parent_id,
                 "from": {"id": "999"}, "message": "Cảm ơn"}
         }]}]}
 
-    def test_webhook_comments_are_deduped_and_bot_reply_enters_followup_context(self):
+    def test_context_keeps_replies_in_thread_and_excludes_other_roots(self):
         self.assertEqual(self.runtime.enqueue_webhook(self.payload("456_1")), 1)
         self.assertEqual(self.runtime.enqueue_webhook(self.payload("456_1")), 0)
         self.assertTrue(self.runtime.process_next())
-        self.assertTrue(self.runtime.enqueue_webhook(self.payload("456_2")))
+        # A direct reply uses root 456_1. A new root comment is a different thread.
+        self.assertTrue(self.runtime.enqueue_webhook(self.payload("456_2", parent_id="456_1")))
         self.assertTrue(self.runtime.process_next())
-        self.assertEqual(len(self.graph.replies), 2)
+        self.assertTrue(self.runtime.enqueue_webhook(self.payload("456_3")))
+        self.assertTrue(self.runtime.process_next())
+        self.assertEqual(len(self.graph.replies), 3)
         self.assertIn("Cảm ơn bạn đã tương tác!", self.model_contexts[1])
+        self.assertNotIn("Cảm ơn bạn đã tương tác!", self.model_contexts[2])
+
+    def test_inbox_restart_preserves_live_lease_and_expired_lease_is_reclaimed(self):
+        self.runtime.inbox.enqueue({"comment_id": "456_11"})
+        old_claim = self.runtime.inbox.claim()
+        self.assertIsNotNone(old_claim)
+        second_worker = CommentInbox(self.runtime.store)
+        self.assertIsNone(second_worker.claim())
+        with self.runtime.store.lock:
+            self.runtime.store.conn.execute(
+                "UPDATE meta_inbox SET lease_until='2000-01-01T00:00:00+00:00' WHERE comment_id='456_11'")
+            self.runtime.store.conn.commit()
+        reclaimed = second_worker.claim()
+        self.assertEqual(reclaimed[0], "456_11")
+        self.assertFalse(self.runtime.inbox.finish("456_11", "DONE", result={}))
+        self.assertTrue(second_worker.finish("456_11", "DONE", result={}))
 
     def test_engine_accepts_exact_evidence_from_canonical_post_context(self):
         self.runtime.model_call = lambda *args, **kwargs: {
@@ -88,7 +107,7 @@ class MetaRuntimeTests(unittest.TestCase):
         self.runtime.enqueue_webhook(self.payload("456_7"))
         self.runtime.process_next()
         self.runtime.model_call = lambda *args, **kwargs: {
-            "ok": True, "semantic": social_semantic("Cảm ơn bạn đã tương tác!"), "attempts": 0,
+            "ok": True, "semantic": social_semantic("Cảm ơn"), "attempts": 0,
         }
         self.runtime.enqueue_webhook(self.payload("456_8"))
         self.runtime.process_next()

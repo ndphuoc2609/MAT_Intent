@@ -6,6 +6,14 @@ from .normalize import (COLORS, LOCATIONS, PRICE_KINDS, SERVICE_TOPICS, VARIANTS
 
 TOPICS = ["price", "promo", "loan", "stock", "spec", "dealer", "testdrive",
           "buy", "service", "complaint", "registration", "social"]
+CATEGORY_BY_TOPIC = {
+    **{topic: "sales" for topic in ("price", "promo", "loan", "stock", "spec", "dealer",
+                                     "testdrive", "buy", "registration")},
+    "service": "service", "complaint": "support", "social": "social",
+}
+CATEGORIES = ("sales", "service", "support", "social")
+SEMANTIC_TAGS = ("multi_intent", "negated", "corrected", "confirmation", "rejection",
+                 "cancellation", "handoff", "sarcasm", "pending_answer", "uncertain")
 OPS = ["START_REQUEST", "UPDATE_SLOT", "ANSWER_PENDING", "CONFIRM_PENDING",
        "REJECT_PENDING", "CANCEL_REQUEST", "SET_CONTACT_PREFERENCE",
        "REQUEST_HUMAN", "REPORT_COMPLAINT", "SOCIAL_ACK", "UNRESOLVED"]
@@ -50,9 +58,9 @@ def parse_json_strict(text: str):
 
 
 def attach_context_provenance(sem, event, context, postcard):
-    """Migrate v1 inherited slots only when one same-actor source is proven."""
+    """Attach inherited-slot provenance only from this server snapshot."""
     import copy
-    if not isinstance(sem, dict) or sem.get("schema_version") != "1":
+    if not isinstance(sem, dict) or sem.get("schema_version") not in ("1", "2"):
         return sem
     out = copy.deepcopy(sem)
     vehicles = postcard.get("vehicles") or []
@@ -61,14 +69,23 @@ def attach_context_provenance(sem, event, context, postcard):
     if not isinstance(post_text, str):
         post_text = ""
     recent = [m for m in context.get("recent", []) if isinstance(m, dict)]
-    sources = [m for m in context.get("messages", []) if isinstance(m, dict)] + recent
+    sources = ([m for m in context.get("messages", []) if isinstance(m, dict)] + recent +
+               [m for m in context.get("state_sources", []) if isinstance(m, dict)])
     for op in out.get("operations") or []:
         slot = op.get("slot") if isinstance(op, dict) else None
         if not isinstance(slot, dict) or slot.get("explicit", True) is not False:
             continue
         source = None
+        request_id = None
         excerpt = slot.get("evidence_excerpt") or op.get("evidence_excerpt")
-        if (not slot.get("source_message_id") and slot.get("kind") == "vehicle" and
+        model_source = next((m for m in sources if m.get("message_id") == slot.get("source_message_id") and
+                             m.get("actor_id") == event.get("actor_id") and
+                             m.get("role") not in ("post", "current")), None)
+        if (model_source and isinstance(excerpt, str) and norm(excerpt) in norm(model_source.get("text") or "") and
+                _positive_slot_evidence(slot.get("kind"), slot.get("value"), slot,
+                                        [excerpt], [model_source.get("text") or ""])):
+            source = model_source
+        if (source is None and slot.get("kind") == "vehicle" and
                 vehicle is not None and canon_slot("vehicle", slot.get("value")) == vehicle and
                 isinstance(excerpt, str) and
                 _positive_slot_evidence("vehicle", slot.get("value"), slot, [excerpt],
@@ -77,7 +94,7 @@ def attach_context_provenance(sem, event, context, postcard):
                       "actor_id": postcard.get("page_id") or event.get("page_id"),
                       "text": post_text or str(vehicles[0]), "role": "post",
                       "vehicles": list(vehicles)}
-        elif not slot.get("source_message_id") and isinstance(excerpt, str):
+        elif source is None and isinstance(excerpt, str):
             candidates = [m for m in sources
                           if m.get("message_id") and m.get("role") not in ("post", "current") and
                           m.get("actor_id") == event.get("actor_id") and
@@ -86,31 +103,55 @@ def attach_context_provenance(sem, event, context, postcard):
                                                   [excerpt], [m.get("text") or ""])]
             if len(candidates) == 1:
                 source = candidates[0]
+        if source is None:
+            state_matches = []
+            for request in context.get("active_requests", []):
+                stored = (request.get("slots") or {}).get(slot.get("kind"))
+                if not isinstance(stored, dict) or canon_slot(slot.get("kind"), stored.get("value")) != \
+                        canon_slot(slot.get("kind"), slot.get("value")):
+                    continue
+                candidate = next((m for m in sources if m.get("message_id") == stored.get("source_message_id") and
+                                  m.get("actor_id") == event.get("actor_id") and
+                                  m.get("role") not in ("post", "current")), None)
+                if candidate:
+                    state_matches.append((candidate, request.get("id")))
+            if len(state_matches) == 1:
+                source, request_id = state_matches[0]
+        # Never trust model supplied source identity, owner, request, or token.
+        for field in ("source_message_id", "source_request_id", "source_actor_id", "source_state_token"):
+            slot.pop(field, None)
         if source:
             slot["source_message_id"] = source["message_id"]
             slot["source_actor_id"] = source.get("actor_id")
             slot["source_state_token"] = context.get("state_token")
-        elif slot.get("source_message_id"):
-            source = next((m for m in sources if m.get("message_id") == slot["source_message_id"]), None)
-            # Legacy v1 canonical-post provenance carries only its ID; enrich
-            # it from the current immutable postcard before validation.
-            if source is None and slot["source_message_id"] == event.get("post_id") and post_text:
-                source = {"message_id": event.get("post_id"),
-                          "actor_id": postcard.get("page_id") or event.get("page_id"),
-                          "text": post_text, "role": "post", "vehicles": list(vehicles)}
-            if (source is None and slot["source_message_id"] == event.get("post_id") and
-                    vehicle is not None and canon_slot("vehicle", slot.get("value")) == vehicle):
-                source = {"message_id": event.get("post_id"),
-                          "actor_id": postcard.get("page_id") or event.get("page_id"),
-                          "text": str(vehicles[0]), "role": "post", "vehicles": list(vehicles)}
-            if source:
-                slot.setdefault("source_actor_id", source.get("actor_id"))
-                slot.setdefault("source_state_token", context.get("state_token"))
+            if request_id:
+                slot["source_request_id"] = request_id
     return out
 
 
 _TOP_FIELDS_V1 = {"schema_version", "sentiment", "sarcasm", "scope", "requests", "operations", "uncertainties"}
 _TOP_FIELDS_V2 = _TOP_FIELDS_V1 | {"intent_labels", "category", "tags"}
+
+
+def category_for_labels(labels):
+    categories = {CATEGORY_BY_TOPIC[label] for label in labels if label in CATEGORY_BY_TOPIC}
+    return next(iter(categories)) if len(categories) == 1 else None
+
+
+def upgrade_semantic(semantic):
+    """Adapt v1 data to v2 without inventing labels, categories, or tags."""
+    import copy
+    if not isinstance(semantic, dict):
+        return semantic
+    out = copy.deepcopy(semantic)
+    if out.get("schema_version") == "1":
+        out["schema_version"] = "2"
+        out["intent_labels"] = list(dict.fromkeys(
+            request.get("topic") for request in out.get("requests", [])
+            if isinstance(request, dict) and request.get("topic") in TOPICS))
+        out["tags"] = []
+        out["category"] = category_for_labels(out["intent_labels"])
+    return out
 
 
 def semantic_json_schema(version="1"):
@@ -166,20 +207,27 @@ def semantic_json_schema(version="1"):
     if str(version) == "2":
         properties.update({"intent_labels": {"type": "array", "maxItems": 12,
                                               "items": {"enum": TOPICS}},
-                           "category": {"type": ["string", "null"], "maxLength": 80},
-                           "tags": {"type": "array", "maxItems": 16, "items": string(64)}})
+                           "category": {"type": ["string", "null"], "enum": [*CATEGORIES, None]},
+                           "tags": {"type": "array", "maxItems": 16,
+                                    "items": {"enum": list(SEMANTIC_TAGS)}}})
     return {"$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": f"MAT Intent semantic v{version}", "type": "object",
             "properties": properties, "required": list(properties), "additionalProperties": False}
 
 
-def semantic_model_json_schema(version="1"):
-    """Provider strict subset. App validation enforces the omitted constraints."""
+def semantic_model_json_schema(version="1", *, include_provenance=False):
+    """Provider strict subset; inherited-slot provenance is server-owned."""
     def walk(node):
         if isinstance(node, list):
             return [walk(value) for value in node]
         if not isinstance(node, dict):
             return node
+        if not include_provenance and node.get("type") == "object" and {"kind", "value"} <= \
+                set(node.get("properties", {})):
+            node = dict(node)
+            node["properties"] = {key: value for key, value in node["properties"].items()
+                                  if key not in {"source_message_id", "source_request_id",
+                                                 "source_actor_id", "source_state_token"}}
         out = {}
         for key, value in node.items():
             if key in {"$schema", "title", "description", "minLength", "maxLength",
@@ -355,12 +403,18 @@ def validate_semantic(sem, event_text: str, context_texts: list[str]) -> list[st
         labels = sem.get("intent_labels", [])
         if not isinstance(labels, list) or len(labels) > 12 or any(x not in TOPICS for x in labels):
             errs.append("intent_labels must be a list of known topics (max 12)")
-        if "category" in sem and sem["category"] is not None and (
-                not isinstance(sem["category"], str) or len(sem["category"]) > 80):
-            errs.append("category must be a string of at most 80 characters")
+        elif len(labels) != len(set(labels)):
+            errs.append("intent_labels cannot contain duplicates")
+        if "category" in sem and sem["category"] not in (*CATEGORIES, None):
+            errs.append("category must use the v2 taxonomy or be null")
+        if isinstance(labels, list) and sem.get("category") != category_for_labels(labels):
+            errs.append("category must match the category derived from intent_labels")
         tags = sem.get("tags", [])
-        if not isinstance(tags, list) or len(tags) > 16 or any(not isinstance(x, str) or len(x) > 64 for x in tags):
-            errs.append("tags must contain at most 16 strings of at most 64 characters")
+        if (not isinstance(tags, list) or len(tags) > 16 or
+                any(not isinstance(x, str) or x not in SEMANTIC_TAGS for x in tags)):
+            errs.append("tags must use the v2 semantic tag taxonomy (max 16)")
+        elif len(tags) != len(set(tags)):
+            errs.append("tags cannot contain duplicates")
     if sem.get("sentiment") not in SENTIMENTS: errs.append("bad sentiment")
     if sem.get("sarcasm") not in SARCASM:
         errs.append("sarcasm must be present/absent/uncertain (no bool/float probability)")
@@ -394,6 +448,11 @@ def validate_semantic(sem, event_text: str, context_texts: list[str]) -> list[st
             if r.get("polarity") not in POLARITY: errs.append(f"requests[{i}] bad polarity")
             if not isinstance(r.get("desired_outcome"), str) or not r["desired_outcome"].strip() or len(r["desired_outcome"]) > 120:
                 errs.append(f"requests[{i}] missing/invalid desired_outcome")
+        if version == "2":
+            request_labels = list(dict.fromkeys(r.get("topic") for r in sem["requests"]
+                                                if isinstance(r, dict) and r.get("topic") in TOPICS))
+            if request_labels != sem.get("intent_labels"):
+                errs.append("intent_labels must match the ordered unique request topics")
     if not isinstance(sem.get("operations"), list) or not sem.get("operations"):
         errs.append("operations must be non-empty list")
         return errs

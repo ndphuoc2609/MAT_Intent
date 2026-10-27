@@ -48,6 +48,22 @@ def intent_questions():
             for topic, desc in INTENT_CRITERIA.items()}
 
 
+def validate_answers(answers, questions):
+    """Require exact typed Noul answers and finite probabilities in [0, 1]."""
+    if not isinstance(answers, dict) or set(answers) != set(questions):
+        raise ValueError("Jev answer keys do not match requested questions")
+    for key, question in questions.items():
+        answer = answers.get(key)
+        if not isinstance(question, dict) or question.get("type") != "noul":
+            raise ValueError("unsupported Jev question type")
+        if not isinstance(answer, dict) or set(answer) != {"type", "noul"} or answer.get("type") != "noul":
+            raise ValueError(f"Jev answer {key!r} has the wrong type or fields")
+        probability = answer.get("noul")
+        if type(probability) not in (int, float) or not math.isfinite(probability) or not 0 <= probability <= 1:
+            raise ValueError(f"Jev answer {key!r} probability is outside [0, 1]")
+    return answers
+
+
 class JevOpenRouter:
     model = MODEL
 
@@ -69,13 +85,14 @@ class JevOpenRouter:
             with urllib.request.build_opener(_NoRedirect()).open(req, timeout=timeout) as response:
                 data = json.load(response)
             latency_ms = (time.perf_counter() - start) * 1000
-            if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
-                raise ValueError("Jev response is missing typed answers")
+            if not isinstance(data, dict):
+                raise ValueError("Jev response must be an object")
+            answers = validate_answers(data.get("answers"), questions)
             usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
             cost = usage.get("cost")
             if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
                 cost = None
-            return {"ok": True, "answers": data["answers"], "usage": usage,
+            return {"ok": True, "answers": answers, "usage": usage,
                     "cost_usd_est": float(cost) if cost is not None else None,
                     "cost_unknown": cost is None, "model_requested": self.model,
                     "model_effective": data.get("model", self.model), "provider": data.get("provider"),

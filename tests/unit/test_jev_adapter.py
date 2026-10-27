@@ -11,6 +11,8 @@ from app.adapters.decision_fast_path import social_ack_candidate, social_ack_eli
 class JevAdapterTests(unittest.TestCase):
     def test_fast_path_is_narrow_and_requires_an_explicit_threshold(self):
         self.assertTrue(social_ack_eligible("Cảm ơn bạn!"))
+        self.assertFalse(social_ack_eligible("👍"))
+        self.assertFalse(social_ack_eligible("Cảm ơn bạn!", has_pending=True))
         self.assertFalse(social_ack_eligible("Cảm ơn, cho giá Creta?"))
         self.assertIsNone(social_ack_candidate("Cảm ơn!", {"noul": 0.99}, None))
         self.assertIsNone(social_ack_candidate("Cảm ơn!", {"noul": 0.89}, 0.90))
@@ -26,7 +28,8 @@ class JevAdapterTests(unittest.TestCase):
 
     def test_pinned_model_uses_decisions_api_and_reports_provider_cost(self):
         response = {"model": "typesafe/jev-1.14-20261014", "provider": "TypeSafe",
-                    "answers": {"price": {"type": "noul", "noul": 0.91}},
+                    "answers": {key: {"type": "noul", "noul": 0.91}
+                                for key in intent_questions()},
                     "usage": {"input_tokens": 10, "output_tokens": 2, "cost": 0.00001}}
         requests = []
         def open_request(request, timeout):
@@ -61,7 +64,8 @@ class JevAdapterTests(unittest.TestCase):
                 opener.assert_not_called()
 
     def test_missing_usage_cost_is_unknown_not_hard_coded(self):
-        response = {"model": MODEL, "answers": {"price": {"type": "noul", "noul": 0.9}}}
+        response = {"model": MODEL, "answers": {key: {"type": "noul", "noul": 0.9}
+                                                   for key in intent_questions()}}
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "key"}), \
              patch("app.adapters.jev.urllib.request.build_opener") as opener:
             opener.return_value.open.return_value = io.BytesIO(json.dumps(response).encode())
@@ -69,6 +73,21 @@ class JevAdapterTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIsNone(result["cost_usd_est"])
         self.assertTrue(result["cost_unknown"])
+
+    def test_malformed_answer_key_type_and_probability_fall_back(self):
+        malformed = [
+            {"answers": {"wrong": {"type": "noul", "noul": 0.9}}},
+            {"answers": {"price": {"type": "choice", "choice": "yes"}}},
+            {"answers": {"price": {"type": "noul", "noul": 1.01}}},
+            {"answers": {"price": {"type": "noul", "noul": float("nan")}}},
+        ]
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "key"}), \
+             patch("app.adapters.jev.urllib.request.build_opener") as opener:
+            opener.return_value.open.side_effect = [
+                io.BytesIO(json.dumps({"answers": row["answers"]}).encode()) for row in malformed]
+            for _ in malformed:
+                result = JevOpenRouter().decide("text", {"price": {"type": "noul"}})
+                self.assertFalse(result["ok"], result)
 
 
 if __name__ == "__main__":

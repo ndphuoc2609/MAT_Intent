@@ -10,12 +10,14 @@ from pathlib import Path
 from ..semantics import normalize_model_semantic, parse_json_strict, semantic_model_json_schema
 
 MODEL = "openai/gpt-6-luna"
-PRICE = {"prompt": 0.0000001, "completion": 0.0000005}
+PINNED_MODEL = "openai/gpt-6-luna-20260922"
 SCHEMA_VERSION = "1"
 SCHEMA_PATH = Path(__file__).resolve().parents[2] / "config" / "schema_versions" / "semantic_v1.json"
 with SCHEMA_PATH.open(encoding="utf-8") as _schema_file:
     SEMANTIC_SCHEMA = json.load(_schema_file)
-STRICT_SEMANTIC_SCHEMA = semantic_model_json_schema(SCHEMA_VERSION)
+STRICT_SEMANTIC_SCHEMAS = {version: semantic_model_json_schema(version)
+                           for version in ("1", "2")}
+STRICT_SEMANTIC_SCHEMA = STRICT_SEMANTIC_SCHEMAS[SCHEMA_VERSION]
 
 SYSTEM = """Bạn là semantic parser cho comment Facebook tiếng Việt của Page ô tô Hyundai.
 CHỈ trả JSON đúng schema v1, không giải thích thêm.
@@ -76,12 +78,25 @@ QUY TẮC BẮT BUỘC:
 - Strict output yêu cầu mọi field của schema: field tùy chọn không áp dụng phải trả null; trong slot.extra, kind không dùng phải là null. Không tự tạo fact để điền field.
 """
 
+SYSTEM_V2 = (SYSTEM.replace("schema v1", "schema v2", 1)
+            .replace('"schema_version": "1"', '"schema_version": "2"', 1)
+            .replace("Slot kế thừa phải có explicit=false, source_message_id, source_actor_id và source_state_token đúng từ context; chỉ kế thừa state của cùng actor trong cùng post/thread. Không lấy thuộc tính của actor khác.",
+                     "Slot kế thừa chỉ ghi explicit=false và evidence; server gắn source_message_id, actor và state token từ snapshot đã kiểm chứng.")
+            + """
+V2 fields: intent_labels chứa các nhãn độc lập, duy nhất và đúng với topics trong requests.
+category dùng taxonomy: sales (price/promo/loan/stock/spec/dealer/testdrive/buy/registration),
+service, support (complaint), social; nếu nhãn thuộc nhiều nhóm hoặc không rõ thì category=null.
+tags chỉ dùng: multi_intent, negated, corrected, confirmation, rejection, cancellation,
+handoff, sarcasm, pending_answer, uncertain. Khi không chắc tag, bỏ qua. Không điền nguồn
+hoặc state token của slot kế thừa; server chịu trách nhiệm gắn provenance.
+""")
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a): raise RuntimeError("redirect refused")
 
 def call_luna(post: str, comment: str, parent: str = "", context: str = "",
               model: str = MODEL, timeout: int = 60, max_tokens: int = 1200,
-              repair_note: str = "", budget_guard=None):
+              repair_note: str = "", budget_guard=None, schema_version=SCHEMA_VERSION):
     """Trả dict {ok, semantic, raw_text, usage, cost_usd_est, cost_unknown,
     model_effective, error, attempts}. attempts = số HTTP attempt THỰC đã
     thực hiện (kể cả retry). budget_guard: callable -> bool, được gọi TRƯỚC
@@ -92,6 +107,9 @@ def call_luna(post: str, comment: str, parent: str = "", context: str = "",
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not api_key:
         return dict(ok=False, error="Set OPENROUTER_API_KEY in the process environment", attempts=0)
+    schema_version = str(schema_version)
+    if schema_version not in STRICT_SEMANTIC_SCHEMAS:
+        return dict(ok=False, error="unsupported semantic schema version", attempts=0)
     try:
         context_obj = parse_json_strict(context) if context else None
     except (TypeError, ValueError):
@@ -119,12 +137,13 @@ def call_luna(post: str, comment: str, parent: str = "", context: str = "",
         user = (f"Post: {post}\nParent/root: {parent}\nContext (requests/pending gần nhất của đúng người): {context}\n"
                 f"Comment cần phân tích: {comment}")
     if repair_note: user += f"\nLưu ý sửa lại (chỉ sửa phần lỗi, giữ nguyên phần đúng): {repair_note}"
-    payload = {"model": model, "messages": [{"role": "system", "content": SYSTEM},
+    prompt_version = f"luna_system_v{schema_version}"
+    payload = {"model": model, "messages": [{"role": "system", "content": SYSTEM_V2 if schema_version == "2" else SYSTEM},
                                             {"role": "user", "content": user}],
                "temperature": 0.0, "max_tokens": max_tokens,
                "response_format": {"type": "json_schema", "json_schema": {
-                   "name": "mat_intent_semantic_v1", "strict": True,
-               "schema": STRICT_SEMANTIC_SCHEMA}},
+                   "name": f"mat_intent_semantic_v{schema_version}", "strict": True,
+               "schema": STRICT_SEMANTIC_SCHEMAS[schema_version]}},
                "provider": {"require_parameters": True}}
     last_err = None
     attempts = 0
@@ -165,14 +184,10 @@ def call_luna(post: str, comment: str, parent: str = "", context: str = "",
             if reported_cost is None: reported_cost = out.get("cost")
             if type(reported_cost) in (int, float) and math.isfinite(reported_cost) and reported_cost >= 0:
                 cost, cost_unknown = float(reported_cost), False
-            elif model_effective == MODEL and isinstance(usage, dict) and all(
-                    type(usage.get(k)) is int and usage[k] >= 0
-                    for k in ("prompt_tokens", "completion_tokens")):
-                cost = usage["prompt_tokens"] * PRICE["prompt"] + usage["completion_tokens"] * PRICE["completion"]
-                cost_unknown = False
             return dict(ok=True, semantic=semantic, raw_text=content, usage=usage,
                         cost_usd_est=cost, cost_unknown=cost_unknown,
                         model_effective=model_effective, attempts=attempts,
+                        schema_version=schema_version, prompt_version=prompt_version,
                         retry_cost_usd_est=0.0 if attempts > 1 and not unknown_failed_attempt else None,
                         retry_cost_unknown=attempts > 1 and unknown_failed_attempt)
         except urllib.error.HTTPError as e:

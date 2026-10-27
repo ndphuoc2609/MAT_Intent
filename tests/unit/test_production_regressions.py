@@ -113,6 +113,20 @@ class TestSlotEvidence(unittest.TestCase):
         self.assertEqual((slot["source_message_id"], slot["source_actor_id"], slot["source_state_token"]),
                          ("prior", "u1", "state-a"))
 
+    def test_v2_inherited_provenance_is_attached_by_server_not_model(self):
+        sem = semantic([slot_op("vehicle", "Creta", "Creta", explicit=False)], version="2")
+        sem.update(intent_labels=["price"], category="sales", tags=[])
+        sem["operations"][0]["slot"].update(source_message_id="prior", source_actor_id="attacker",
+                                              source_state_token="model-invented")
+        ctx = {"state_token": "server-snapshot", "recent": [{"message_id": "prior", "actor_id": "u1",
+                "role": "recent", "text": "Giá Creta"}], "messages": []}
+        enriched = attach_context_provenance(sem, event("current", "giá bao nhiêu"), ctx,
+                                               {"vehicles": ["Creta"], "text": "Xe Hyundai"})
+        slot = enriched["operations"][0]["slot"]
+        self.assertEqual(slot["source_message_id"], "prior")
+        self.assertEqual(slot["source_actor_id"], "u1")
+        self.assertEqual(slot["source_state_token"], "server-snapshot")
+
     def test_color_and_down_payment_unit_are_grounded_and_negation_is_respected(self):
         color = semantic([slot_op("color", "Trắng", "Trắng", ref="topic:stock")], topic="stock")
         self.assertEqual(validate_semantic(color, "Còn màu trắng không?", []), [])
@@ -138,7 +152,8 @@ class TestSlotEvidence(unittest.TestCase):
 
     def test_v2_multilabel_contract_requires_labels_category_and_tags(self):
         sem = semantic([{"op": "SOCIAL_ACK", "evidence_excerpt": "cảm ơn"}], version="2")
-        sem.update(intent_labels=["social", "price"], category="sales", tags=["multi-intent"])
+        sem["requests"].append({"topic": "social", "desired_outcome": "ack", "polarity": "positive"})
+        sem.update(intent_labels=["price", "social"], category=None, tags=["multi_intent"])
         self.assertEqual(validate_semantic(sem, "cảm ơn hỏi giá", []), [])
         del sem["tags"]
         self.assertTrue(any("requires tags" in error for error in
@@ -167,6 +182,14 @@ class TestThreadActorIsolation(unittest.TestCase):
         resolved = resolve({"pending_id": "$PENDING", "other": "$OTHER_REQUEST"},
                            engine, event("current", "oke", root="thread-b"))
         self.assertEqual(resolved, {"pending_id": "pending-b", "other": "b-u2"})
+
+    def test_reusing_event_id_with_different_payload_is_conflict(self):
+        engine = make_engine()
+        original = event("same-id", "hello")
+        engine.process(original, PC, None)
+        changed = {**original, "text": "different content"}
+        result = engine.process(changed, PC, None)
+        self.assertIn("EVENT_ID_CONFLICT", result["routing"])
 
     def test_same_actor_followup_in_another_thread_does_not_update_old_request(self):
         engine = make_engine()
@@ -215,6 +238,12 @@ class TestThreadActorIsolation(unittest.TestCase):
         self.assertIn("REVIEW_STALE_CONTEXT", result["routing"])
         request = engine.store.conn.execute("SELECT slots FROM requests").fetchone()[0]
         self.assertEqual(__import__("json").loads(request)["variant"]["value"], "Cao cấp")
+        fresh_token = engine.context(stale, PC)["state_token"]
+        retried = engine.process(stale, PC, semantic([slot_op("variant", "Tiêu chuẩn",
+            "Bản tiêu chuẩn", op="UPDATE_SLOT")]), expected_state_token=fresh_token)
+        self.assertNotIn("DUPLICATE_IGNORED", retried["routing"])
+        request = engine.store.conn.execute("SELECT slots FROM requests").fetchone()[0]
+        self.assertEqual(__import__("json").loads(request)["variant"]["value"], "Tiêu chuẩn")
 
 
 class TestCacheStateCompleteness(unittest.TestCase):
@@ -251,6 +280,13 @@ class TestCacheStateCompleteness(unittest.TestCase):
         self.assertEqual(result["semantic_version"], "1")
         self.assertTrue(any(change["kind"] == "request_created" for change in result["state_changes"]))
         self.assertTrue(result["state_after"]["requests"])
+
+    def test_model_context_does_not_expose_server_state_token(self):
+        from scripts.run_multiturn_eval import fmt_context
+        serialized = fmt_context({"state_token": "server-secret-token", "messages": [
+            {"message_id": "m1", "actor_id": "u1", "role": "current", "text": "giá Creta"}]})
+        self.assertNotIn("server-secret-token", serialized)
+        self.assertNotIn('"state_token"', serialized)
 
 
 if __name__ == "__main__":

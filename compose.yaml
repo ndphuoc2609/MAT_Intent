@@ -1,4 +1,58 @@
 services:
+  intent-postgres:
+    profiles: ["intent"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${INTENT_POSTGRES_USER:-mat_intent}
+      POSTGRES_PASSWORD: ${INTENT_POSTGRES_PASSWORD:-local-only}
+      POSTGRES_DB: ${INTENT_POSTGRES_DB:-mat_intent}
+    ports:
+      - "127.0.0.1:${INTENT_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - mat_intent_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  intent-api:
+    profiles: ["intent"]
+    build: .
+    command: ["python3", "-m", "app.intent_api"]
+    ports:
+      - "127.0.0.1:${INTENT_API_PORT:-8780}:8780"
+    environment:
+      INTENT_API_HOST: "0.0.0.0"
+      INTENT_API_PORT: "8780"
+      INTENT_API_KEY: ${INTENT_API_KEY:-}
+      MAT_INTENT_DATABASE_URL: ${INTENT_SERVICE_DATABASE_URL:-postgresql://mat_intent:local-only@intent-postgres:5432/mat_intent}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      INTENT_LUNA_MODEL: ${INTENT_LUNA_MODEL:-openai/gpt-6-luna-20260922}
+      INTENT_MODEL_TIMEOUT_SECONDS: ${INTENT_MODEL_TIMEOUT_SECONDS:-45}
+      INTENT_MODEL_MAX_TOKENS: ${INTENT_MODEL_MAX_TOKENS:-1200}
+      INTENT_MODEL_MAX_CALLS: ${INTENT_MODEL_MAX_CALLS:-}
+      INTENT_MODEL_MAX_COST_USD: ${INTENT_MODEL_MAX_COST_USD:-}
+      INTENT_MODEL_RESERVE_USD: ${INTENT_MODEL_RESERVE_USD:-}
+      INTENT_BUDGET_LEDGER_PATH: /app/runs/budget_ledger.jsonl
+      INTENT_JEV_SHADOW_ENABLED: "${INTENT_JEV_SHADOW_ENABLED:-false}"
+      INTENT_JEV_MODEL_MAX_CALLS: ${INTENT_JEV_MODEL_MAX_CALLS:-}
+      INTENT_JEV_MODEL_MAX_COST_USD: ${INTENT_JEV_MODEL_MAX_COST_USD:-}
+      INTENT_JEV_MODEL_RESERVE_USD: ${INTENT_JEV_MODEL_RESERVE_USD:-}
+      INTENT_JEV_BUDGET_LEDGER_PATH: /app/runs/budget_ledger.jsonl
+      INTENT_TRACE_PATH: /app/runs/intent_trace.jsonl
+    volumes:
+      - ./runs:/app/runs
+    depends_on:
+      intent-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8780/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
   sandbox:
     build: .
     ports:
@@ -49,3 +103,6 @@ services:
       timeout: 3s
       start_period: 5s
       retries: 3
+
+volumes:
+  mat_intent_pgdata:

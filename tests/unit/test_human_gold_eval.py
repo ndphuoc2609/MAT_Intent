@@ -1,6 +1,6 @@
 import unittest
 
-from scripts.evaluate_human_gold import score, split_human_gold
+from scripts.evaluate_human_gold import score, split_human_gold, split_human_gold_with_report
 
 
 def row(i, thread, actor, day):
@@ -26,17 +26,28 @@ class HumanGoldEvalTests(unittest.TestCase):
                  "slots": {"vehicle": "Creta", "color": "Trắng"}, "action": "HANDOFF",
                  "risk_group": "high"}]
         pred = [{"id": "1", "labels": ["price"], "slots": {"vehicle": "Creta"},
-                 "action": "REVIEW", "covered": True, "auto_processed": True,
-                 "critical_error": True, "pipeline_latency_ms": 50, "cost_usd": 0.001}]
+                 "action": "AUTO", "covered": True, "auto_processed": True,
+                 "pipeline_latency_ms": 50, "cost_usd": 0.001}]
         report = score(gold, pred)
         self.assertEqual(report["all"]["intent_macro_f1"], 0.5)
         self.assertAlmostEqual(report["all"]["slot_f1"], 2 / 3)
         self.assertEqual(report["all"]["action_correctness"], 0.0)
         self.assertEqual(report["high_risk"]["critical_errors"], 1)
+        self.assertEqual(report["high_risk"]["critical_error_unknown"], 0)
         self.assertEqual(report["auto_processed"]["latency_p95_ms"], 50)
         missing = score(gold, [])
         self.assertEqual(missing["all"]["coverage"], 0.0)
         self.assertEqual(missing["missing_predictions"], 1)
+        self.assertIsNone(missing["all"]["critical_errors"])
+        self.assertEqual(missing["all"]["critical_error_unknown"], 1)
+
+    def test_split_reports_actor_group_crossing_temporal_cut(self):
+        rows = [row(i, f"t{i}", f"a{i}", i + 1) for i in range(10)]
+        rows[0]["actor_id"] = rows[-1]["actor_id"] = "same-actor"
+        folds, report = split_human_gold_with_report(rows)
+        self.assertEqual(sum(map(len, folds.values())), 10)
+        self.assertTrue(report["boundary_groups"])
+        self.assertEqual(report["boundary_groups"][0]["size"], 2)
 
 
 if __name__ == "__main__":

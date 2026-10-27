@@ -1001,14 +1001,30 @@
         "string",
         "null"
       ],
-      "maxLength": 80
+      "enum": [
+        "sales",
+        "service",
+        "support",
+        "social",
+        null
+      ]
     },
     "tags": {
       "type": "array",
       "maxItems": 16,
       "items": {
-        "type": "string",
-        "maxLength": 64
+        "enum": [
+          "multi_intent",
+          "negated",
+          "corrected",
+          "confirmation",
+          "rejection",
+          "cancellation",
+          "handoff",
+          "sarcasm",
+          "pending_answer",
+          "uncertain"
+        ]
       }
     }
   },

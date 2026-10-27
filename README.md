@@ -1,5 +1,8 @@
 # Facebook Page conversation assistant
 
+For the independent intent-engine API (no Meta dependency or outbound writes),
+see [docs/intent-api.md](docs/intent-api.md).
+
 The Compose stack contains two isolated services:
 
 - `sandbox` on `127.0.0.1:8766`: the existing interactive demo with sample facts and simulated sends.

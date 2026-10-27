@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS handoffs(request_id TEXT PRIMARY KEY, owner TEXT, rea
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 """
 
+
+class EventPayloadConflict(ValueError):
+    """An idempotency key was reused for a different event payload."""
+
 class Store:
     def __init__(self, path=":memory:"):
         self.lock = threading.RLock()
@@ -77,11 +81,18 @@ class Store:
         """SQLite already serializes this connection's transaction."""
         return None
     def insert_event(self, dedupe, event, actor):
-        return self.conn.execute(
+        cur = self.conn.execute(
             "INSERT OR IGNORE INTO events(dedupe_key,comment_id,actor_id,text,payload,retracted) "
             "VALUES (?,?,?,?,?,0)",
             (dedupe, event["comment_id"], actor, event.get("text", ""),
              json.dumps(event, ensure_ascii=False)))
+        if cur.rowcount == 0:
+            existing = self.conn.execute(
+                "SELECT comment_id,actor_id,payload FROM events WHERE dedupe_key=?", (dedupe,)).fetchone()
+            if (existing and (existing[0] != event["comment_id"] or existing[1] != actor or
+                              json.loads(existing[2] or "{}") != event)):
+                raise EventPayloadConflict("event_id payload conflict")
+        return cur
     # -- helpers trong lock, dùng transaction của caller
     def get_request(self, rid):
         cur = self.conn.execute("SELECT * FROM requests WHERE id=?", (rid,))

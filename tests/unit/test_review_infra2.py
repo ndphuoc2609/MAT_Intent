@@ -239,7 +239,8 @@ class TestOpenRouterCredentials(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["semantic"], _semantic("chào"))
         self.assertEqual(result.get("attempts"), 1)
-        self.assertAlmostEqual(result["cost_usd_est"], 0.000011)
+        self.assertIsNone(result["cost_usd_est"])
+        self.assertTrue(result["cost_unknown"])
         request, = requests
         self.assertEqual(request.full_url, "https://openrouter.ai/api/v1/chat/completions")
         self.assertEqual(request.get_header("Authorization"), "Bearer test-only-key")

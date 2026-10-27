@@ -17,50 +17,14 @@ import argparse, hashlib, json, os, sys, uuid
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from datetime import datetime, timezone
-from app.adapters.luna import call_luna, MODEL, SYSTEM
+from app.adapters.luna import call_luna, PINNED_MODEL as MODEL, SYSTEM_V2 as SYSTEM
 from app.semantics import validate_semantic
+from app.semantics import upgrade_semantic
 from app.harness import make_engine
 from app.engine import Clock
 from app.facts import Facts
 from app.policy import AUTO_ACTIONS, HANDOFF_SLA_HOURS, PENDING_TTL_HOURS
-
-CONTEXT_TOKEN_LIMIT = 12000
-CONTEXT_CHAR_LIMIT = CONTEXT_TOKEN_LIMIT * 3
-
-
-def _over_context_budget(serialized):
-    # shortcut: UTF-8 bytes/3 estimates tokens; use a provider tokenizer when one is available.
-    return len(serialized.encode("utf-8")) > CONTEXT_TOKEN_LIMIT * 3
-
-
-def fmt_context(ctx, *, prior_customer_turns=None):
-    """Serialize context as a bounded object; drop old low-priority messages whole."""
-    recent = list(ctx.get("recent") or [])
-    bot = list(ctx.get("recent_bot_replies") or [])
-    prior = list(prior_customer_turns or [])
-    messages = list(ctx.get("messages") or [])
-    if not any(m.get("role") in ("root", "parent") for m in messages if isinstance(m, dict)):
-        messages += [{"role": "parent", "text": text} for text in ctx.get("parent_texts", [])
-                     if isinstance(text, str)]
-    payload = {
-        "format": "mat_intent_context_v1", "state_token": ctx.get("state_token"),
-        "postcard": ctx.get("postcard") or {}, "messages": messages,
-        "recent": recent, "active_requests": ctx.get("active_requests") or [],
-        "pending": ctx.get("pending") or [], "contact_blocks": ctx.get("contact_blocks") or [],
-        "prior_customer_turns": prior,
-        "recent_bot_replies": [{"text": x, "verified_fact": False} for x in bot],
-    }
-    encode = lambda: json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    while _over_context_budget(encode()) and recent:
-        recent.pop()  # newest is first; discard only the oldest whole message
-    while _over_context_budget(encode()) and prior:
-        prior.pop(0)
-    while _over_context_budget(encode()) and bot:
-        bot.pop(0)
-        payload["recent_bot_replies"] = [{"text": x, "verified_fact": False} for x in bot]
-    if _over_context_budget(encode()):
-        raise ValueError("required post/root/parent/current/state context exceeds budget")
-    return encode()
+from app.context import CONTEXT_CHAR_LIMIT, CONTEXT_TOKEN_LIMIT, fmt_context
 
 def snapshot(eng, page, actor):
     with eng.store.lock:
@@ -84,7 +48,7 @@ def main():
     ap.add_argument("--reserve-cost", type=float, default=0.00032)
     args = ap.parse_args()
     os.makedirs(args.ckdir, exist_ok=True)
-    schema = open(os.path.join(ROOT, "config", "schema_versions", "semantic_v1.json")).read()
+    schema = open(os.path.join(ROOT, "config", "schema_versions", "semantic_v2.json")).read()
     convos = [json.loads(l) for l in open(args.input) if l.strip()]
     total_calls, total_cost = 0, 0.0
     budget_hit = False
@@ -130,10 +94,15 @@ def main():
             cache_context = {
                 "scope": {k: ctx.get("event", {}).get(k)
                           for k in ("page_id", "post_id", "thread_root_id", "actor_id")},
-                "messages": [{k: m.get(k) for k in ("role", "actor_id", "text")}
+                "messages": [{k: m.get(k) for k in
+                              ("message_id", "role", "actor_id", "text", "parent_id", "event_time")}
                              for m in ctx.get("messages", []) if m.get("role") != "current"],
-                "recent": [{k: m.get(k) for k in ("actor_id", "text")}
+                "recent": [{k: m.get(k) for k in
+                            ("message_id", "actor_id", "text", "parent_id", "event_time")}
                            for m in ctx.get("recent", [])],
+                "state_sources": [{k: m.get(k) for k in
+                                   ("message_id", "actor_id", "role", "text", "slot_kind", "slot_value")}
+                                  for m in ctx.get("state_sources", [])],
                 "requests": sorted(request_logical_key(r) for r in actor_reqs),
                 "pendings": sorted(pending_logical_key(p, {r["id"]: r for r in actor_reqs})
                                    for p in full_pends if p.get("status") == "OPEN"),
@@ -148,7 +117,7 @@ def main():
                                                  "handoff_sla_hours": HANDOFF_SLA_HOURS,
                                                  "pending_ttl_hours": PENDING_TTL_HOURS})
             parent_context = [m.get("text", "") for m in ctx.get("messages", [])
-                              if m.get("role") in ("root", "parent")]
+                              if m.get("role") in ("root", "parent", "root_parent")]
             cache_key = full_cache_key(comment=text, parent=parent_context, postcard=pc,
                                        state_fp=state_fp, system=SYSTEM, schema=schema,
                                        model=MODEL)
@@ -210,7 +179,7 @@ def main():
                 post_str = f"{pc.get('topic')} ({', '.join(pc.get('vehicles') or [])})"
                 call_guard, reservations = _make_hook()
                 api = call_luna(post_str, text, parent="", context=ctx_str,
-                                budget_guard=call_guard)
+                                budget_guard=call_guard, model=MODEL, schema_version="2")
                 attempts, cost = api.get("attempts", 1), api.get("cost_usd_est")
                 total_calls += attempts; total_cost += cost or 0.0
                 if cost is None: run_unknown = True
@@ -223,7 +192,7 @@ def main():
                                          ("failed" if cost is not None else "unknown_cost"))
                     budget_ledger.settle_reservations(budget_ledger.DEFAULT_PATH, reservations)
                 if api.get("ok"):
-                    sem, model_eff = api["semantic"], api.get("model_effective", MODEL)
+                    sem, model_eff = upgrade_semantic(api["semantic"]), api.get("model_effective", MODEL)
                     val_errs = validate_semantic(sem, text, [r["text"] for r in ctx["recent"]] + ctx["parent_texts"])
                     if val_errs:  # 1 lần repair (guard TRƯỚC repair, R14)
                         ok2, reason2 = _guard()
@@ -233,7 +202,8 @@ def main():
                         else:
                             repair_guard, reservations = _make_hook()
                             rep = call_luna(post_str, text, parent="", context=ctx_str,
-                                            repair_note="; ".join(val_errs), budget_guard=repair_guard)
+                                            repair_note="; ".join(val_errs), budget_guard=repair_guard,
+                                            model=MODEL, schema_version="2")
                             attempts += rep.get("attempts", 1); total_calls += rep.get("attempts", 1)
                             _rc = rep.get("cost_usd_est")
                             cost = (cost or 0.0) + (_rc or 0.0); total_cost += _rc or 0.0
@@ -245,7 +215,7 @@ def main():
                                                  status=None if rep.get("ok") else "failed")
                             budget_ledger.settle_reservations(budget_ledger.DEFAULT_PATH, reservations)
                             if rep.get("ok"):
-                                sem = rep["semantic"]
+                                sem = upgrade_semantic(rep["semantic"])
                                 val_errs = validate_semantic(sem, text, [r["text"] for r in ctx["recent"]] + ctx["parent_texts"])
                     json.dump(dict(cache_key_v2=cache_key, semantic=sem, model_effective=model_eff,
                                    validation_errors=val_errs,

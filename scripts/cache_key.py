@@ -16,16 +16,24 @@ import hashlib, json
 def _canon(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
 
-def _slot_logical(slots) -> dict:
+def _slot_logical(slots, request_id=None) -> dict:
     # Keep every field that can change grounding or policy, including lineage;
     # random request/pending handles are mapped separately.
-    return dict(slots or {})
+    out = json.loads(_canon(slots or {}))
+    for slot in out.values():
+        if not isinstance(slot, dict): continue
+        # This server snapshot token is removed before inference and attached
+        # again after validation, so it cannot change a cached model decision.
+        slot.pop("source_state_token", None)
+        if slot.get("source_request_id") == request_id:
+            slot["source_request_id"] = "self"
+    return out
 
 def request_logical_key(req: dict) -> str:
     """Logical request identity with all slots/outcomes and no random request id."""
     return _canon({k: req.get(k) for k in ("page_id", "post_id", "thread_root_id", "actor_id",
                                            "topic", "status", "version", "desired_outcomes")} |
-                   {"slots": _slot_logical(req.get("slots"))})
+                   {"slots": _slot_logical(req.get("slots"), req.get("id"))})
 
 def pending_logical_key(pend: dict, req_by_id=None) -> str:
     """Logical pending identity with proposition, status, options and basis."""

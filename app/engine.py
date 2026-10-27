@@ -7,7 +7,7 @@ from .normalize import canon_slot, norm, parse_relative_datetime, parse_time_exp
 from .semantics import attach_context_provenance, validate_semantic
 from .facts import Facts, calc_otr
 from .renderer import render, claim_check, claim_check_typed
-from .state import Store, FakeSender
+from .state import EventPayloadConflict, Store, FakeSender
 from .policy import AUTO_ACTIONS, HANDOFF_SLA_HOURS, PENDING_TTL_HOURS
 
 
@@ -351,13 +351,22 @@ class Engine:
                 "AND json_extract(payload, '$.thread_root_id')=? AND comment_id<>? ORDER BY rowid DESC LIMIT 5",
                 (event["actor_id"], event["page_id"], event.get("post_id"),
                  event.get("thread_root_id"), event.get("comment_id"))).fetchall()
-            recent = [{"comment_id": r[1], "message_id": r[1], "actor_id": r[2], "role": "recent", "text": r[0]}
-                      for r in rows if r[1] != event.get("comment_id")]
+            recent = []
+            for row in rows:
+                if row[1] in {event.get("comment_id"), event.get("thread_root_id"), event.get("parent_id")}:
+                    continue
+                try: payload = json.loads(row[3] or "{}")
+                except (TypeError, ValueError): payload = {}
+                recent.append({"comment_id": row[1], "message_id": row[1], "actor_id": row[2],
+                    "role": "recent", "text": row[0] or "", "parent_id": payload.get("parent_id"),
+                    "event_time": payload.get("event_time")})
             by_id = {}
             for key, role in (("thread_root_id", "root"), ("parent_id", "parent")):
                 mid = event.get(key)
-                if (not mid or mid in (event.get("post_id"), event.get("comment_id")) or
-                        mid in by_id):
+                if mid in by_id and role == "parent" and by_id[mid].get("role") == "root":
+                    by_id[mid]["role"] = "root_parent"
+                    continue
+                if not mid or mid in (event.get("post_id"), event.get("comment_id")) or mid in by_id:
                     continue
                 pr = self.store.conn.execute(
                     "SELECT text, actor_id, payload FROM events WHERE comment_id=? AND retracted=0 ORDER BY rowid DESC LIMIT 1",
@@ -369,7 +378,8 @@ class Engine:
                         payload.get("post_id") == event.get("post_id") and
                         payload.get("thread_root_id") == event.get("thread_root_id")):
                     by_id[mid] = {"message_id": mid, "actor_id": pr[1], "role": role,
-                                  "text": pr[0] or ""}
+                                  "text": pr[0] or "", "parent_id": payload.get("parent_id"),
+                                  "event_time": payload.get("event_time")}
             allowed_shared = {event.get("thread_root_id"), event.get("parent_id")}
             for message in external_messages or []:
                 if (not isinstance(message, dict) or message.get("message_id") not in allowed_shared or
@@ -383,25 +393,50 @@ class Engine:
                 by_id[message["message_id"]] = {"message_id": message["message_id"],
                     "actor_id": message.get("actor_id"), "role": message.get("role") or
                     ("root" if message["message_id"] == event.get("thread_root_id") else "parent"),
-                    "text": message["text"]}
+                    "text": message["text"], "parent_id": message.get("parent_id"),
+                    "event_time": message.get("event_time")}
             shared = [dict(message_id=event.get("post_id"), actor_id=postcard.get("page_id"),
                            role="post", text=postcard.get("text") or "")]
             shared.extend(by_id.values())
             if all(x.get("message_id") != event.get("comment_id") for x in shared):
                 shared.append(dict(message_id=event.get("comment_id"), actor_id=event.get("actor_id"),
-                                   role="current", text=event.get("text") or ""))
+                                   role="current", text=event.get("text") or "",
+                                   parent_id=event.get("parent_id"), event_time=event.get("event_time")))
             active = self.store.active_requests(event["page_id"], event["actor_id"],
                                                 event.get("post_id"), event.get("thread_root_id"))
+            state_sources = []
+            seen_sources = set()
+            for request in active:
+                for name, slot in (request.get("slots") or {}).items():
+                    source_id = slot.get("source_message_id") if isinstance(slot, dict) else None
+                    if not source_id or source_id in seen_sources:
+                        continue
+                    seen_sources.add(source_id)
+                    row = self.store.conn.execute(
+                        "SELECT text,actor_id,payload FROM events WHERE comment_id=? AND actor_id=? "
+                        "AND retracted=0 ORDER BY rowid DESC LIMIT 1", (source_id, event["actor_id"])).fetchone()
+                    if not row:
+                        continue
+                    try: payload = json.loads(row[2] or "{}")
+                    except (TypeError, ValueError): payload = {}
+                    if (payload.get("page_id") == event["page_id"] and
+                            payload.get("post_id") == event.get("post_id") and
+                            payload.get("thread_root_id") == event.get("thread_root_id")):
+                        state_sources.append({"message_id": source_id, "actor_id": row[1],
+                            "role": "state_source", "text": row[0] or "",
+                            "request_id": request["id"], "slot_kind": name,
+                            "slot_value": slot.get("value")})
             pend = []
             for r in active:
                 pend += self.store.open_pending_for(
                     event["actor_id"], r["id"], page_id=event["page_id"],
                     post_id=event.get("post_id"), thread_root_id=event.get("thread_root_id"))
             contact_blocks = sorted(self.store.blocks(event["page_id"], event["actor_id"]))
-        parent_texts = [x["text"] for x in shared if x["role"] in ("root", "parent")]
+        parent_texts = [x["text"] for x in shared if x["role"] in ("root", "parent", "root_parent")]
         snapshot = {"scope": [event.get(k) for k in
                               ("page_id", "post_id", "thread_root_id", "actor_id")],
                     "postcard": postcard, "shared": shared, "recent": recent,
+                    "state_sources": state_sources,
                     "requests": [{k: r.get(k) for k in
                                   ("id", "version", "topic", "status", "slots", "desired_outcomes")}
                                  for r in active],
@@ -415,7 +450,7 @@ class Engine:
         return dict(event=event, postcard=postcard, messages=shared, recent=recent,
                     parent_texts=parent_texts, active_requests=active, pending=pend,
                     contact_blocks=contact_blocks,
-                    state_token=state_token)
+                    state_sources=state_sources, state_token=state_token)
 
     def _trace_state_snapshot(self, event):
         scope = (event["page_id"], event.get("post_id"), event.get("thread_root_id"), event["actor_id"])
@@ -543,9 +578,15 @@ class Engine:
                         result["routing"].append("RETRACTED"); self.store.conn.commit(); return result
                 if event.get("actor_role") == "page_self":
                     result["routing"].append("PAGE_SELF_IGNORED"); self.store.conn.commit(); return result
-                if isinstance(semantic, dict) and semantic.get("scope") != "in_scope":
-                    result["routing"].append("REVIEW_SCOPE")
-                    self.store.audit(event["comment_id"], "scope_review", result, now_iso)
+                if isinstance(semantic, dict) and semantic.get("scope") in ("out_of_scope", "unknown"):
+                    scope_errors = validate_semantic(semantic, event.get("text", ""), [])
+                    if scope_errors:
+                        result["errors"] = scope_errors
+                        result["routing"].append("REVIEW_SCHEMA")
+                        self.store.audit(event["comment_id"], "schema_error", result, now_iso)
+                    else:
+                        result["routing"].append("REVIEW_SCOPE")
+                        self.store.audit(event["comment_id"], "scope_review", result, now_iso)
                     self.store.conn.commit(); return result
                 self._sweep_expired(event, now_iso)
                 ctx = self.context(event, postcard, trusted_context_messages)
@@ -558,9 +599,12 @@ class Engine:
                 if expected_state_token is not None and expected_state_token != ctx["state_token"]:
                     result["routing"].append("REVIEW_STALE_CONTEXT")
                     self.store.audit(event["comment_id"], "stale_context", result, now_iso)
+                    # Keep the API inbox event durable, but let this engine event
+                    # be retried with a fresh snapshot and the same idempotency key.
+                    self.store.conn.execute("DELETE FROM events WHERE dedupe_key=?", (dedupe,))
                     self.store.conn.commit(); return result
                 semantic = attach_context_provenance(semantic, event, ctx, postcard)
-                for message in [*ctx["messages"], *ctx["recent"]]:
+                for message in [*ctx["messages"], *ctx["recent"], *ctx.get("state_sources", [])]:
                     mid = message.get("message_id")
                     if mid:
                         source = trusted_source_ids.get(mid)
@@ -579,6 +623,7 @@ class Engine:
                                 "actor_id": message.get("actor_id"),
                                 "state_token": ctx["state_token"], "role": message.get("role")}
                 ctx_texts = [postcard.get("text", "")] + [r["text"] for r in ctx["recent"]] + ctx.get("parent_texts", [])
+                ctx_texts += [m["text"] for m in ctx.get("state_sources", [])]
                 if isinstance(trusted_context_texts, (list, tuple)):
                     ctx_texts += [text for text in trusted_context_texts
                                   if isinstance(text, str) and text.strip() and len(text) <= 20000]
@@ -872,6 +917,10 @@ class Engine:
                 self.store.conn.execute("RELEASE SAVEPOINT business")
                 self.store.audit(event["comment_id"], "processed", result, now_iso)
                 self.store.conn.commit(); return result
+            except EventPayloadConflict as e:
+                self.store.conn.rollback()
+                result["errors"].append(str(e)); result["routing"].append("EVENT_ID_CONFLICT")
+                return result
             except Exception as e:
                 self.store.conn.rollback()
                 result["errors"].append(str(e)); result["routing"].append("ERROR_ROLLBACK")
