@@ -1,0 +1,18 @@
+# Không đưa vào image: cache, DB runtime, file tạm, ZIP cũ.
+__pycache__
+*.pyc
+*.db
+*.receiver
+runs/
+.git
+*.zip
+*.sha256
+/tmp
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+.ssh/
+secrets/

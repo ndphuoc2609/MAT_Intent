@@ -1,0 +1,10 @@
+[project]
+name = "facebook-intent-sandbox"
+version = "1.0.0"
+description = "Sandbox (không gửi Facebook thật) cho hệ thống hiểu và xử lý comment Facebook tiếng Việt"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

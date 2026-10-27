@@ -1,0 +1,41 @@
+services:
+  sandbox:
+    build: .
+    ports:
+      - "127.0.0.1:8766:8766"
+    environment:
+      SANDBOX_HOST: 0.0.0.0
+      SANDBOX_PORT: "8766"
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes:
+      - ./runs:/app/runs
+
+  meta-services:
+    build: .
+    command: ["python3", "-m", "meta_services.server"]
+    ports:
+      - "127.0.0.1:8767:8767"
+    environment:
+      META_SERVICE_HOST: "0.0.0.0"
+      META_SERVICE_PORT: "8767"
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      META_APP_ID: ${META_APP_ID:-}
+      META_APP_SECRET: ${META_APP_SECRET:-}
+      META_PAGE_ID: ${META_PAGE_ID:-}
+      META_PAGE_ACCESS_TOKEN: ${META_PAGE_ACCESS_TOKEN:-}
+      META_WEBHOOK_VERIFY_TOKEN: ${META_WEBHOOK_VERIFY_TOKEN:-}
+      META_GRAPH_API_VERSION: ${META_GRAPH_API_VERSION:-}
+      META_OUTBOUND_ENABLED: "${META_OUTBOUND_ENABLED:-false}"
+      META_SERVICE_API_KEY: ${META_SERVICE_API_KEY:-}
+    volumes:
+      - ./runs:/app/runs
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8767/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3

@@ -1,0 +1,15 @@
+# Ngân sách phiên (theo prompt §2). Vượt trần -> dừng gọi mới, lưu checkpoint.
+session:
+  max_fix_loops: 12
+  max_model_calls: 300
+  max_cost_usd: 2.00
+  max_cases_per_api_batch: 60
+  model_requested: openai/gpt-6-luna
+  model_effective_canonical: openai/gpt-6-luna-20260922  # từ /v1/models ngày 2026-10-24
+  pricing_per_token_usd: {prompt: 0.0000001, completion: 0.0000005}
+  # Ước tính trước gọi / call: prompt ~1200 tok = 0.00012, completion ~400 tok = 0.00020
+  pre_estimate_per_call_usd: 0.00032
+  timeout_seconds: 60
+  max_output_tokens: 1200
+  retries: 2  # chỉ 429/529/5xx/timeout, backoff+jitter; không retry 401/400/schema
+  retryable_statuses: [429, 529, 500, 502, 503, 504]

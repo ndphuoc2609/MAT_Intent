@@ -1,0 +1,32 @@
+# Gate policy v1 — code là nguồn duy nhất áp dụng thứ tự này (app/policy.py).
+# Một enum duy nhất KHÔNG đủ: routing_action, state_updates,
+# outbound_permission và response_plan được tách riêng trong engine.
+version: 1
+gate_order:
+  - kill_switch_and_environment
+  - opt_out_per_channel
+  - handoff_lock
+  - dedupe_and_state_version
+  - schema_evidence_provenance
+  - complaint_legal_human_route
+  - sarcasm_or_ambiguous_action
+  - slots_facts_no_conflict
+  - response_validated_and_auto_allowlist
+  - recheck_before_dispatch
+kill_switch: false  # bật bằng tay trong test kill-switch; sender giả vẫn không gửi khi bật
+auto_allowed_actions:
+  - answer_price
+  - answer_promo
+  - answer_loan_info
+  - answer_stock
+  - answer_spec
+  - answer_dealer
+  - ask_clarification
+  - social_ack
+  - propose_test_drive_slot
+  - answer_confirmation
+  # KHÔNG auto: confirm_purchase, confirm_booking, confirm_payment, send_lead, call_out
+pending_ttl_hours: 24
+handoff_sla_hours: 48  # quá SLA -> OVERDUE, KHÔNG tự release (xem app/policy.py)
+facts_freshness_ttl_hours: 720  # TTL kinh doanh riêng từng fact vẫn thắng nếu ngắn hơn
+opt_out_scopes: [call, public_reply, inbox, all]

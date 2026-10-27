@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Luna · Hội thoại thử nghiệm</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header><div><p class="eyebrow">HYUNDAI · INTENT SANDBOX</p><h1>Thử một cuộc hội thoại thật.</h1><p>Luna đọc ý định. Engine giữ trạng thái, kiểm tra dữ kiện và quyết định trả lời.</p></div><span class="badge">Chỉ gửi mô phỏng</span></header>
+  <aside class="disclosure"><strong>Dữ kiện SAMPLE · Không dùng tư vấn thật.</strong> Không gửi Facebook, tạo lịch hẹn, lead hay đặt cọc thật. Khi gửi một lượt, nội dung bài viết, bình luận và ngữ cảnh riêng của cuộc hội thoại sẽ được gửi tới OpenRouter. Trạng thái hội thoại chỉ nằm trong bộ nhớ và mất khi khởi động lại. Tối đa 24 lần gọi mới trong ngân sách phiên 300 lần / $2; mỗi attempt giữ trước tối đa $0.05, retry và repair đều được tính.</aside>
+  <p id="model-status" class="status" role="status">Đang kiểm tra kết nối máy chủ…</p>
+  <main>
+    <section class="setup panel" aria-labelledby="setup-title">
+      <p class="eyebrow">01 · BỐI CẢNH</p><h2 id="setup-title">Bắt đầu hội thoại</h2>
+      <form id="setup-form">
+        <label for="post-select">Bài viết</label><select id="post-select"><option value="">Đang tải…</option></select>
+        <div id="manual" hidden>
+          <label for="page-id">Page ID</label><input id="page-id" maxlength="200" placeholder="page-cua-ban">
+          <label for="post-text">Nội dung bài viết</label><textarea id="post-text" rows="5" maxlength="10000" placeholder="Dán nội dung bài viết tại đây"></textarea>
+          <label for="vehicles">Danh sách xe, cách nhau bằng dấu phẩy</label><input id="vehicles" placeholder="Creta, Tucson">
+        </div>
+        <label for="actor-id">Actor ID (người bình luận)</label><input id="actor-id" value="customer-1" maxlength="200" required>
+        <button type="submit" id="start">Tạo hội thoại riêng</button>
+      </form>
+      <label for="conversation-select">Hội thoại trong phiên này</label><select id="conversation-select"><option value="">Chưa có hội thoại</option></select>
+      <div class="post-preview"><h3>Bài viết hiện tại</h3><p id="post-preview">Chọn bài viết rồi tạo hội thoại.</p><p id="scope" class="muted"></p></div>
+    </section>
+    <section class="chat panel" aria-labelledby="chat-title">
+      <p class="eyebrow">02 · HỘI THOẠI</p><h2 id="chat-title">Bạn muốn hỏi gì?</h2>
+      <div id="history" class="history" aria-live="polite"><p class="empty">Tạo hội thoại để bắt đầu. Mỗi bình luận tự do đều được gửi tới Luna.</p></div>
+      <form id="turn-form"><label for="turn-text">Bình luận của khách hàng</label><textarea id="turn-text" rows="3" maxlength="10000" placeholder="Ví dụ: Creta bản cao còn màu trắng không?" required disabled></textarea><div class="composer-footer"><span class="muted">Enter xuống dòng · Gửi để phân tích</span><button id="send" type="submit" disabled>Gửi tới Luna</button></div></form>
+      <p id="error" class="error" role="alert"></p>
+    </section>
+    <section class="inspection panel" aria-labelledby="inspection-title">
+      <p class="eyebrow">03 · ENGINE</p><h2 id="inspection-title">Ý nghĩa & trạng thái</h2>
+      <h3>Điều hướng lượt gần nhất</h3><p id="route" class="route">Chưa có lượt</p>
+      <h3>Semantic operations</h3><pre id="semantic">Chưa có diễn giải</pre>
+      <h3>Requests đang mở & slots</h3><pre id="requests">[]</pre>
+      <h3>Câu hỏi / đề xuất đang chờ</h3><pre id="pending">[]</pre>
+      <details><summary>Fake-send ledger · chỉ mô phỏng</summary><pre id="fake-sends">[]</pre></details>
+      <details><summary>Outbox</summary><pre id="outbox">[]</pre></details>
+    </section>
+  </main>
+  <footer>openai/gpt-6-luna · Khóa API chỉ được đọc ở máy chủ · Không có đăng nhập Meta hay gửi thật</footer>
+</body>
+</html>

@@ -1,0 +1,15 @@
+# Targets chốt TRƯỚC khi tối ưu (prompt §14). Không tự đổi rồi kết luận pass.
+# Tất cả metric dưới đây đo trên nhãn synthetic_contract / ai_reviewed cho tới khi
+# có human_verified; khi đó cổng B chỉ được gọi SEMANTIC_EXPLORATORY.
+gate_b_targets:
+  intent_request_macro_f1: 0.90
+  request_recall_incl_multi: 0.95
+  negation_confirmation_change_link_accuracy: 0.98
+  action_correctness: 0.95
+  end_state_correctness: 0.95
+  auto_response_precision: 0.99
+  correct_self_completion_rate_eligible: 0.60
+  min_auto_requests_in_self_completion_denominator: 30
+# Định nghĩa eligible (chốt trước, không loại ca khó vì model fail):
+# nhu cầu trong phạm vi, facts hợp lệ có sẵn HOẶC slot thu thập được,
+# không bắt buộc người theo policy.
