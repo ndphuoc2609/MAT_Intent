@@ -49,6 +49,21 @@ class TestSlotEvidence(unittest.TestCase):
             "op": "SOCIAL_ACK", "evidence_excerpt": "oke", "request_ref": None}]})
         self.assertEqual(shaped["operations"], [{"op": "SOCIAL_ACK", "evidence_excerpt": "oke"}])
 
+    def test_provider_slot_without_server_owned_provenance_normalizes(self):
+        value = {"requests": [{"topic": "price", "desired_outcome": None}], "operations": [{
+            "op": "START_REQUEST", "request": {"topic": "price", "desired_outcome": None},
+            "slot": {"kind": "vehicle", "value": "Creta", "raw": None,
+                     "evidence_excerpt": "Creta", "explicit": True, "confirmed": None, "extra": None}}]}
+        shaped = normalize_model_semantic(value)
+        self.assertEqual(shaped["requests"], [{"topic": "price"}])
+        self.assertEqual(shaped["operations"][0]["request"], {"topic": "price"})
+        self.assertEqual(shaped["operations"][0]["slot"], {
+            "kind": "vehicle", "value": "Creta", "evidence_excerpt": "Creta", "explicit": True})
+        minimal = normalize_model_semantic({"requests": [{"topic": "price"}], "operations": [{
+            "op": "START_REQUEST", "request": {"topic": "price"},
+            "slot": {"kind": "vehicle", "value": "Creta"}}]})
+        self.assertEqual(minimal["operations"][0]["slot"], {"kind": "vehicle", "value": "Creta"})
+
     def test_post_vehicle_context_is_inferred_with_post_provenance(self):
         engine = make_engine()
         sem = semantic([{"op": "START_REQUEST", "request_ref": "topic:price",
@@ -126,6 +141,54 @@ class TestSlotEvidence(unittest.TestCase):
         self.assertEqual(slot["source_message_id"], "prior")
         self.assertEqual(slot["source_actor_id"], "u1")
         self.assertEqual(slot["source_state_token"], "server-snapshot")
+
+    def test_operation_source_id_is_server_mapped_from_current_evidence(self):
+        sem = semantic([{"op": "START_REQUEST", "request_ref": "topic:spec",
+                         "source_message_id": "model-guessed-id", "evidence_excerpt": "Xe như nào"}],
+                       topic="spec")
+        enriched = attach_context_provenance(sem, event("current-1", "Xe như nào"),
+            {"messages": [{"message_id": "current-1", "actor_id": "u1", "role": "current",
+                           "text": "Xe như nào"}]}, PC)
+        self.assertEqual(enriched["operations"][0]["source_message_id"], "current-1")
+
+    def test_operation_source_id_maps_to_unique_parent_evidence(self):
+        sem = semantic([{"op": "START_REQUEST", "request_ref": "topic:spec",
+                         "source_message_id": "model-guessed-id", "evidence_excerpt": "Thông tin gốc"}],
+                       topic="spec")
+        context = {"messages": [
+            {"message_id": "parent-1", "actor_id": "u2", "role": "parent", "text": "Thông tin gốc"},
+            {"message_id": "current-1", "actor_id": "u1", "role": "current", "text": "đúng vậy"}]}
+        enriched = attach_context_provenance(sem, event("current-1", "đúng vậy", parent="parent-1"),
+                                               context, PC)
+        self.assertEqual(enriched["operations"][0]["source_message_id"], "parent-1")
+
+    def test_ambiguous_context_excerpt_does_not_trust_model_source_id(self):
+        engine = make_engine()
+        postcard = {"vehicles": [], "text": "Bài viết"}
+        root = event("root", "cụm trích dẫn", actor="root-author", root="root")
+        parent = event("parent", "cụm trích dẫn", actor="parent-author", root="root", parent="root")
+        current = event("current", "đúng như trên", actor="u1", root="root", parent="parent")
+        engine.process(root, postcard, None)
+        engine.process(parent, postcard, None)
+        sem = semantic([{"op": "START_REQUEST", "request_ref": "topic:spec",
+                         "source_message_id": "model-guessed-id", "evidence_excerpt": "cụm trích dẫn"}],
+                       topic="spec")
+        result = engine.process(current, postcard, sem)
+        self.assertIn("REVIEW_PROVENANCE", result["routing"])
+        self.assertEqual(result["state_changes"], [])
+
+    def test_explicit_slot_source_must_be_the_current_message(self):
+        engine = make_engine()
+        postcard = {"vehicles": ["Creta"], "text": "Hyundai Creta"}
+        prior = event("prior", "Creta", root="root")
+        engine.process(prior, postcard, None)
+        current = event("current", "Creta", root="root")
+        op = slot_op("vehicle", "Creta", "Creta", explicit=True)
+        op["source_message_id"] = "prior"
+        op["slot"]["source_message_id"] = "prior"
+        result = engine.process(current, postcard, semantic([op]))
+        self.assertIn("REVIEW_PROVENANCE", result["routing"])
+        self.assertEqual(result["state_changes"], [])
 
     def test_color_and_down_payment_unit_are_grounded_and_negation_is_respected(self):
         color = semantic([slot_op("color", "Trắng", "Trắng", ref="topic:stock")], topic="stock")

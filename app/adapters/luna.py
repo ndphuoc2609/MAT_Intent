@@ -31,7 +31,7 @@ CHỈ trả JSON đúng schema v1, không giải thích thêm.
    "polarity": "positive|negative|conditional|unknown"}],
  "operations": [{"op": "START_REQUEST|UPDATE_SLOT|ANSWER_PENDING|CONFIRM_PENDING|REJECT_PENDING|CANCEL_REQUEST|SET_CONTACT_PREFERENCE|REQUEST_HUMAN|REPORT_COMPLAINT|SOCIAL_ACK|UNRESOLVED",
    "request_ref": "topic:<topic> hoặc id request nếu context cho",
-   "slot": {"kind": "vehicle|variant|color|location|price_kind|down_payment|datetime|dealer|service_topic|compare_vehicle", "value": "giá trị thô hoặc số, down_payment là {amount, unit|null}", "evidence_excerpt": "trích riêng phần chứng minh slot nếu explicit", "explicit": true, "source_message_id": "...", "source_actor_id": "...", "source_state_token": "..."},
+   "slot": {"kind": "vehicle|variant|color|location|price_kind|down_payment|datetime|dealer|service_topic|compare_vehicle", "value": "giá trị thô hoặc số, down_payment là {amount, unit|null}", "evidence_excerpt": "trích riêng phần chứng minh slot nếu explicit", "explicit": true},
    "evidence_excerpt": "trích nguyên văn từ comment (hoặc parent/root nếu suy luận từ đó)",
    "pending_id": "chỉ khi trả lời/xác nhận pending trong context",
    "scope": "call|public_reply|inbox|all (chỉ cho SET_CONTACT_PREFERENCE)",
@@ -49,10 +49,11 @@ QUY TẮC BẮT BUỘC:
 - Sarcasm: khen ngược/mỉa mai = present; không chắc = uncertain; không dùng số confidence.
 - different_action=true CHỈ khi hai cách hiểu đều hợp lý theo context và dẫn tới trạng thái/hiệu ứng xử lý khác nhau thật sự (VD: hủy khác đổi giờ, gửi khác không gửi). Nếu cùng dẫn tới một trạng thái/hiệu ứng, chọn cách hiểu hợp ngữ cảnh nhất và đặt different_action=false; không flag chỉ vì cách diễn đạt có thể phân tích khác nhau.
 - Evidence phải là trích nguyên văn có trong comment/parent/root đã cho; không bịa excerpt.
+- Không tự điền operations[].source_message_id; luôn để null để server ánh xạ evidence tới message đã xác minh.
 - Slot explicit phải được chứng minh bởi chính evidence_excerpt (value hoặc alias đã biết phải xuất hiện trong excerpt); không dùng một từ khác trong câu để hợp thức hóa slot.
 - evidence_excerpt ở operation chứng minh intent; slot.evidence_excerpt chứng minh riêng slot. Không dùng excerpt intent để chứng minh slot nếu chúng khác nhau.
-- Slot kế thừa phải có explicit=false, source_message_id, source_actor_id và source_state_token đúng từ context; chỉ kế thừa state của cùng actor trong cùng post/thread. Không lấy thuộc tính của actor khác.
-- Không coi câu trả lời cũ của model là fact. Post là bối cảnh chung; nếu suy xe từ post đơn xe, đánh dấu explicit=false và trỏ source_message_id tới post.
+- Slot kế thừa phải có explicit=false; chỉ kế thừa từ message/evidence cùng actor, cùng post/thread trong context. Không tự điền nguồn hoặc state token; server gắn provenance từ snapshot đã kiểm chứng. Nếu nguồn không rõ thì bỏ slot hoặc trả UNRESOLVED. Không lấy thuộc tính của actor khác.
+- Không coi câu trả lời cũ của model là fact. Post là bối cảnh chung; nếu post nêu đúng một xe và dùng xe đó làm slot suy luận, evidence_excerpt của slot phải trích đúng tên xe từ post, đặt explicit=false, không tự điền source_message_id; server gắn nguồn đã xác minh.
 - Persona/tone chỉ áp dụng sau khi policy quyết định; không đổi sentiment, intent, polarity hoặc slot extraction.
 - down_payment: "200" không kèm đơn vị thì unit=null, KHÔNG tự gán triệu.
 - price_kind: "lăn bánh"=otr, "niêm yết"=list, "giá" chung chung thì để price_kind trống và UNRESOLVED? Không: vẫn START_REQUEST price, không đặt slot price_kind.
@@ -80,19 +81,30 @@ QUY TẮC BẮT BUỘC:
 
 SYSTEM_V2 = (SYSTEM.replace("schema v1", "schema v2", 1)
             .replace('"schema_version": "1"', '"schema_version": "2"', 1)
-            .replace("Slot kế thừa phải có explicit=false, source_message_id, source_actor_id và source_state_token đúng từ context; chỉ kế thừa state của cùng actor trong cùng post/thread. Không lấy thuộc tính của actor khác.",
-                     "Slot kế thừa chỉ ghi explicit=false và evidence; server gắn source_message_id, actor và state token từ snapshot đã kiểm chứng.")
             + """
 V2 fields: intent_labels chứa các nhãn độc lập, duy nhất và đúng với topics trong requests.
 category dùng taxonomy: sales (price/promo/loan/stock/spec/dealer/testdrive/buy/registration),
 service, support (complaint), social; nếu nhãn thuộc nhiều nhóm hoặc không rõ thì category=null.
 tags chỉ dùng: multi_intent, negated, corrected, confirmation, rejection, cancellation,
-handoff, sarcasm, pending_answer, uncertain. Khi không chắc tag, bỏ qua. Không điền nguồn
-hoặc state token của slot kế thừa; server chịu trách nhiệm gắn provenance.
+handoff, sarcasm, pending_answer, uncertain. Khi không chắc tag, bỏ qua.
 """)
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a): raise RuntimeError("redirect refused")
+
+
+def _model_output_failure(code, message, *, attempts, usage, cost, cost_unknown,
+                          model_effective, schema_version, prompt_version,
+                          finish_reason=None):
+    """Return a safe, typed failure for a completed but unusable model reply."""
+    result = dict(ok=False, error_code=code, error=message, attempts=attempts,
+                  usage=usage, cost_usd_est=None if cost_unknown else cost,
+                  cost_unknown=cost_unknown, model_effective=model_effective,
+                  schema_version=schema_version, prompt_version=prompt_version)
+    if isinstance(finish_reason, str):
+        result["finish_reason"] = finish_reason[:64]
+    return result
+
 
 def call_luna(post: str, comment: str, parent: str = "", context: str = "",
               model: str = MODEL, timeout: int = 60, max_tokens: int = 1200,
@@ -140,7 +152,7 @@ def call_luna(post: str, comment: str, parent: str = "", context: str = "",
     prompt_version = f"luna_system_v{schema_version}"
     payload = {"model": model, "messages": [{"role": "system", "content": SYSTEM_V2 if schema_version == "2" else SYSTEM},
                                             {"role": "user", "content": user}],
-               "temperature": 0.0, "max_tokens": max_tokens,
+               "max_tokens": max_tokens,
                "response_format": {"type": "json_schema", "json_schema": {
                    "name": f"mat_intent_semantic_v{schema_version}", "strict": True,
                "schema": STRICT_SEMANTIC_SCHEMAS[schema_version]}},
@@ -165,25 +177,79 @@ def call_luna(post: str, comment: str, parent: str = "", context: str = "",
             req.add_header("Content-Type", "application/json")
             req.add_header("Authorization", f"Bearer {api_key}")
             with urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout) as res:
-                out = json.load(res)
+                try:
+                    out = json.load(res)
+                except (TypeError, ValueError, UnicodeError, RecursionError) as e:
+                    return dict(ok=False, error=f"invalid provider JSON: {type(e).__name__}",
+                                attempts=attempts, cost_usd_est=None, cost_unknown=True,
+                                model_effective=model, schema_version=schema_version,
+                                prompt_version=prompt_version)
             last_failure_unbilled = False
-            content = out["choices"][0]["message"]["content"]
-            usage = out.get("usage", {})
+            usage = out.get("usage") if isinstance(out, dict) else {}
+            if not isinstance(usage, dict):
+                usage = {}
+            model_effective = (out.get("model") or model) if isinstance(out, dict) else model
+            cost, cost_unknown = None, True
+            reported_cost = usage.get("cost")
+            if reported_cost is None and isinstance(out, dict): reported_cost = out.get("cost")
+            try:
+                valid_cost = type(reported_cost) in (int, float) and math.isfinite(reported_cost) and reported_cost >= 0
+            except OverflowError:
+                valid_cost = False
+            if valid_cost:
+                cost, cost_unknown = float(reported_cost), False
+            common = dict(attempts=attempts, usage=usage, cost=cost,
+                           cost_unknown=cost_unknown or unknown_failed_attempt,
+                           model_effective=model_effective, schema_version=schema_version,
+                           prompt_version=prompt_version)
+            choices = out.get("choices") if isinstance(out, dict) else None
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                return _model_output_failure("MODEL_RESPONSE_SHAPE",
+                    "provider response did not contain a completion choice", **common)
+            choice = choices[0]
+            finish_reason = choice.get("finish_reason")
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                return _model_output_failure("MODEL_RESPONSE_SHAPE",
+                    "provider completion did not contain an assistant message",
+                    finish_reason=finish_reason, **common)
+            # Refusal/filter signals take precedence over length. The sandbox
+            # may retry a length truncation with a larger token cap, which
+            # must never turn an explicit refusal into another attempt.
+            if ((isinstance(message.get("refusal"), str) and message["refusal"].strip()) or
+                    finish_reason in ("content_filter", "refusal")):
+                return _model_output_failure("MODEL_REFUSAL",
+                    "model refused structured output or filtered the response",
+                    finish_reason=finish_reason, **common)
+            if finish_reason == "length":
+                return _model_output_failure("MODEL_OUTPUT_TRUNCATED",
+                    "model output truncated at max_tokens", finish_reason=finish_reason, **common)
+            if "content" not in message or message["content"] is None:
+                return _model_output_failure("MODEL_OUTPUT_MISSING",
+                    "model response content is missing", finish_reason=finish_reason, **common)
+            content = message["content"]
+            # OpenRouter documents chat completion output content as a string.
+            # Do not stringify arrays/objects into JSON: that would conflate
+            # provider content parts with the semantic contract.
+            if not isinstance(content, str):
+                return _model_output_failure("MODEL_OUTPUT_SHAPE",
+                    "model response content must be a JSON string",
+                    finish_reason=finish_reason, **common)
             try:
                 semantic = parse_json_strict(content)
-                if not isinstance(semantic, dict):
-                    raise ValueError("model response must be a JSON object")
+            except (TypeError, ValueError, UnicodeError, RecursionError):
+                return _model_output_failure("MODEL_OUTPUT_INVALID_JSON",
+                    "model response content is not valid JSON",
+                    finish_reason=finish_reason, **common)
+            if not isinstance(semantic, dict):
+                return _model_output_failure("MODEL_SEMANTIC_SHAPE",
+                    "model semantic must be a JSON object", finish_reason=finish_reason, **common)
+            try:
                 semantic = normalize_model_semantic(semantic)
-            except (TypeError, ValueError) as e:
-                last_err = f"invalid model JSON: {e}"[:500]
-                break
-            # A8: chỉ tính cost khi cả hai token counts là số nguyên không âm.
-            model_effective = out.get("model", model)
-            cost, cost_unknown = None, True
-            reported_cost = (usage.get("cost") if isinstance(usage, dict) else None)
-            if reported_cost is None: reported_cost = out.get("cost")
-            if type(reported_cost) in (int, float) and math.isfinite(reported_cost) and reported_cost >= 0:
-                cost, cost_unknown = float(reported_cost), False
+            except (TypeError, ValueError, AttributeError, KeyError, OverflowError):
+                return _model_output_failure("MODEL_SEMANTIC_SHAPE",
+                    "model semantic contains an invalid nested shape",
+                    finish_reason=finish_reason, **common)
             return dict(ok=True, semantic=semantic, raw_text=content, usage=usage,
                         cost_usd_est=cost, cost_unknown=cost_unknown,
                         model_effective=model_effective, attempts=attempts,

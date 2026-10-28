@@ -25,6 +25,7 @@ auto_allowed_actions:
   - social_ack
   - propose_test_drive_slot
   - answer_confirmation
+  - answer_general_advice
   # KHÔNG auto: confirm_purchase, confirm_booking, confirm_payment, send_lead, call_out
 pending_ttl_hours: 24
 handoff_sla_hours: 48  # quá SLA -> OVERDUE, KHÔNG tự release (xem app/policy.py)

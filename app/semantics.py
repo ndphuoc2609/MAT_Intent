@@ -71,7 +71,31 @@ def attach_context_provenance(sem, event, context, postcard):
     recent = [m for m in context.get("recent", []) if isinstance(m, dict)]
     sources = ([m for m in context.get("messages", []) if isinstance(m, dict)] + recent +
                [m for m in context.get("state_sources", []) if isinstance(m, dict)])
-    for op in out.get("operations") or []:
+    operations = out.get("operations")
+    # Provenance enrichment is downstream of model parsing and must leave
+    # malformed containers untouched for validate_semantic to reject. In
+    # particular, iterating an integer here used to turn a schema error into
+    # ERROR_ROLLBACK before the validator could return REVIEW_SCHEMA.
+    if not isinstance(operations, list):
+        return out
+    for op in operations:
+        if not isinstance(op, dict):
+            continue
+        # Model IDs are claims, not provenance. Resolve the operation quote to
+        # the current event or one unique root/parent message from this snapshot.
+        op.pop("source_message_id", None)
+        op_excerpt = op.get("evidence_excerpt")
+        if isinstance(op_excerpt, str) and norm(op_excerpt) in norm(event.get("text") or ""):
+            if event.get("comment_id"):
+                op["source_message_id"] = event["comment_id"]
+        elif isinstance(op_excerpt, str):
+            matches = {m.get("message_id"): m for m in sources
+                       if (m.get("role") in ("post", "root", "parent", "root_parent") or
+                           m.get("role") in ("recent", "state_source") and
+                           m.get("actor_id") == event.get("actor_id")) and
+                       m.get("message_id") and norm(op_excerpt) in norm(m.get("text") or "")}
+            if len(matches) == 1:
+                op["source_message_id"] = next(iter(matches))
         slot = op.get("slot") if isinstance(op, dict) else None
         if not isinstance(slot, dict) or slot.get("explicit", True) is not False:
             continue
@@ -85,15 +109,16 @@ def attach_context_provenance(sem, event, context, postcard):
                 _positive_slot_evidence(slot.get("kind"), slot.get("value"), slot,
                                         [excerpt], [model_source.get("text") or ""])):
             source = model_source
+        post_vehicle = str(vehicles[0]) if vehicles else ""
         if (source is None and slot.get("kind") == "vehicle" and
                 vehicle is not None and canon_slot("vehicle", slot.get("value")) == vehicle and
-                isinstance(excerpt, str) and
-                _positive_slot_evidence("vehicle", slot.get("value"), slot, [excerpt],
-                                        [post_text or str(vehicles[0])])):
+                _positive_slot_evidence("vehicle", slot.get("value"), slot, [post_vehicle],
+                                        [post_text or post_vehicle])):
             source = {"message_id": event.get("post_id"),
                       "actor_id": postcard.get("page_id") or event.get("page_id"),
                       "text": post_text or str(vehicles[0]), "role": "post",
                       "vehicles": list(vehicles)}
+            slot["evidence_excerpt"] = post_vehicle
         elif source is None and isinstance(excerpt, str):
             candidates = [m for m in sources
                           if m.get("message_id") and m.get("role") not in ("post", "current") and
@@ -271,24 +296,34 @@ def normalize_model_semantic(semantic):
     if not isinstance(semantic, dict):
         return semantic
     out = copy.deepcopy(semantic)
-    for request in out.get("requests", []):
-        if isinstance(request, dict) and request.get("desired_outcome") is None:
-            request.pop("desired_outcome")
-    for operation in out.get("operations", []):
+    requests = out.get("requests")
+    if isinstance(requests, list):
+        for request in requests:
+            if isinstance(request, dict) and request.get("desired_outcome") is None:
+                request.pop("desired_outcome", None)
+    operations = out.get("operations")
+    if not isinstance(operations, list):
+        return out
+    for operation in operations:
         if not isinstance(operation, dict):
             continue
-        for field in OP_SPEC.get(operation.get("op"), {}).get("allowed", ()):
+        operation_type = operation.get("op")
+        # Structured output is a provider constraint, not a substitute for
+        # validation. A malformed nested value must reach validate_semantic as
+        # a schema error instead of raising TypeError here (e.g. op=[...]).
+        spec = OP_SPEC.get(operation_type, {}) if isinstance(operation_type, str) else {}
+        for field in spec.get("allowed", ()):
             if field in operation and operation[field] is None:
                 operation.pop(field)
         request = operation.get("request")
         if isinstance(request, dict) and request.get("desired_outcome") is None:
-            request.pop("desired_outcome")
+            request.pop("desired_outcome", None)
         slot = operation.get("slot")
         if isinstance(slot, dict):
             for field in ("raw", "evidence_excerpt", "explicit", "confirmed", "extra", "source_message_id",
                           "source_request_id", "source_actor_id", "source_state_token"):
                 if slot.get(field) is None:
-                    slot.pop(field)
+                    slot.pop(field, None)
             extra = slot.get("extra")
             if isinstance(extra, dict):
                 slot["extra"] = {kind: value for kind, value in extra.items() if value is not None}
@@ -502,11 +537,6 @@ def validate_semantic(sem, event_text: str, context_texts: list[str]) -> list[st
             errs.append(f"operations[{i}] missing evidence_excerpt")
         elif not any(norm(ex) in h for h in [norm(event_text)] + [norm(x) for x in context_texts]):
             errs.append(f"operations[{i}] evidence not found in event/context")
-        # A6: op-level source là canonical; slot-level source khác op-level
-        # là mâu thuẫn provenance (engine cũng kiểm lại bằng store).
-        if op.get("source_message_id") and isinstance(op.get("slot"), dict) and op["slot"].get("source_message_id"):
-            if op["source_message_id"] != op["slot"]["source_message_id"]:
-                errs.append(f"operations[{i}] slot source differs from op source (canonical is op-level)")
         slot = op.get("slot")
         if slot is not None:
             if not isinstance(slot, dict):

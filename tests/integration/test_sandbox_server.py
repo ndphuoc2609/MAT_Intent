@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import sqlite3
 from pathlib import Path
 import tempfile
 import threading
@@ -11,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 
-def meaning(text="giá bao nhiêu", evidence="Creta"):
+def meaning(text="giá bao nhiêu", evidence="giá bao nhiêu"):
     return {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent",
             "scope": "in_scope", "requests": [{"topic": "price", "desired_outcome": "price", "polarity": "positive"}],
             "operations": [{"op": "START_REQUEST", "request_ref": "topic:price", "evidence_excerpt": evidence,
@@ -86,6 +87,384 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertEqual(manual["post"]["text"], "Tucson tại Page của tôi")
         self.assertEqual(manual["active_requests"], [])
 
+    def test_sandbox_does_not_reply_with_sample_price_when_no_verified_facts(self):
+        state = self.conversation()
+        comment = "Giá niêm yết Creta bản cao bao nhiêu?"
+        sem = meaning(evidence=comment)
+        sem["operations"].append({"op": "UPDATE_SLOT", "request_ref": "topic:price",
+                                  "evidence_excerpt": "Giá niêm yết",
+                                  "slot": {"kind": "price_kind", "value": "list",
+                                           "evidence_excerpt": "Giá niêm yết", "explicit": True}})
+        sem["operations"].append({"op": "UPDATE_SLOT", "request_ref": "topic:price",
+                                  "evidence_excerpt": "bản cao",
+                                  "slot": {"kind": "variant", "value": "Cao cấp",
+                                           "evidence_excerpt": "bản cao", "explicit": True}})
+        with patch("sandbox.server.call_luna", return_value=model_result(sem)):
+            _, result = self.turn(state, comment)
+        self.assertNotIn("SAMPLE", (result["turn"].get("response_text") or "").upper())
+        self.assertFalse(any("SAMPLE" in json.dumps(send, ensure_ascii=False).upper()
+                             for send in result["turn"]["sends"]))
+
+    def test_sandbox_reads_dealers_from_configured_directory(self):
+        path = str(Path(self.tmp.name) / "dealers.sqlite3")
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE dealers(name TEXT, mailing_address TEXT)")
+            db.execute("INSERT INTO dealers VALUES (?, ?)", ("Hyundai Hoàng Mai", "987 Tam Trinh, Hoàng Mai, Hà Nội"))
+        self.http.app.dealer_db_path = path
+        state = self.conversation()
+        self.assertEqual(state["dealer_directory"], {"status": "available", "count": 1})
+        comment = "Tìm đại lý ở Hà Nội"
+        sem = {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent", "scope": "in_scope",
+               "requests": [{"topic": "dealer", "desired_outcome": "dealer", "polarity": "positive"}],
+               "operations": [{"op": "START_REQUEST", "request_ref": "topic:dealer", "topic": "dealer",
+                    "evidence_excerpt": comment, "slot": {"kind": "location", "value": "Hà Nội",
+                    "evidence_excerpt": "Hà Nội", "explicit": True}}], "uncertainties": []}
+        with patch("sandbox.server.call_luna", return_value=model_result(sem)):
+            _, result = self.turn(state, comment)
+        reply = result["turn"].get("response_text") or ""
+        self.assertIn("Hyundai Hoàng Mai", reply)
+        self.assertIn("987 Tam Trinh", reply)
+        self.assertNotIn("SAMPLE", reply.upper())
+        maps = result["turn"]["dealer_maps"]
+        self.assertEqual(len(maps), 1)
+        self.assertEqual(maps[0]["name"], "Hyundai Hoàng Mai")
+        self.assertTrue(maps[0]["url"].startswith("https://www.google.com/maps/search/?api=1&query="))
+
+    def test_dealer_follow_up_location_reads_directory(self):
+        path = str(Path(self.tmp.name) / "dealers-followup.sqlite3")
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE dealers(name TEXT, mailing_address TEXT)")
+            db.execute("INSERT INTO dealers VALUES (?, ?)", ("Hyundai Hoàng Mai", "987 Tam Trinh, Hoàng Mai, Hà Nội"))
+        self.http.app.dealer_db_path = path
+        state = self.conversation()
+        question = "Tìm đại lý Hyundai"
+        sem = {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent", "scope": "in_scope",
+               "requests": [{"topic": "dealer", "desired_outcome": "dealer", "polarity": "positive"}],
+               "operations": [{"op": "START_REQUEST", "request_ref": "topic:dealer", "topic": "dealer",
+                               "evidence_excerpt": question}], "uncertainties": []}
+        with patch("sandbox.server.call_luna", return_value=model_result(sem)):
+            _, first = self.turn(state, question)
+        self.assertIn("ask_clarification", first["turn"]["routing"])
+        request_id, pending_id = first["active_requests"][0]["id"], first["pending"][0]["id"]
+        sem["operations"] = [{"op": "ANSWER_PENDING", "request_ref": request_id, "pending_id": pending_id,
+                              "evidence_excerpt": "Hà Nội", "slot": {"kind": "location", "value": "Hà Nội",
+                              "evidence_excerpt": "Hà Nội", "explicit": True}}]
+        with patch("sandbox.server.call_luna", return_value=model_result(sem)):
+            _, second = self.turn(state, "Hà Nội")
+        self.assertIn("Hyundai Hoàng Mai", second["turn"].get("response_text") or "")
+        self.assertEqual(len(second["turn"]["dealer_maps"]), 1)
+
+    def test_dealer_reply_and_map_do_not_expose_embedded_personal_contact(self):
+        from urllib.parse import parse_qs, urlsplit
+        path = str(Path(self.tmp.name) / "dealers-contact.sqlite3")
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE dealers(name TEXT, mailing_address TEXT)")
+            db.execute("INSERT INTO dealers VALUES (?, ?)", ("Hyundai Hiệp Bình",
+                "Nguyễn A - 0901234567    Số 123, Quốc lộ 13, Phường Hiệp Bình, TP. HCM"))
+            db.execute("INSERT INTO dealers VALUES (?, ?)", ("Hyundai Thủ Đức",
+                "Nguyễn B Số 456, Quốc lộ 13, Phường Hiệp Bình, TP. HCM"))
+        self.http.app.dealer_db_path = path
+        state = self.conversation()
+        text = "Tìm đại lý ở Sài Gòn"
+        sem = {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent", "scope": "in_scope",
+               "requests": [{"topic": "dealer", "desired_outcome": "dealer", "polarity": "positive"}],
+               "operations": [{"op": "START_REQUEST", "request_ref": "topic:dealer", "topic": "dealer",
+                   "evidence_excerpt": text, "slot": {"kind": "location", "value": "TP.HCM",
+                   "evidence_excerpt": "Sài Gòn", "explicit": True}}], "uncertainties": []}
+        with patch("sandbox.server.call_luna", return_value=model_result(sem)):
+            _, result = self.turn(state, text)
+        turn = result["turn"]
+        self.assertIn("Số 123", turn["response_text"])
+        self.assertNotIn("Nguyễn A", turn["response_text"])
+        self.assertNotIn("Nguyễn B", turn["response_text"])
+        self.assertNotIn("0901234567", turn["response_text"])
+        queries = [parse_qs(urlsplit(link["url"]).query)["query"][0] for link in turn["dealer_maps"]]
+        self.assertTrue(any("Số 123" in query for query in queries))
+        self.assertTrue(any("Số 456" in query for query in queries))
+        self.assertTrue(all("Nguyễn A" not in query and "Nguyễn B" not in query and "0901234567" not in query
+                            for query in queries))
+
+    def test_sandbox_jev_shadow_is_observable_without_blocking_luna(self):
+        finished = threading.Event()
+        class FakeJev:
+            def decide(self, state, questions, **kwargs):
+                finished.set()
+                self_state.append(state)
+                return {"ok": True, "attempts": 1, "model_effective": "typesafe/jev-1.14",
+                        "latency_ms": 12.5, "usage": {"input_tokens": 40, "output_tokens": 3},
+                        "cost_usd_est": 0.00002, "cost_unknown": False,
+                        "answers": {key: {"type": "noul", "noul": 0.7 if key == "price" else 0.01}
+                                    for key in questions}}
+        self_state = []
+        self.http.app.jev_adapter = FakeJev()
+        self.http.app.jev_trace_path = str(Path(self.tmp.name) / "jev_trace.jsonl")
+        state = self.conversation()
+        comment = "Giá lăn bánh Creta bao nhiêu?"
+        with patch("sandbox.server.call_luna", return_value=model_result(meaning(evidence=comment))):
+            status, result = self.turn(state, comment)
+        self.assertEqual(status, 200, result)
+        shadow_id = result["turn"]["jev_shadow_event_id"]
+        self.assertTrue(finished.wait(1))
+        for _ in range(50):
+            status, shadow = self.request("GET", f"/api/conversations/{state['id']}/jev/{shadow_id}")
+            if shadow["status"] != "pending": break
+            time.sleep(0.01)
+        self.assertEqual(status, 200)
+        self.assertEqual(shadow["status"], "complete")
+        self.assertEqual(shadow["predictions"]["price"], 0.7)
+        self.assertEqual(shadow["model_effective"], "typesafe/jev-1.14")
+        self.assertNotIn(comment, json.dumps(shadow))
+        self.assertEqual(len(self_state), 1)
+        self.assertIn(comment, self_state[0]["context"])
+        trace = json.loads(Path(self.http.app.jev_trace_path).read_text().splitlines()[0])
+        self.assertEqual(trace["decisions"]["price"]["probability"], 0.7)
+        self.assertEqual(trace["question_version"], "jev_intent_questions_v1")
+        self.assertEqual(trace["model_effective"], "typesafe/jev-1.14")
+        self.assertEqual(len(trace["event_hash"]), 64)
+        self.assertNotIn(comment, json.dumps(trace))
+
+    def test_sandbox_jev_shadow_is_bounded_and_invalid_answers_are_hidden(self):
+        started, release = threading.Event(), threading.Event()
+        calls = []
+        class BlockingJev:
+            def decide(self, state, questions, **kwargs):
+                calls.append(state)
+                started.set()
+                release.wait(2)
+                return {"ok": True, "attempts": 1, "answers": {key: {"type": "noul", "noul": 1.2}
+                        for key in questions}}
+        self.http.app.jev_adapter = BlockingJev()
+        state = self.conversation()
+        first = self.http.app.start_jev_shadow(self.http.app.conversations[state["id"]], "event-1", "{}")
+        self.assertTrue(started.wait(1))
+        duplicate = self.http.app.start_jev_shadow(self.http.app.conversations[state["id"]], "event-1", "different")
+        self.assertEqual(duplicate, first)
+        self.assertEqual(len(calls), 1)
+        second = self.http.app.start_jev_shadow(self.http.app.conversations[state["id"]], "event-2", "{}")
+        self.assertEqual(self.http.app.conversations[state["id"]]["jev_shadows"][second]["status"], "skipped")
+        release.set()
+        for _ in range(100):
+            record = self.http.app.conversations[state["id"]]["jev_shadows"].get(first, {})
+            if record.get("status") != "pending": break
+            time.sleep(0.01)
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["predictions"], {})
+        self.assertNotIn("1.2", json.dumps(record))
+        shadow_ledger = [json.loads(line) for line in Path(self.ledger).read_text().splitlines()
+                         if line.strip() and json.loads(line).get("kind") == "shadow"]
+        self.assertEqual(shadow_ledger[-1]["attempts"], 1)
+        self.assertIsNone(shadow_ledger[-1]["cost_usd_est"])
+
+    def test_jev_blocked_model_error_is_visible_without_provider_payload(self):
+        class BlockedJev:
+            def decide(self, state, questions, **kwargs):
+                return {"ok": False, "attempts": 1, "cost_unknown": True,
+                        "error_code": "MODEL_BLOCKED", "http_status": 404,
+                        "error": "private provider payload"}
+        self.http.app.jev_adapter = BlockedJev()
+        self.http.app.jev_trace_path = str(Path(self.tmp.name) / "jev_trace.jsonl")
+        state = self.conversation()
+        event_id = self.http.app.start_jev_shadow(self.http.app.conversations[state["id"]], "blocked-1", "{}")
+        for _ in range(100):
+            _, result = self.request("GET", f"/api/conversations/{state['id']}/jev/{event_id}")
+            if result["status"] != "pending": break
+            time.sleep(0.01)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "MODEL_BLOCKED")
+        self.assertEqual(result["http_status"], 404)
+        self.assertNotIn("private provider payload", json.dumps(result))
+
+    def test_jev_trace_write_failure_does_not_change_luna_result(self):
+        class FakeJev:
+            def decide(self, state, questions, **kwargs):
+                return {"ok": True, "attempts": 1,
+                    "answers": {key: {"type": "noul", "noul": 0.1} for key in questions}}
+        self.http.app.jev_adapter = FakeJev()
+        state = self.conversation()
+        comment = "Giá lăn bánh Creta bao nhiêu?"
+        with patch("scripts.model_trace.append", side_effect=OSError("private path")), \
+             patch("sandbox.server.call_luna", return_value=model_result(meaning(evidence=comment))):
+            status, result = self.turn(state, comment)
+        self.assertEqual(status, 200)
+        self.assertTrue(result["turn"]["ok"])
+        event_id = result["turn"]["jev_shadow_event_id"]
+        for _ in range(100):
+            shadow = self.http.app.conversations[state["id"]]["jev_shadows"].get(event_id, {})
+            if shadow.get("status") != "pending": break
+            time.sleep(0.01)
+        self.assertEqual(shadow["status"], "complete")
+        self.assertEqual(shadow["trace_status"], "failed")
+        self.assertNotIn("private path", json.dumps(shadow))
+
+        class RaiseAfterRequest:
+            def decide(self, state, questions, **kwargs):
+                self.assert_guard = kwargs["budget_guard"]()
+                raise TimeoutError("raw private context must not reach result")
+        self.http.app.jev_adapter = RaiseAfterRequest()
+        event_id = self.http.app.start_jev_shadow(self.http.app.conversations[state["id"]], "event-3", "{}")
+        for _ in range(100):
+            record = self.http.app.conversations[state["id"]]["jev_shadows"].get(event_id, {})
+            if record.get("status") != "pending": break
+            time.sleep(0.01)
+        self.assertEqual(record["status"], "failed")
+        self.assertNotIn("private context", json.dumps(record))
+        shadow_ledger = [json.loads(line) for line in Path(self.ledger).read_text().splitlines()
+                         if line.strip() and json.loads(line).get("kind") == "shadow"]
+        self.assertEqual(shadow_ledger[-1]["attempts"], 1)
+        self.assertIsNone(shadow_ledger[-1]["cost_usd_est"])
+
+    def test_health_keeps_sandbox_open_by_default_with_uncapped_warning(self):
+        from scripts import budget_ledger
+        budget_ledger.record(self.ledger, run_id="unknown-test", kind="call", attempts=1,
+                             cost_usd_est=None)
+        status, health = self.request("GET", "/health")
+        self.assertEqual(status, 200)
+        self.assertTrue(health["budget_ok"])
+        self.assertFalse(health["budget_enforced"])
+        self.assertIn("uncapped", health["budget_warning"].lower())
+
+    def test_persona_selection_generates_post_for_chat_context(self):
+        personas = [{"id": "advisor", "name": "Tư vấn viên"}]
+        with patch("sandbox.server.Sandbox.personas", return_value=personas), \
+             patch("sandbox.server.Sandbox.generate_post", return_value="Bài viết về Creta"):
+            status, result = self.request("GET", "/api/personas")
+            self.assertEqual(status, 200)
+            self.assertTrue(any(item["id"] == "advisor" for item in result["personas"]))
+            self.assertIn("Creta", result["vehicles"])
+            state = self.conversation(post_id=None, persona_id="advisor", vehicle="Creta")
+        self.assertEqual(state["post"]["persona_id"], "advisor")
+        self.assertEqual(state["post"]["vehicles"], ["Creta"])
+        self.assertIn("Creta", state["post"]["text"])
+
+        def luna(post, text, **kwargs):
+            self.assertEqual(post, state["post"]["text"])
+            self.assertIn("Creta", kwargs["context"])
+            self.assertTrue(kwargs["budget_guard"]())
+            return model_result(meaning(evidence="Giá lăn bánh Creta"))
+        with patch("sandbox.server.call_luna", side_effect=luna):
+            status, result = self.turn(state, "Giá lăn bánh Creta bao nhiêu?")
+        self.assertEqual(status, 200, result)
+        self.assertTrue(result["turn"]["ok"], result["turn"])
+        self.assertGreaterEqual(result["turn"]["pipeline_latency_ms"], result["turn"]["model_latency_ms"])
+        self.assertEqual(result["turn"]["model"], "openai/gpt-6-luna")
+        self.assertEqual(result["turn"]["usage"], {"prompt_tokens": 500, "completion_tokens": 100,
+                                                     "total_tokens": 600})
+        self.assertTrue(result["turn"]["usage_complete"])
+
+    def test_persona_tone_changes_wording_without_changing_intent_or_pending(self):
+        personas = [{"id": "warm", "name": "An", "tone": "thân thiện"},
+                    {"id": "neutral", "name": "Bình", "tone": "trung tính"}]
+        question = "Tìm đại lý Hyundai"
+        sem = {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent", "scope": "in_scope",
+               "requests": [{"topic": "dealer", "desired_outcome": "dealer", "polarity": "positive"}],
+               "operations": [{"op": "START_REQUEST", "request_ref": "topic:dealer", "topic": "dealer",
+                               "evidence_excerpt": question}], "uncertainties": []}
+        with patch("sandbox.server.Sandbox.personas", return_value=personas), \
+             patch("sandbox.server.Sandbox.generate_post", return_value="Bài viết về Creta"), \
+             patch("sandbox.server.call_luna", return_value=model_result(sem)):
+            warm = self.conversation(post_id=None, persona_id="warm", vehicle="Creta")
+            neutral = self.conversation(post_id=None, persona_id="neutral", vehicle="Creta")
+            _, warm_result = self.turn(warm, question)
+            _, neutral_result = self.turn(neutral, question)
+        self.assertNotEqual(warm_result["turn"]["response_text"], neutral_result["turn"]["response_text"])
+        self.assertEqual(warm_result["turn"]["routing"], neutral_result["turn"]["routing"])
+        self.assertEqual(warm_result["pending"][0]["expected_slot"], neutral_result["pending"][0]["expected_slot"])
+
+    def test_chat_usage_is_incomplete_when_provider_retries_are_unreported(self):
+        state = self.conversation()
+        with patch("sandbox.server.call_luna", return_value=model_result(attempts=2)):
+            status, result = self.turn(state)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["turn"]["attempts"], 2)
+        self.assertFalse(result["turn"]["usage_complete"])
+
+    def test_reasoning_token_count_is_available_when_provider_reports_it(self):
+        state = self.conversation()
+        response = model_result()
+        response["usage"]["completion_tokens_details"] = {"reasoning_tokens": 60}
+        with patch("sandbox.server.call_luna", return_value=response):
+            _, result = self.turn(state)
+        self.assertEqual(result["turn"]["model_calls"][0]["reasoning_tokens"], 60)
+
+    def test_total_tokens_are_summed_per_call_when_provider_omits_total(self):
+        state = self.conversation()
+        first = model_result(sem={}, cost=.0001)
+        first["usage"]["total_tokens"] = 123
+        second = model_result(cost=.0001)
+        with patch("sandbox.server.call_luna", side_effect=[first, second]):
+            status, result = self.turn(state)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["turn"]["usage"]["total_tokens"], 123 + 500 + 100)
+        self.assertTrue(result["turn"]["usage_complete"])
+
+    def test_pipeline_latency_includes_response_state_build(self):
+        state = self.conversation()
+        original_state = self.http.app.state
+        def delayed_state(conversation):
+            time.sleep(.025)
+            return original_state(conversation)
+        with patch("sandbox.server.call_luna", return_value=model_result()), \
+             patch.object(self.http.app, "state", side_effect=delayed_state):
+            status, result = self.turn(state)
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(result["turn"]["pipeline_latency_ms"], 20)
+
+    def test_database_persona_is_available_for_post_creation(self):
+        personas = [{"id": "201", "name": "Người đi làm", "tone": "chân thành"}]
+        with patch("sandbox.server.Sandbox.personas", return_value=personas), \
+             patch("sandbox.server.Sandbox.generate_post", return_value="Bài viết dài về Tucson") as generate:
+            status, result = self.request("GET", "/api/personas")
+            self.assertEqual(status, 200)
+            self.assertEqual(result["personas"][0]["id"], "201")
+            state = self.conversation(post_id=None, persona_id="201", vehicle="Tucson")
+            self.assertEqual(state["post"]["text"], "Bài viết dài về Tucson")
+            self.assertEqual(generate.call_args.args, (personas[0], "Tucson"))
+            self.assertEqual(set(generate.call_args.kwargs), {"_metrics"})
+
+    def test_generated_post_uses_persona_and_records_model_cost(self):
+        content = "Bài viết về Tucson. " * 20
+        response = io.BytesIO(json.dumps({"model": "provider/effective-model",
+                                          "choices": [{"message": {"content": content}}],
+                                          "usage": {"cost": 0.01, "prompt_tokens": 15,
+                                                    "completion_tokens": 30, "total_tokens": 45}}).encode())
+        sent = {}
+        def open_request(request, timeout):
+            sent["payload"] = json.loads(request.data)
+            return response
+        opener = SimpleNamespace(open=open_request)
+        metrics = {}
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), \
+             patch("sandbox.server.urllib.request.build_opener", return_value=opener):
+            text = self.http.app.generate_post({"name": "An", "tone": "chân thành"}, "Tucson", _metrics=metrics)
+        self.assertEqual(text, content.strip())
+        self.assertEqual(sent["payload"]["max_tokens"], 600)
+        self.assertIn("100-180 từ", sent["payload"]["messages"][0]["content"])
+        self.assertEqual(metrics["usage"], {"prompt_tokens": 15, "completion_tokens": 30, "total_tokens": 45})
+        self.assertEqual(metrics["model"], "provider/effective-model")
+        self.assertEqual(metrics["cost_usd_est"], 0.01)
+        self.assertGreaterEqual(metrics["generation_latency_ms"], metrics["model_latency_ms"])
+        records = [json.loads(line) for line in Path(self.ledger).read_text().splitlines()]
+        self.assertTrue(any(row.get("kind") == "post" and row.get("cost_usd_est") == 0.01 and
+                            row.get("model") == "provider/effective-model" for row in records))
+
+    def test_post_generation_model_falls_back_to_requested_model(self):
+        from sandbox.server import MODEL
+        content = "Bài viết về Tucson. " * 20
+        response = io.BytesIO(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
+        metrics = {}
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), \
+             patch("sandbox.server.urllib.request.build_opener",
+                   return_value=SimpleNamespace(open=lambda request, timeout: response)):
+            self.http.app.generate_post({"name": "An"}, "Tucson", _metrics=metrics)
+        self.assertEqual(metrics["model"], MODEL)
+
+    def test_sandbox_page_starts_with_persona_and_comment_inputs(self):
+        page = (Path(__file__).resolve().parents[2] / "sandbox/static/index.html").read_text()
+        self.assertIn('id="persona-select"', page)
+        self.assertIn('id="vehicle-select"', page)
+        self.assertIn('id="turn-text"', page)
+        self.assertNotIn('id="post-text"', page)
+
     def test_valid_model_flow_uses_post_evidence_and_retains_pending(self):
         state = self.conversation()
         def luna(post, text, **kwargs):
@@ -147,6 +526,72 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertEqual(result["fake_sends"], [])
         self.assertEqual(self.rows(), [])
 
+    def test_truncated_luna_output_gets_one_bounded_retry_and_no_wrong_state(self):
+        state = self.conversation()
+        failure = {"ok": False, "error": "model output truncated", "error_code": "MODEL_OUTPUT_TRUNCATED",
+                   "finish_reason": "length", "attempts": 1, "usage": {"prompt_tokens": 40,
+                   "completion_tokens": 1200}, "cost_usd_est": .001, "cost_unknown": False}
+        with patch("sandbox.server.call_luna", return_value=failure) as luna:
+            _, result = self.turn(state, "Đại lý ở Sài Gòn?")
+        turn = result["turn"]
+        self.assertEqual(turn["routing"], ["REVIEW_MODEL_ERROR"])
+        self.assertEqual(turn["model_calls"][0]["error_code"], "MODEL_OUTPUT_TRUNCATED")
+        self.assertEqual(turn["model_calls"][0]["finish_reason"], "length")
+        self.assertEqual(turn["cost_usd_est"], .002)
+        self.assertEqual(result["active_requests"], [])
+        self.assertEqual(result["fake_sends"], [])
+        self.assertEqual(luna.call_count, 2)
+        self.assertEqual(luna.call_args_list[0].kwargs["max_tokens"], 1200)
+        self.assertEqual(luna.call_args_list[1].kwargs["max_tokens"], 1800)
+
+    def test_truncated_luna_output_can_recover_with_one_valid_reply(self):
+        state = self.conversation()
+        failure = {"ok": False, "error": "model output truncated", "error_code": "MODEL_OUTPUT_TRUNCATED",
+                   "finish_reason": "length", "attempts": 1, "usage": {"prompt_tokens": 40,
+                   "completion_tokens": 1200}, "cost_usd_est": .001, "cost_unknown": False}
+        with patch("sandbox.server.call_luna", side_effect=[failure, model_result(cost=.0001)]) as luna:
+            _, result = self.turn(state)
+        turn = result["turn"]
+        self.assertTrue(turn["ok"], turn)
+        self.assertEqual(turn["attempts"], 2)
+        self.assertAlmostEqual(turn["cost_usd_est"], .0011)
+        self.assertEqual(turn["model_calls"][0]["error_code"], "MODEL_OUTPUT_TRUNCATED")
+        self.assertEqual(turn["model_calls"][1]["validation"], "passed")
+        self.assertEqual(len(result["active_requests"]), 1)
+        self.assertEqual(luna.call_count, 2)
+
+    def test_missing_luna_content_is_not_assumed_to_be_truncation(self):
+        state = self.conversation()
+        failure = {"ok": False, "error": "missing content", "error_code": "MODEL_OUTPUT_MISSING",
+                   "attempts": 1, "cost_usd_est": None, "cost_unknown": True}
+        with patch("sandbox.server.call_luna", return_value=failure) as luna:
+            _, result = self.turn(state)
+        self.assertEqual(luna.call_count, 1)
+        self.assertEqual(result["turn"]["routing"], ["REVIEW_MODEL_ERROR"])
+        self.assertEqual(result["active_requests"], [])
+
+    def test_provider_refusal_does_not_trigger_truncation_retry(self):
+        state = self.conversation()
+        failure = {"ok": False, "error": "model refused", "error_code": "MODEL_REFUSAL",
+                   "finish_reason": "length", "attempts": 1, "cost_usd_est": .001, "cost_unknown": False}
+        with patch("sandbox.server.call_luna", return_value=failure) as luna:
+            _, result = self.turn(state)
+        self.assertEqual(luna.call_count, 1)
+        self.assertEqual(result["turn"]["model_error_code"], "MODEL_REFUSAL")
+        self.assertEqual(result["turn"]["routing"], ["REVIEW_MODEL_ERROR"])
+        self.assertEqual(result["active_requests"], [])
+
+    def test_truncation_retry_stops_when_budget_denied(self):
+        state = self.conversation()
+        failure = {"ok": False, "error": "truncated", "error_code": "MODEL_OUTPUT_TRUNCATED",
+                   "finish_reason": "length", "attempts": 1, "cost_usd_est": .001, "cost_unknown": False}
+        with patch.object(self.http.app, "budget", side_effect=[(True, ""), (False, "budget denied")]), \
+             patch("sandbox.server.call_luna", return_value=failure) as luna:
+            _, result = self.turn(state)
+        self.assertEqual(luna.call_count, 1)
+        self.assertEqual(result["turn"]["routing"], ["BLOCKED_BUDGET"])
+        self.assertEqual(result["active_requests"], [])
+
     def test_invalid_semantic_gets_at_most_one_repair(self):
         state = self.conversation()
         with patch("sandbox.server.call_luna", return_value=model_result(sem={})) as luna:
@@ -165,6 +610,13 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertTrue(result["turn"]["ok"], result)
         self.assertEqual(result["turn"]["attempts"], 2)
         self.assertAlmostEqual(result["turn"]["cost_usd_est"], 0.0002)
+        calls = result["turn"]["model_calls"]
+        self.assertEqual([call["phase"] for call in calls], ["initial", "repair"])
+        self.assertEqual([call["validation"] for call in calls], ["failed", "passed"])
+        self.assertTrue(calls[0]["validation_errors"])
+        self.assertEqual(calls[1]["validation_errors"], [])
+        self.assertEqual(calls[0]["usage"]["prompt_tokens"], 500)
+        self.assertGreaterEqual(calls[0]["latency_ms"], 0)
 
     def test_review_preserves_engine_clarification_without_fake_send(self):
         state = self.conversation()
@@ -194,7 +646,7 @@ class SandboxHTTPTests(unittest.TestCase):
         state = self.conversation()
         conversation = self.http.app.conversations[state["id"]]
         comment = "customer-1 failed planning comment"
-        with patch("sandbox.server.call_luna", return_value=model_result()), patch.object(
+        with patch("sandbox.server.call_luna", return_value=model_result(meaning(evidence=comment))), patch.object(
                 conversation["engine"], "_plan", side_effect=RuntimeError("plan failed")):
             _, result = self.turn(state, comment)
         self.assertFalse(result["turn"]["ok"])
@@ -243,35 +695,103 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertTrue(result["turn"]["ok"], result)
         self.assertTrue(result["active_requests"])
 
-    def test_budget_accounts_each_retry_and_denies_next_attempt(self):
+    def test_sandbox_default_allows_retries_after_unknown_cost(self):
         from scripts import budget_ledger
         budget_ledger.record(self.ledger, run_id="prior", kind="call", attempts=22, cost_usd_est=.002)
         state = self.conversation()
+        calls = iter([dict(ok=False, error="retry failed", attempts=2, cost_usd_est=None,
+                           cost_unknown=True), model_result()])
+        first = True
         def retries(*args, **kwargs):
+            nonlocal first
             guard = kwargs["budget_guard"]
-            self.assertTrue(guard())
-            self.assertTrue(guard())
-            self.assertFalse(guard())
-            return dict(ok=False, error="retry failed", attempts=2, cost_usd_est=None, cost_unknown=True)
-        with patch("sandbox.server.call_luna", side_effect=retries):
-            _, result = self.turn(state)
+            if first:
+                self.assertTrue(guard())
+                self.assertTrue(guard())
+                self.assertTrue(guard())
+                first = False
+            return next(calls)
+        with patch("sandbox.server.call_luna", side_effect=retries) as luna:
+            _, result = self.turn(state, "Giá Creta?")
+            _, next_result = self.turn(state, "giá bao nhiêu")
         self.assertFalse(result["turn"]["ok"])
-        self.assertEqual(self.rows()[-1]["attempts"], 2)
-        self.assertTrue(self.rows()[-1]["cost_unknown"])
-        with patch("sandbox.server.call_luna", side_effect=AssertionError("budget must deny before model")):
-            _, result = self.turn(state)
-        self.assertIn("BUDGET", result["turn"]["routing"][0])
-        self.assertEqual(result["outbox"], [])
+        self.assertTrue(next_result["turn"]["ok"], next_result)
+        self.assertEqual(luna.call_count, 2)
+        self.assertEqual(self.rows()[-2]["attempts"], 2)
+        self.assertTrue(self.rows()[-2]["cost_unknown"])
 
-    def test_unknown_cost_blocks_future_spend(self):
+    def test_unknown_cost_does_not_block_sandbox_by_default_and_stays_logged(self):
         state = self.conversation()
-        with patch("sandbox.server.call_luna", return_value=model_result(cost=None)):
-            self.turn(state)
+        with patch("sandbox.server.call_luna", side_effect=[model_result(cost=None), model_result()]) as luna:
+            self.turn(state, "giá bao nhiêu")
+            _, result = self.turn(state, "giá bao nhiêu nữa")
+        self.assertTrue(result["turn"]["ok"], result)
+        self.assertEqual(luna.call_count, 2)
         self.assertEqual(self.rows()[0]["status"], "unknown_cost")
-        with patch("sandbox.server.call_luna", side_effect=AssertionError("unknown cost must block")):
-            _, result = self.turn(state)
-        self.assertIn("BUDGET", result["turn"]["routing"][0])
-        self.assertEqual(len(self.rows()), 1)
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_model_inferred_vehicle_uses_verified_single_vehicle_post_provenance(self):
+        state = self.conversation()
+        semantic = {
+            "schema_version": "1", "sentiment": "NEU", "sarcasm": "absent",
+            "scope": "in_scope",
+            "requests": [{"topic": "spec", "desired_outcome": "general_vehicle_information",
+                          "polarity": "positive"}],
+            "operations": [{"op": "START_REQUEST", "request": {
+                "topic": "spec", "desired_outcome": "general_vehicle_information"},
+                "request_ref": "topic:spec", "topic": "spec", "evidence_excerpt": "Xe như nào",
+                # Luna returned the conversation ID, not the event/comment ID.
+                "source_message_id": state["id"],
+                "slot": {"kind": "vehicle", "value": "Creta", "explicit": False}}],
+            "uncertainties": []}
+        with patch("sandbox.server.call_luna", return_value=model_result(semantic)) as luna:
+            status, result = self.turn(state, "Xe như nào")
+        self.assertEqual(status, 200, result)
+        self.assertTrue(result["turn"]["ok"], result["turn"])
+        self.assertEqual(result["turn"]["attempts"], 1)
+        luna.assert_called_once()
+        self.assertEqual(result["turn"]["semantic"]["operations"][0]["source_message_id"],
+                         state["id"] + "-1")
+        created = next(change for change in result["turn"]["state_changes"]
+                       if change["kind"] == "request_created")
+        slot = created["slots"]["vehicle"]
+        self.assertEqual((slot["value"], slot["source_message_id"], slot["source_actor_id"],
+                          slot["explicit"]), ("Creta", "creta", "sample-hyundai", False))
+
+    def test_color_recommendation_turn_reaches_chat_policy_with_server_resolved_source(self):
+        state = self.conversation()
+        text = "Thế theo bạn nên mua màu nào là đẹp"
+        semantic = {
+            "schema_version": "1", "sentiment": "NEU", "sarcasm": "absent",
+            "scope": "in_scope",
+            "requests": [{"topic": "buy", "desired_outcome": "color_recommendation",
+                          "polarity": "positive"}],
+            "operations": [{"op": "START_REQUEST", "request": {
+                "topic": "buy", "desired_outcome": "color_recommendation"},
+                "request_ref": "topic:buy", "topic": "buy", "evidence_excerpt": text,
+                "source_message_id": state["id"],
+                "slot": {"kind": "vehicle", "value": "Creta", "explicit": False}}],
+            "uncertainties": []}
+        with patch("sandbox.server.call_luna", return_value=model_result(semantic)) as luna:
+            status, result = self.turn(state, text)
+        self.assertEqual(status, 200, result)
+        self.assertNotIn("REVIEW_PROVENANCE", result["turn"]["routing"])
+        self.assertTrue(result["turn"]["response_text"], result["turn"])
+        self.assertEqual(result["turn"]["semantic"]["operations"][0]["source_message_id"],
+                         state["id"] + "-1")
+        luna.assert_called_once()
+
+    def test_budget_can_be_explicitly_enforced(self):
+        from sandbox.server import Sandbox
+        from scripts import budget_ledger
+        budget_ledger.record(self.ledger, run_id="unknown-test", kind="call", attempts=1,
+                             cost_usd_est=None)
+        with patch.dict(os.environ, {"SANDBOX_ENFORCE_BUDGET": "true"}):
+            app = Sandbox(ledger_path=self.ledger)
+        self.assertTrue(app.enforce_budget)
+        allowed, reason = app.budget()
+        self.assertFalse(allowed)
+        self.assertIn("unknown", reason.lower())
 
     def test_unauthorized_http_failure_with_known_zero_cost_keeps_budget_open(self):
         from scripts import budget_ledger
@@ -292,7 +812,7 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertEqual(context["recent"], [])
         self.assertIn("Creta", context["parent_texts"][0])
 
-    def test_concurrent_turns_share_one_remaining_attempt(self):
+    def test_concurrent_sandbox_turns_are_not_blocked_by_spend_ledger(self):
         from scripts import budget_ledger
         budget_ledger.record(self.ledger, run_id="prior", kind="call", attempts=23, cost_usd_est=.002)
         first, second = self.conversation(), self.conversation()
@@ -313,8 +833,8 @@ class SandboxHTTPTests(unittest.TestCase):
                 thread.join(timeout=3)
                 self.assertFalse(thread.is_alive())
         self.assertEqual(len(results), 2)
-        self.assertEqual(sum(result[1]["turn"]["ok"] for result in results), 1)
-        self.assertEqual(budget_ledger.totals(self.ledger)[0], 24)
+        self.assertEqual(sum(result[1]["turn"]["ok"] for result in results), 2)
+        self.assertEqual(budget_ledger.totals(self.ledger)[0], 25)
 
     def test_invalid_input_rejected_before_model(self):
         for payload in ({}, {"page_id": "page", "post_text": "x", "actor_id": "a", "vehicles": "Creta"}):
@@ -340,7 +860,7 @@ class SandboxHTTPTests(unittest.TestCase):
                 status, _ = self.request("GET", "/health", host=host)
                 self.assertEqual(status, 200)
 
-    def test_cost_guard_reserves_maximum_completion_before_model_call(self):
+    def test_sandbox_default_opens_even_when_spend_ledger_is_at_cap(self):
         from scripts import budget_ledger
         budget_ledger.record(self.ledger, run_id="near-cap", kind="call", attempts=1,
                              cost_usd_est=1.9141)
@@ -351,10 +871,9 @@ class SandboxHTTPTests(unittest.TestCase):
         with patch("sandbox.server.call_luna", side_effect=expensive_call) as luna:
             status, result = self.turn(state)
         self.assertEqual(status, 200)
-        self.assertFalse(result["turn"]["ok"])
-        self.assertIn("BUDGET", result["turn"]["routing"][0])
-        luna.assert_not_called()
-        self.assertLessEqual(.0854 + budget_ledger.totals(self.ledger)[1], 2.0)
+        self.assertTrue(result["turn"]["ok"], result)
+        luna.assert_called_once()
+        self.assertEqual(budget_ledger.totals(self.ledger)[0], 2)
 
     def test_model_bounds_context_and_repair_note_before_openrouter(self):
         from sandbox.server import CONTEXT_CHAR_LIMIT, REPAIR_CHAR_LIMIT

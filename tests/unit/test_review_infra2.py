@@ -56,8 +56,10 @@ class TestA7Resume(unittest.TestCase):
     def test_resume_reuses_cache_zero_new_attempts(self):
         with tempfile.TemporaryDirectory() as d:
             ledger = str(Path(d) / "ledger.jsonl")
+            original_totals = budget.totals
             with patch.object(runner, "call_luna", _fixture_luna), \
-                 patch.object(budget, "DEFAULT_PATH", ledger):
+                 patch.object(budget, "DEFAULT_PATH", ledger), \
+                 patch.object(budget, "totals", lambda path=None: original_totals(path or ledger)):
                 ck = str(Path(d) / "cache")
                 turns = ["Lái thử Creta Hà Nội sáng mai", "oke"]
                 r1 = self._run(d, turns, "run1.json", ck)
@@ -80,8 +82,10 @@ class TestA7Resume(unittest.TestCase):
     def test_changed_input_invalidates_cache(self):
         with tempfile.TemporaryDirectory() as d:
             ledger = str(Path(d) / "ledger.jsonl")
+            original_totals = budget.totals
             with patch.object(runner, "call_luna", _fixture_luna), \
-                 patch.object(budget, "DEFAULT_PATH", ledger):
+                 patch.object(budget, "DEFAULT_PATH", ledger), \
+                 patch.object(budget, "totals", lambda path=None: original_totals(path or ledger)):
                 ck = str(Path(d) / "cache")
                 self._run(d, ["Lái thử Creta Hà Nội sáng mai", "oke"], "run1.json", ck)
                 r2 = self._run(d, ["Lái thử Creta Hà Nội sáng mai", "oke nhé"], "run2.json", ck)
@@ -224,7 +228,7 @@ class TestOpenRouterCredentials(unittest.TestCase):
                 self.assertEqual(guard_calls, [])
                 build_opener.assert_not_called()
 
-    def test_key_is_only_sent_in_openrouter_bearer_header(self):
+    def test_openrouter_request_uses_bearer_and_supported_parameters(self):
         response = {"choices": [{"message": {"content": json.dumps(_semantic("chào"))}}],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 20},
                     "model": "openai/gpt-6-luna"}
@@ -247,10 +251,70 @@ class TestOpenRouterCredentials(unittest.TestCase):
         self.assertNotIn(b"test-only-key", request.data)
         payload = json.loads(request.data)
         self.assertEqual(payload["model"], "openai/gpt-6-luna")
+        self.assertNotIn("temperature", payload)
         self.assertEqual(payload["response_format"]["type"], "json_schema")
         self.assertTrue(payload["response_format"]["json_schema"]["strict"])
         self.assertEqual(payload["response_format"]["json_schema"]["schema"], adapter.STRICT_SEMANTIC_SCHEMA)
         self.assertTrue(payload["provider"]["require_parameters"])
+
+    def test_local_semantic_failure_does_not_retry_and_keeps_reported_cost(self):
+        response = {"choices": [{"message": {"content": json.dumps(_semantic("chào"))}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 20, "cost": 0.001},
+                    "model": "openai/gpt-6-luna"}
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-only-key"}), \
+             patch.object(adapter.urllib.request, "build_opener") as build_opener, \
+             patch.object(adapter, "normalize_model_semantic", side_effect=KeyError("source_message_id")), \
+             patch.object(adapter.time, "sleep"):
+            build_opener.return_value.open.side_effect = lambda *a, **k: io.BytesIO(json.dumps(response).encode())
+            result = adapter.call_luna("post", "chào")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(build_opener.return_value.open.call_count, 1)
+        self.assertEqual(result["cost_usd_est"], 0.001)
+        self.assertFalse(result["cost_unknown"])
+
+    def test_invalid_reported_cost_is_unknown_without_retry(self):
+        response = {"choices": [{"message": {"content": json.dumps(_semantic("chào"))}}],
+                    "usage": {"cost": 10 ** 400}, "model": "openai/gpt-6-luna"}
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-only-key"}), \
+             patch.object(adapter.urllib.request, "build_opener") as build_opener, \
+             patch.object(adapter.time, "sleep"):
+            build_opener.return_value.open.side_effect = lambda *a, **k: io.BytesIO(json.dumps(response).encode())
+            result = adapter.call_luna("post", "chào")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["attempts"], 1)
+        self.assertTrue(result["cost_unknown"])
+
+    def test_invalid_provider_json_is_not_retried(self):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-only-key"}), \
+             patch.object(adapter.urllib.request, "build_opener") as build_opener, \
+             patch.object(adapter.time, "sleep"):
+            build_opener.return_value.open.side_effect = lambda *a, **k: io.BytesIO(b"not json")
+            result = adapter.call_luna("post", "chào")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["attempts"], 1)
+        self.assertTrue(result["cost_unknown"])
+        self.assertEqual(build_opener.return_value.open.call_count, 1)
+
+    def test_local_failure_after_unknown_retry_keeps_total_cost_unknown(self):
+        response = {"choices": [{"message": {"content": json.dumps(_semantic("chào"))}}],
+                    "usage": {"cost": 0.001}, "model": "openai/gpt-6-luna"}
+        calls = []
+        def rate_limit_then_response(request, timeout):
+            calls.append(request)
+            if len(calls) == 1:
+                raise adapter.urllib.error.HTTPError(request.full_url, 429, "rate limited", {}, io.BytesIO(b"retry"))
+            return io.BytesIO(json.dumps(response).encode())
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-only-key"}), \
+             patch.object(adapter.urllib.request, "build_opener") as build_opener, \
+             patch.object(adapter, "normalize_model_semantic", side_effect=KeyError("source_message_id")), \
+             patch.object(adapter.time, "sleep"):
+            build_opener.return_value.open.side_effect = rate_limit_then_response
+            result = adapter.call_luna("post", "chào", budget_guard=lambda: True)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertIsNone(result["cost_usd_est"])
+        self.assertTrue(result["cost_unknown"])
 
     def test_adapter_rejects_embedded_or_non_object_json_without_retry(self):
         semantic = json.dumps(_semantic("chào"))

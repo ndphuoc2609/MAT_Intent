@@ -279,7 +279,7 @@ class IntentApiServiceTests(unittest.TestCase):
         self.assertTrue(replay["idempotent_replay"])
         self.assertEqual(len(calls), 1)
 
-    def test_shared_legacy_budget_baseline_blocks_api_and_sandbox_at_cap(self):
+    def test_api_budget_stays_enforced_while_sandbox_defaults_open(self):
         from app.adapters.luna import call_luna
         from sandbox.server import Sandbox
         from scripts import budget_ledger
@@ -298,7 +298,9 @@ class IntentApiServiceTests(unittest.TestCase):
             self.assertEqual(status, 503)
             self.assertEqual(result["status"], "MODEL_UNAVAILABLE")
             self.assertTrue(any("exhausted" in reason for reason in result["reasons"]))
-            self.assertFalse(Sandbox(ledger).budget()[0])
+            self.assertTrue(Sandbox(ledger).budget()[0])
+            with patch.dict(os.environ, {"SANDBOX_ENFORCE_BUDGET": "true"}):
+                self.assertFalse(Sandbox(ledger).budget()[0])
             self.assertEqual(budget_ledger.totals(ledger)[0], 24)
 
     def test_http_api_auth_health_readiness_post_and_event_read(self):

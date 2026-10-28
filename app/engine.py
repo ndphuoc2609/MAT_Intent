@@ -5,7 +5,8 @@ import hashlib, json, uuid
 from datetime import datetime, timedelta, timezone
 from .normalize import canon_slot, norm, parse_relative_datetime, parse_time_expression, fmt_money, yes_no
 from .semantics import attach_context_provenance, validate_semantic
-from .facts import Facts, calc_otr
+from .facts import (DEALER_DIRECTORY_URL, Facts, calc_otr,
+                    dealer_public_address)
 from .renderer import render, claim_check, claim_check_typed
 from .state import EventPayloadConflict, Store, FakeSender
 from .policy import AUTO_ACTIONS, HANDOFF_SLA_HOURS, PENDING_TTL_HOURS
@@ -18,6 +19,26 @@ def _delivery_status(result):
     if status in ("failed", "FAILED"):
         return "FAILED"
     return "UNKNOWN"
+
+def _social_reply(text):
+    message = norm(text or "")
+    words = set(message.split())
+    if words & {"chao", "hello", "hi"}:
+        return "Chào bạn! Mình có thể giúp gì?"
+    if "cam on" in message:
+        before_thanks = message.split("cam on", 1)[0].split()
+        after_thanks = message.split("cam on", 1)[1].split()
+        if set(before_thanks + after_thanks) & {"khong", "ko", "chua", "dau"}:
+            return "Mình hiểu rồi."
+        return "Không có gì, bạn nhé!"
+    if words & {"ok", "oke", "okay", "oki"}:
+        return "Oke bạn nhé."
+    return "Cảm ơn bạn nhé!"
+
+def _color_advice(vehicle=None):
+    available_for = f" cho {vehicle}" if vehicle else ""
+    return ("Mình nghiêng về tông trung tính: dễ phối và nhìn lâu không chán. "
+            f"Màu nào đang có sẵn{available_for} thì hiện chưa được xác minh.")
 
 class Clock:
     """FrozenClock cho test/contract: now() luôn trả cùng một mốc."""
@@ -337,8 +358,13 @@ class Engine:
                 fid = u.get("fact_id")
                 if not fid or fid.startswith("calc:"): continue
                 f = next((x for x in self.facts.facts if x.get("id") == fid), None)
-                if f is None or not is_fresh(f, now):
+                if f is None:
                     return "BLOCKED_STALE_FACTS"
+                if f.get("source") == "local_dealer_directory":
+                    # This directory has no verification timestamp; dispatch
+                    # checks the immutable facts snapshot/version above only.
+                    continue
+                if not is_fresh(f, now): return "BLOCKED_STALE_FACTS"
         return None
     # ---------- context ----------
     def context(self, event, postcard, external_messages=None):
@@ -813,8 +839,8 @@ class Engine:
                 if not touched:
                     self.store.conn.execute("RELEASE SAVEPOINT business")
                     if "SOCIAL_ACK" in result["routing"]:
-                        result["response_text"] = "Cảm ơn bạn đã tương tác!"
-                        result["response_plan"] = dict(parts=["Cảm ơn bạn đã tương tác!"], actions=["social_ack"])
+                        result["response_text"] = _social_reply(event.get("text"))
+                        result["response_plan"] = dict(parts=[result["response_text"]], actions=["social_ack"])
                         result["routing"].append("social_ack")
                         payload = dict(dedupe_key=f"{event['comment_id']}:reply", text=result["response_text"], comment_id=event["comment_id"])
                         # A5b: ghi intent TRƯỚC commit (trong transaction này)
@@ -861,11 +887,14 @@ class Engine:
                         if vehicle:
                             safe_parts.append(f"Tồn kho {vehicle} hiện chưa được xác minh.")
                 if "BLOCKED_HANDOFF" in result["routing"] and safe:
-                    safe_parts.append("Một phần yêu cầu đang được nhân viên xử lý.")
+                    safe_parts.append("Một phần yêu cầu cần người xem xét trước khi có thể xác nhận.")
                 for (r, _, _) in draft_safe:
-                    safe_parts.append(f"Phần cần người xử lý ({r['_human_draft']}) đã được chuyển cho nhân viên.")
-                safe_text = render(safe_parts, postcard.get("persona_default", "tư vấn viên"))
-                ho_text = render([x for (_, p, _) in ho for x in p], postcard.get("persona_default", "tư vấn viên"))
+                    safe_parts.append(f"Phần này cần chuyển cho nhân viên để kiểm tra ({r['_human_draft']}); hiện chưa thể xác nhận tự động.")
+                safe_text = render(safe_parts, postcard.get("persona_default", "tư vấn viên"),
+                                   style=getattr(self, "response_style", "neutral"))
+                ho_text = render([x for (_, p, _) in ho for x in p],
+                                 postcard.get("persona_default", "tư vấn viên"),
+                                 style=getattr(self, "response_style", "neutral"))
                 safe_nums = [n for (_, _, ns) in safe for n in ns]
                 ho_nums = [n for (_, _, ns) in ho for n in ns]
                 def _veh_set(group):
@@ -1150,6 +1179,9 @@ class Engine:
             canon[i] = slot_source_id
             op_excerpt = op.get("evidence_excerpt") or ""
             slot_excerpt = slot.get("evidence_excerpt") or op_excerpt
+            if (op_excerpt and norm(op_excerpt) not in norm(event.get("text", "")) and
+                    not op_src and t not in ("SOCIAL_ACK", "UNRESOLVED")):
+                return "REVIEW_PROVENANCE", None, blocked_idx, canon
             if (slot and slot.get("explicit", True) and not op_src and
                     norm(op.get("evidence_excerpt", "")) not in norm(event.get("text", ""))):
                 return "REVIEW_PROVENANCE", None, blocked_idx, canon
@@ -1187,6 +1219,8 @@ class Engine:
                     return "REVIEW_PROVENANCE", None, blocked_idx, canon
                 source_text = source.get("text") or ""
                 source_actor = source.get("actor_id")
+                if slot.get("explicit", True) and slot_source_id != event.get("comment_id"):
+                    return "REVIEW_PROVENANCE", None, blocked_idx, canon
                 post_inference = (slot_source_id == event.get("post_id") and
                                   source.get("role") == "post" and slot.get("explicit", True) is False and
                                   slot.get("kind") == "vehicle" and
@@ -1642,18 +1676,19 @@ class Engine:
         if req["status"] == "CANCELLED":
             return ([f"Đã hủy yêu cầu {topic} của bạn."], nums, "social_ack")
         if req["status"] == "HANDED_OFF":
-            return (["Yêu cầu này đã được chuyển cho nhân viên xử lý."], nums, "HANDOFF")
+            return (["Yêu cầu này cần người xem xét trước khi mình có thể xác nhận thêm."], nums, "HANDOFF")
         if self._clear_past_testdrive_datetime(req, now):
             if req["status"] == "READY": req["status"] = "OPEN"
             req["version"] += 1; self.store.save_request(req)
         if req["status"] == "READY" and topic == "testdrive":
-            return (["Đã ghi nhận xác nhận đề xuất lái thử của bạn, nhân viên sẽ xác nhận lại lịch (chưa phải lịch đã đặt)."],
+            return (["Mình đã ghi nhận bạn đồng ý với đề xuất lái thử. Đây chưa phải lịch đã đặt."],
                     nums, "answer_confirmation")
         fresh = lambda *a, **k: self.facts.query(*a, now=now, **k)
         if topic == "complaint":
             req["status"] = "HANDED_OFF"; req["version"] += 1; self.store.save_request(req)
             self.store.add_handoff(req["id"], "staff", "complaint", req["version"], now_iso)
-            return (["Phần khiếu nại đã được chuyển cho nhân viên xử lý."], nums, "HANDOFF")
+            return (["Mình đã ghi nhận khiếu nại; nội dung này cần người kiểm tra trước khi có câu trả lời."],
+                    nums, "HANDOFF")
         if topic == "price":
             vehicle = self._vehicle(req, postcard)
             if not vehicle:
@@ -1672,7 +1707,8 @@ class Engine:
                 self._ask(req, event, "choice", "variant", variants, "Bạn muốn xem phiên bản nào?", now_iso)
                 return (["Bạn muốn xem phiên bản nào ạ?"], nums, "ask_clarification")
             if conf or not fl:
-                return (["Giá cho phiên bản này hiện chưa xác nhận được, nhân viên sẽ kiểm tra lại."], nums, "HANDOFF")
+                return (["Giá phiên bản này chưa có dữ liệu xác nhận nên mình chưa thể báo chính xác."],
+                        nums, "HANDOFF")
             price = fl[0]["value"]; nums.append(price); _use(fl[0], "list_price")
             if kind == "list":
                 req["status"] = "COMPLETED"; req["version"] += 1; self.store.save_request(req)
@@ -1688,9 +1724,10 @@ class Engine:
             if fconf or pconf or dconf:
                 # R07: không bỏ cờ conflict ở phí lăn bánh (dùng fact đầu tiên
                 # trong khi có 2 mức phí mâu thuẫn là trả lời sai).
-                return (["Phí lăn bánh đang có dữ liệu mâu thuẫn, nhân viên sẽ xác nhận lại."], nums, "HANDOFF")
+                return (["Dữ liệu phí lăn bánh hiện chưa thống nhất, nên mình chưa thể đưa ra con số chính xác."],
+                        nums, "HANDOFF")
             if not fr or not fp or not fd:
-                return (["Phí lăn bánh cho khu vực này chưa có dữ liệu xác nhận, nhân viên sẽ kiểm tra."], nums, "HANDOFF")
+                return ([f"Mình chưa có đủ dữ liệu phí lăn bánh ở {loc} để tính chính xác."], nums, "HANDOFF")
             calc = calc_otr(price, fr[0]["value"], fp[0]["value"], fd[0]["value"])
             nums += [fr[0]["value"], fp[0]["value"], fd[0]["value"], calc["total"]]
             _use(fr[0], "reg_rate"); _use(fp[0], "plate_fee"); _use(fd[0], "road_fee")
@@ -1711,9 +1748,11 @@ class Engine:
                           "Bạn hỏi ưu đãi xe nào?", now_iso)
                 return (["Bạn hỏi ưu đãi xe nào ạ?"], nums, "ask_clarification")
             fl, st, conf = fresh("promo", vehicle=vehicle)
-            if conf: return (["Ưu đãi đang có dữ liệu mâu thuẫn, nhân viên sẽ xác nhận lại."], nums, "HANDOFF")
+            if conf:
+                return (["Dữ liệu ưu đãi hiện chưa thống nhất, nên mình chưa thể xác nhận mức áp dụng."],
+                        nums, "HANDOFF")
             if not fl:
-                if st: return (["Ưu đãi mẫu đã hết hạn, nhân viên sẽ cập nhật ưu đãi mới."], nums, "HANDOFF")
+                if st: return (["Thông tin ưu đãi đã cũ nên mình chưa thể xác nhận mức hiện tại."], nums, "HANDOFF")
                 return (["Hiện chưa có ưu đãi được xác nhận cho xe này."], nums, "answer_promo")
             nums.append(fl[0]["value"]); _use(fl[0], "promo")
             req["status"] = "COMPLETED"; req["version"] += 1; self.store.save_request(req)
@@ -1726,12 +1765,16 @@ class Engine:
                           "Số trả trước bạn nói là đơn vị nào?", now_iso)
                 return (["Số trả trước bạn nói là đơn vị triệu hay tỷ ạ?"], nums, "ask_clarification")
             fl, _, lconf = fresh("loan_rate")
-            if lconf: return (["Lãi suất đang có dữ liệu mâu thuẫn, nhân viên sẽ xác nhận lại."], nums, "HANDOFF")
-            if not fl: return (["Lãi suất hiện chưa có dữ liệu xác nhận, nhân viên sẽ tư vấn."], nums, "HANDOFF")
+            if lconf:
+                return (["Dữ liệu lãi suất hiện chưa thống nhất, nên mình chưa thể đưa ra con số chính xác."],
+                        nums, "HANDOFF")
+            if not fl:
+                return (["Mình chưa có lãi suất được xác nhận nên chưa thể ước tính khoản trả góp."],
+                        nums, "HANDOFF")
             nums.append(fl[0]["value"]); _use(fl[0], "loan_rate")
             req["status"] = "COMPLETED"; req["version"] += 1; self.store.save_request(req)
             return ([f"Lãi suất tham khảo mẫu là {fl[0]['value']}%/năm (SAMPLE). "
-                     "Số tiền trả góp chính xác nhân viên sẽ tính sau khi đủ thông tin xe và kỳ hạn."],
+                     "Để ước tính khoản trả góp chính xác còn cần giá xe, số tiền trả trước và kỳ hạn vay."],
                     nums, "answer_loan_info")
         if topic == "stock":
             vehicle, variant, color = self._vehicle(req, postcard), _slot(req, "variant"), _slot(req, "color")
@@ -1745,10 +1788,13 @@ class Engine:
             if sconf:
                 # R07: tồn kho mâu thuẫn (VD vừa 1 vừa 0) thì handoff, không
                 # chọn fact đầu tiên để trả "Còn".
-                return (["Tồn kho đang có dữ liệu mâu thuẫn, nhân viên sẽ kiểm tra lại."], nums, "HANDOFF")
+                return (["Dữ liệu tồn kho hiện chưa thống nhất nên mình chưa thể xác nhận xe còn hay hết."],
+                        nums, "HANDOFF")
             if not fl:
-                return ([f"Hiện chưa xác nhận còn {vehicle} {variant or ''} {color or ''} giao ngay, "
-                         "nhân viên sẽ kiểm tra tồn kho thực tế.".strip()], nums, "HANDOFF")
+                item = " ".join(part for part in (vehicle, variant, color) if part)
+                return ([f"Mình chưa xác nhận được xe {item} còn hay hết vì chưa có dữ liệu "
+                         "để kiểm tra tồn kho thực tế."],
+                        nums, "HANDOFF")
             # Không hỏi variant khi user không nêu: câu trả lời tồn kho chung
             # không nêu tên phiên bản (variant or ''), chỉ nêu màu khi mọi fact
             # khớp cùng một màu và location của fact đầu tiên — hành vi này giữ
@@ -1771,12 +1817,21 @@ class Engine:
                     nums, "answer_stock")
         if topic == "spec":
             vehicle = self._vehicle(req, postcard)
+            if req.get("desired_outcomes") == ["color_recommendation"]:
+                req["status"] = "COMPLETED"; req["version"] += 1; self.store.save_request(req)
+                return ([_color_advice(vehicle)], nums, "answer_general_advice")
             if not vehicle:
                 self._ask(req, event, "slot", "vehicle", postcard.get("vehicles") or [],
                           "Bạn hỏi thông số xe nào?", now_iso)
                 return (["Bạn hỏi thông số xe nào ạ?"], nums, "ask_clarification")
             fl, _, conflict = fresh("spec", vehicle=vehicle)
-            if not fl or conflict: return (["Thông số xe này chưa được xác nhận, nhân viên sẽ cung cấp."], nums, "HANDOFF")
+            if not fl or conflict:
+                if "city_driving_suitability" in req.get("desired_outcomes", []):
+                    return ([f"Với nhu cầu đi phố, bạn có thể cân nhắc kích thước xe, tầm nhìn và mức tiêu hao. "
+                             f"Mình chưa có thông số được xác nhận để kết luận riêng về {vehicle}."],
+                            nums, "HANDOFF")
+                return ([f"Mình chưa có thông số được xác nhận cho {vehicle} để trả lời chính xác."],
+                        nums, "HANDOFF")
             ex = fl[0].get("extra", {})
             nums += [v for v in ex.values() if isinstance(v, (int, float))]
             import re as _re
@@ -1798,11 +1853,50 @@ class Engine:
         if topic == "dealer":
             loc = _slot(req, "location")
             if not loc:
-                self._ask(req, event, "slot", "location", ["Hà Nội", "TP.HCM"],
-                          "Bạn ở khu vực nào để mình chỉ đại lý gần nhất?", now_iso)
-                return (["Bạn ở khu vực nào để mình chỉ đại lý gần nhất ạ?"], nums, "ask_clarification")
+                self._ask(req, event, "slot", "location", [],
+                          "Bạn đang ở khu vực nào (tỉnh/thành phố hoặc quận/huyện)?", now_iso)
+                return (["Bạn đang ở khu vực nào (tỉnh/thành phố hoặc quận/huyện) ạ?"], nums, "ask_clarification")
+            if getattr(self.facts, "dealer_directory_configured", False):
+                matched = self.facts.directory_dealers(loc)
+                by_name = {}
+                for fact in matched:
+                    extra = fact.get("extra") or {}
+                    address = dealer_public_address(extra.get("address"))
+                    if not extra.get("name") or not address:
+                        continue
+                    by_name.setdefault(norm(extra["name"]), []).append((fact, address))
+                if any(len({norm(address) for _, address in entries}) > 1
+                       for entries in by_name.values()):
+                    message = ("Danh sách đã nạp có địa chỉ không nhất quán cho cùng một đại lý. "
+                               "Hãy kiểm tra tại danh sách Hyundai chính thức: "
+                               f"{DEALER_DIRECTORY_URL}. Dữ liệu chưa được xác minh trực tuyến.")
+                    return ([message], nums, "HANDOFF")
+                entries = [items[0] for _, items in sorted(by_name.items())]
+                if not entries:
+                    if getattr(self, "dealer_directory_error", None):
+                        reason = "Danh sách đại lý trên máy hiện chưa đọc được."
+                    else:
+                        reason = "Chưa tìm thấy đại lý phù hợp trong danh sách địa chỉ đã nạp."
+                    message = (f"{reason} Tra cứu danh sách Hyundai chính thức: "
+                               f"{DEALER_DIRECTORY_URL}. Dữ liệu chưa được xác minh trực tuyến.")
+                    return ([message], nums, "HANDOFF")
+                parts_out = []
+                import re as _re
+                for fact, address in entries:
+                    extra = fact["extra"]
+                    _use(fact, "dealer_directory_entry")
+                    nums += [int(value) for value in _re.findall(r"\d+", address)]
+                    parts_out.append(f"{extra['name']} — {address}")
+                req["status"] = "COMPLETED"; req["version"] += 1; self.store.save_request(req)
+                text = ("Mình tìm được các địa chỉ này trong danh sách đại lý đã nạp. "
+                        "Dữ liệu chưa được xác minh trực tuyến; bạn kiểm tra cập nhật trước khi ghé nhé:\n" +
+                        "\n".join(f"• {part}" for part in parts_out))
+                return ([text], nums, "answer_dealer")
             fl, _, conflict = fresh("dealer", location=loc)
-            if not fl or conflict: return (["Chưa có đại lý được xác nhận ở khu vực này, nhân viên sẽ hỗ trợ."], nums, "HANDOFF")
+            if not fl or conflict:
+                return ([f"Chưa tìm thấy đại lý phù hợp trong danh sách đã nạp. "
+                         f"Tra cứu danh sách Hyundai chính thức: {DEALER_DIRECTORY_URL}. "
+                         "Chưa có kết quả trực tuyến được xác minh."], nums, "HANDOFF")
             _use(fl[0], "dealer")
             ex = fl[0].get("extra", {})
             import re as _re
@@ -1866,10 +1960,14 @@ class Engine:
                      "Bạn xác nhận đề xuất này nhé? (Đây là đề xuất, chưa phải lịch đã đặt.)"],
                     nums, "propose_test_drive_slot")
         if topic == "buy":
+            if req.get("desired_outcomes") == ["color_recommendation"]:
+                req["status"] = "COMPLETED"; req["version"] += 1; self.store.save_request(req)
+                return ([_color_advice(self._vehicle(req, postcard))],
+                        nums, "answer_general_advice")
             # Mua/đặt cọc cần người xác nhận cuối — không auto confirm.
             req["status"] = "HANDED_OFF"; req["version"] += 1; self.store.save_request(req)
             self.store.add_handoff(req["id"], "staff", "buy_confirmation", req["version"], now_iso)
-            return (["Đã ghi nhận nhu cầu mua xe của bạn, nhân viên sẽ liên hệ xác nhận trước khi có đơn mua."],
+            return (["Mình chưa thể xác nhận việc mua hoặc đặt cọc qua cuộc trò chuyện này."],
                     nums, "HANDOFF")
         if topic == "service":
             fl, _, conflict = fresh("warranty")
@@ -1877,7 +1975,7 @@ class Engine:
                 nums.append(fl[0]["value"]); _use(fl[0], "warranty")
                 req["status"] = "COMPLETED"; req["version"] += 1; self.store.save_request(req)
                 return ([f"Thời gian bảo hành mẫu là {fl[0]['value']} năm (SAMPLE)."], nums, "answer_spec")
-            return (["Đã ghi nhận câu hỏi dịch vụ, nhân viên sẽ trả lời chi tiết."], nums, "HANDOFF")
+            return (["Mình chưa có thông tin đã xác nhận cho câu hỏi dịch vụ này."], nums, "HANDOFF")
         if topic == "registration":
             loc = _slot(req, "location")
             if not loc:
@@ -1885,11 +1983,13 @@ class Engine:
                           "Bạn đăng ký xe ở tỉnh/thành nào?", now_iso)
                 return (["Bạn đăng ký xe ở tỉnh/thành nào ạ?"], nums, "ask_clarification")
             fl, _, conflict = fresh("registration_fee", location=loc)
-            if not fl or conflict: return (["Phí đăng ký cho khu vực này chưa có dữ liệu xác nhận, nhân viên sẽ tư vấn."], nums, "HANDOFF")
+            if not fl or conflict:
+                return ([f"Phí đăng ký tại {loc} chưa có dữ liệu xác nhận nên mình chưa thể báo chính xác."],
+                        nums, "HANDOFF")
             nums.append(fl[0]["value"]); _use(fl[0], "registration_fee")
             req["status"] = "COMPLETED"; req["version"] += 1; self.store.save_request(req)
             return ([f"Phí đăng ký mẫu tại {loc} là {fmt_money(fl[0]['value'])} (SAMPLE, theo tài liệu mẫu)."],
                     nums, "answer_price")
         if topic == "social":
-            return (["Cảm ơn bạn đã tương tác!"], nums, "social_ack")
-        return (["Đã ghi nhận, nhân viên sẽ hỗ trợ."], nums, "HANDOFF")
+            return ([_social_reply(event.get("text"))], nums, "social_ack")
+        return (["Mình chưa đủ thông tin để trả lời câu này chính xác."], nums, "HANDOFF")

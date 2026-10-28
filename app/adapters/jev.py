@@ -67,6 +67,21 @@ def validate_answers(answers, questions):
 class JevOpenRouter:
     model = MODEL
 
+    @staticmethod
+    def _failure(code, *, attempts=1, latency_ms=None, http_status=None, usage=None,
+                 cost_usd_est=None, cost_unknown=True):
+        result = {"ok": False, "error_code": code, "error": f"Jev request failed ({code})",
+                  "attempts": attempts, "model_requested": MODEL,
+                  "cost_usd_est": cost_usd_est, "cost_unknown": cost_unknown}
+        if isinstance(usage, dict):
+            result["usage"] = {key: usage[key] for key in ("input_tokens", "output_tokens", "total_tokens")
+                               if type(usage.get(key)) is int and usage[key] >= 0}
+        if latency_ms is not None:
+            result["latency_ms"] = latency_ms
+        if http_status is not None:
+            result["http_status"] = http_status
+        return result
+
     def decide(self, state, questions, *, timeout=10, budget_guard=None):
         key = os.environ.get("OPENROUTER_API_KEY", "").strip()
         if not key:
@@ -86,21 +101,48 @@ class JevOpenRouter:
                 data = json.load(response)
             latency_ms = (time.perf_counter() - start) * 1000
             if not isinstance(data, dict):
-                raise ValueError("Jev response must be an object")
-            answers = validate_answers(data.get("answers"), questions)
+                return self._failure("INVALID_RESPONSE", latency_ms=latency_ms)
             usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
             cost = usage.get("cost")
-            if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
+            cost_known = type(cost) in (int, float) and math.isfinite(cost) and cost >= 0
+            if cost_known:
+                cost = float(cost)
+            else:
                 cost = None
+            try:
+                answers = validate_answers(data.get("answers"), questions)
+            except (TypeError, ValueError):
+                return self._failure("INVALID_RESPONSE", latency_ms=latency_ms, usage=usage,
+                                     cost_usd_est=cost, cost_unknown=not cost_known)
             return {"ok": True, "answers": answers, "usage": usage,
-                    "cost_usd_est": float(cost) if cost is not None else None,
-                    "cost_unknown": cost is None, "model_requested": self.model,
+                    "cost_usd_est": cost, "cost_unknown": not cost_known, "model_requested": self.model,
                     "model_effective": data.get("model", self.model), "provider": data.get("provider"),
                     "latency_ms": latency_ms, "attempts": 1, "error": None}
-        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as error:
-            return {"ok": False, "error": str(error)[:300], "attempts": 1,
-                    "model_requested": self.model, "latency_ms": (time.perf_counter() - start) * 1000,
-                    "cost_usd_est": None, "cost_unknown": True}
+        except urllib.error.HTTPError as error:
+            body = error.read(8192)
+            try:
+                payload = json.loads(body)
+                provider_error = payload.get("error") if isinstance(payload, dict) else None
+                detail = provider_error.get("message", "") if isinstance(provider_error, dict) else ""
+            except (TypeError, ValueError, UnicodeError):
+                detail = ""
+            normalized = detail.lower() if isinstance(detail, str) else ""
+            model_blocked = (error.code == 404 and "model blocked by guardrail" in normalized and
+                             "matching your guardrail restrictions and data policy" in normalized)
+            code = ("MODEL_BLOCKED" if model_blocked else
+                    {401: "HTTP_401", 402: "HTTP_402", 403: "HTTP_403", 404: "HTTP_404",
+                     429: "HTTP_429"}.get(error.code, "PROVIDER_ERROR"))
+            return self._failure(code, latency_ms=(time.perf_counter() - start) * 1000,
+                                 http_status=error.code)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return self._failure("INVALID_RESPONSE", latency_ms=(time.perf_counter() - start) * 1000)
+        except urllib.error.URLError as error:
+            code = "TIMEOUT" if isinstance(error.reason, TimeoutError) else "PROVIDER_ERROR"
+            return self._failure(code, latency_ms=(time.perf_counter() - start) * 1000)
+        except TimeoutError:
+            return self._failure("TIMEOUT", latency_ms=(time.perf_counter() - start) * 1000)
+        except (OSError, ValueError):
+            return self._failure("PROVIDER_ERROR", latency_ms=(time.perf_counter() - start) * 1000)
 
 
 def confirmation_questions(proposition):

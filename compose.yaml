@@ -56,13 +56,20 @@ services:
   sandbox:
     build: .
     ports:
-      - "127.0.0.1:8766:8766"
+      - "127.0.0.1:${SANDBOX_PORT:-8766}:8766"
     environment:
       SANDBOX_HOST: 0.0.0.0
       SANDBOX_PORT: "8766"
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      INTENT_LUNA_MODEL: ${INTENT_LUNA_MODEL:-openai/gpt-6-luna}
+      DB_Host: ${DB_Host:-}
+      DB_Port: ${DB_Port:-5432}
+      DB_Username: ${DB_Username:-}
+      DB_Password: ${DB_Password:-}
+      SANDBOX_ENFORCE_BUDGET: ${SANDBOX_ENFORCE_BUDGET:-false}
     volumes:
       - ./runs:/app/runs
+      - ./fact_db.sqlite3:/app/fact_db.sqlite3:ro
 
   meta-services:
     build: .

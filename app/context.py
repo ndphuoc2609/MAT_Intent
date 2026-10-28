@@ -25,6 +25,17 @@ def fmt_context(ctx, *, prior_customer_turns=None):
     recent = list(ctx.get("recent") or [])
     bot = list(ctx.get("recent_bot_replies") or [])
     prior = list(prior_customer_turns or [])
+    scope = ctx.get("scope")
+    actor = scope[3] if isinstance(scope, (list, tuple)) and len(scope) > 3 else None
+    if not isinstance(actor, str) or not actor:
+        current = next((m for m in ctx.get("messages", []) if isinstance(m, dict) and
+                        m.get("role") == "current" and isinstance(m.get("actor_id"), str) and
+                        m["actor_id"]), None)
+        actor = current.get("actor_id") if current else None
+    recent_texts = {m.get("text") for m in recent if isinstance(m, dict) and
+                    isinstance(m.get("text"), str) and
+                    m.get("role") == "recent" and actor is not None and m.get("actor_id") == actor}
+    prior = [text for text in prior if not isinstance(text, str) or text not in recent_texts]
     messages = list(ctx.get("messages") or [])
     if not any(m.get("role") in ("root", "parent", "root_parent")
                for m in messages if isinstance(m, dict)):

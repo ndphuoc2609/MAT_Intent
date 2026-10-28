@@ -25,9 +25,9 @@ def run(cmd, cwd=ROOT):
 U = [sys.executable, "-m", "unittest"]
 MUTATIONS = [
     ("drop_handoff_override_complaint", "app/engine.py",
-     [('if req["status"] == "HANDED_OFF":\n            return (["Yêu cầu này đã được chuyển cho nhân viên xử lý."], nums, "HANDOFF")',
-       'if False and req["status"] == "HANDED_OFF":\n            return (["Yêu cầu này đã được chuyển cho nhân viên xử lý."], nums, "HANDOFF")'),
-      ('return (["Phần khiếu nại đã được chuyển cho nhân viên xử lý."], nums, "HANDOFF")',
+     [('if req["status"] == "HANDED_OFF":',
+       'if False and req["status"] == "HANDED_OFF":'),
+      ('return (["Mình đã ghi nhận khiếu nại; nội dung này cần người kiểm tra trước khi có câu trả lời."],\n                    nums, "HANDOFF")',
        'return (["Cảm ơn bạn!"], nums, "social_ack")')],
      [sys.executable, "scripts/run_contract.py", "--split", "dev", "--only", "complaint_pure"]),
     # Owner isolation có 2 lớp (_resolve_ref + _apply_ops): mutant 1 lớp bị

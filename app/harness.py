@@ -3,11 +3,11 @@ Dùng cho contract tests, replay và API eval (không dùng logic riêng trong t
 from __future__ import annotations
 import json
 from .state import Store, FakeSender
-from .facts import Facts
+from .facts import DealerDirectoryError, Facts, load_dealers
 from .engine import Engine, Clock
 
 def make_engine(db=":memory:", clock=None, facts=None, kill_switch=False,
-                receiver_path=None, drain_on_start=False):
+                receiver_path=None, drain_on_start=False, dealer_db_path=None):
     # A5c: receiver mô phỏng external system PHẢI bền qua restart khi engine
     # dùng DB file: mặc định receiver file nằm cạnh DB (db + ".receiver"),
     # để engine mới mở cùng DB vẫn thấy effect cũ (không coi receiver mới
@@ -18,7 +18,20 @@ def make_engine(db=":memory:", clock=None, facts=None, kill_switch=False,
         receiver_path = db + ".receiver"
     sender = FakeSender(receiver=FakeReceiver(receiver_path) if receiver_path else FakeReceiver())
     store = Store(db)
-    eng = Engine(store, facts or Facts(), sender, clock or Clock(__import__("datetime").datetime.now(__import__("datetime").timezone.utc)), kill_switch)
+    directory_error = None
+    if dealer_db_path is not None:
+        try:
+            dealer_facts = load_dealers(dealer_db_path)
+        except DealerDirectoryError as exc:
+            dealer_facts = []
+            directory_error = str(exc)
+        facts = Facts(facts=facts.facts if facts is not None else [],
+                      verified_at=facts.verified_at if facts is not None else None,
+                      dealer_facts=dealer_facts)
+    elif facts is None:
+        facts = Facts()
+    eng = Engine(store, facts, sender, clock or Clock(__import__("datetime").datetime.now(__import__("datetime").timezone.utc)), kill_switch)
+    eng.dealer_directory_error = directory_error
     if drain_on_start:
         eng.drain_intended()
     return eng

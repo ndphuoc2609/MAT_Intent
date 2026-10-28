@@ -5,8 +5,25 @@ see [docs/intent-api.md](docs/intent-api.md).
 
 The Compose stack contains two isolated services:
 
-- `sandbox` on `127.0.0.1:8766`: the existing interactive demo with sample facts and simulated sends.
+- `sandbox` on `127.0.0.1:8766`: the interactive demo with a read-only dealer directory and simulated sends.
 - `meta-services` on `127.0.0.1:8767`: the Page Graph API connector, signed comment webhook, OpenRouter/Luna processing, persistent conversation state, and authenticated operator API.
+
+To test a Luna conversation, open `http://127.0.0.1:8766/`, choose a persona and
+vehicle, create the sample post, then enter comments. Configure `DB_Host`,
+`DB_Port`, `DB_Username`, and `DB_Password` for read-only access to
+`content_ai_fac.public.personas`. Posts are generated with OpenRouter using the
+selected persona; posts and comments incur model usage. Replies remain inside the sandbox. Nothing
+is published externally. The independent PostgreSQL intent API is documented
+in [docs/intent-api.md](docs/intent-api.md).
+
+The sandbox reads `fact_db.sqlite3` as a read-only dealer directory. Compose
+mounts this file read-only; local Python may set `SANDBOX_DEALER_DB` to another
+SQLite file with `dealers(name, mailing_address)`. The directory has no
+verification date, business hours, or coordinates, so results are identified as
+an imported list rather than a verified nearest dealer. If a dealer cannot be
+matched, the reply links to the official Hyundai dealer locator; automatic
+online lookup is not configured. Other factual replies require real facts and
+do not fall back to sample data.
 
 The Meta service uses the existing engine with **no sample facts**. It sends a public comment reply only when the engine allows it. Missing or conflicting facts produce a handoff draft at `GET /api/reviews`; they are never answered from demo data.
 
@@ -43,7 +60,7 @@ To receive webhooks, configure the Meta Page `feed` subscription to a publicly r
 
 The service calls the existing `openai/gpt-6-luna` adapter for verified new comments, including while outbound writes are disabled. It sends the post text, comment, parent text, and recent Page/actor-scoped conversation state to OpenRouter. SQLite state and the separate model budget ledger live in the ignored `runs/` directory.
 
-The Meta service uses a separate budget ledger capped at 300 provider attempts and $2.00. Unknown model cost blocks further model calls. Facts are empty until verified facts are connected, so price, stock, warranty, and other factual requests are handed to staff rather than answered from sample values.
+The local sandbox leaves budget enforcement off by default so unknown-cost ledger entries do not block manual testing. Provider attempts and reported costs are still appended to the shared ledger, and the UI warns that spend is uncapped. Set `SANDBOX_ENFORCE_BUDGET=true` to restore the sandbox cap and fail-closed unknown-cost check. The production intent API keeps its separate required budget limits. Facts are empty until verified facts are connected, so price, stock, warranty, and other factual requests are handed to staff rather than answered from sample values.
 
 ## Verify
 

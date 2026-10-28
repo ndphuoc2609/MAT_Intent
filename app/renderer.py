@@ -11,9 +11,97 @@ UNIT_MAP = {"VND": "đồng", "percent": "%", "percent_per_year": "%",
             "years": "năm", "L": "L", "xe": "xe", "dealer": "dealer", "spec": ""}
 SPEC_KEYS = ("engine", "seats", "power_hp")
 
-def render(parts: list[str], persona: str = "tư vấn viên") -> str:
-    body = " ".join(p for p in parts if p)
-    return body
+RENDER_STYLES = frozenset({"neutral", "warm", "professional", "concise"})
+_STYLE_BY_TONE = {
+    "neutral": "neutral", "trung tính": "neutral",
+    "warm": "warm", "friendly": "warm", "ấm áp": "warm", "thân thiện": "warm",
+    "professional": "professional", "formal": "professional",
+    "chuyên nghiệp": "professional", "trang trọng": "professional",
+    "concise": "concise", "direct": "concise", "ngắn gọn": "concise",
+}
+_MAX_TONE_DESCRIPTION_CHARS = 240
+_DESCRIPTION_STYLE_PHRASES = {
+    "neutral": ("trung tính", "neutral"),
+    "warm": ("nhẹ nhàng", "ấm áp", "thân thiện", "warm", "friendly"),
+    "professional": ("chuyên nghiệp", "trang trọng", "professional", "formal"),
+    "concise": ("ngắn gọn", "concise", "direct"),
+}
+_NEGATED_TONE_PREFIX = re.compile(
+    r"(?<!\w)(?:không|chẳng|chả|chưa|not|never)"
+    r"(?:\s+(?:hề|quá|mấy|lắm|thật|thực|sự|phải|có|được|nên|còn|là|kiểu|"
+    r"hẳn|khá|vẻ|đặc\s+biệt|very|really|too|quite|particularly)){0,2}\s*$"
+)
+
+# Variants are whole, engine-authored clarification prompts. Facts and any
+# unlisted text pass through unchanged; this renderer never paraphrases claims.
+_PROMPT_VARIANTS = {
+    "warm": {
+        "Bạn đang hỏi giá xe nào ạ?": "Bạn đang hỏi giá mẫu xe nào vậy?",
+        "Bạn muốn xem giá niêm yết hay giá lăn bánh ạ?":
+            "Bạn muốn xem giá niêm yết hay giá lăn bánh nhỉ?",
+        "Bạn đang ở khu vực nào (tỉnh/thành phố hoặc quận/huyện) ạ?":
+            "Bạn đang ở tỉnh/thành phố hay quận/huyện nào vậy?",
+    },
+    "professional": {
+        "Bạn đang hỏi giá xe nào ạ?": "Bạn muốn tham khảo giá mẫu xe nào?",
+        "Bạn muốn xem giá niêm yết hay giá lăn bánh ạ?":
+            "Bạn muốn tham khảo giá niêm yết hay giá lăn bánh?",
+        "Bạn đang ở khu vực nào (tỉnh/thành phố hoặc quận/huyện) ạ?":
+            "Vui lòng cho biết tỉnh/thành phố hoặc quận/huyện của bạn.",
+    },
+    "concise": {
+        "Bạn đang hỏi giá xe nào ạ?": "Bạn hỏi giá xe nào?",
+        "Bạn muốn xem giá niêm yết hay giá lăn bánh ạ?":
+            "Bạn muốn giá niêm yết hay giá lăn bánh?",
+        "Bạn đang ở khu vực nào (tỉnh/thành phố hoặc quận/huyện) ạ?":
+            "Bạn ở tỉnh/thành phố hoặc quận/huyện nào?",
+    },
+}
+
+
+def style_from_tone(tone: str | None) -> str:
+    """Map an exact label or one unambiguous, known phrase to a safe style.
+
+    Free-form persona text is not interpreted as instructions. Unknown values
+    use the backward-compatible neutral style. Descriptions are length-limited;
+    embedded phrases count only when exactly one style category is positive.
+    """
+    if not isinstance(tone, str):
+        return "neutral"
+    normalized = " ".join(tone.casefold().split())
+    exact_style = _STYLE_BY_TONE.get(normalized)
+    if exact_style:
+        return exact_style
+    if len(normalized) > _MAX_TONE_DESCRIPTION_CHARS:
+        return "neutral"
+
+    matched_styles = set()
+    for style, phrases in _DESCRIPTION_STYLE_PHRASES.items():
+        for phrase in phrases:
+            pattern = re.compile(rf"(?<!\w){re.escape(phrase)}(?!\w)")
+            for match in pattern.finditer(normalized):
+                clause_prefix = re.split(
+                    r"[,;.!?:]|\b(?:nhưng|tuy nhiên|but|however)\b",
+                    normalized[:match.start()])[-1]
+                if _NEGATED_TONE_PREFIX.search(clause_prefix):
+                    continue
+                matched_styles.add(style)
+                break
+            if style in matched_styles:
+                break
+    return next(iter(matched_styles)) if len(matched_styles) == 1 else "neutral"
+
+
+def render(parts: list[str], persona: str = "tư vấn viên", *, style: str = "neutral") -> str:
+    """Join engine text, optionally varying only known clarification prompts.
+
+    ``persona`` remains accepted for existing callers. It is intentionally not
+    used to create biographical claims or alter facts.
+    """
+    if not isinstance(style, str) or style not in RENDER_STYLES:
+        style = "neutral"
+    variants = _PROMPT_VARIANTS.get(style, {})
+    return " ".join(variants.get(part, part) for part in parts if part)
 
 def _parse_number(raw: str):
     if "." in raw and len(raw.split(".")[-1]) == 3 and raw.count(".") >= 1:

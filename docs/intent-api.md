@@ -111,6 +111,8 @@ supported schema subset; the application validator remains authoritative.
 OpenRouter support is endpoint-specific, so requests require provider parameter
 support and are still checked in the engine ([OpenRouter structured outputs](https://openrouter.ai/docs/guides/features/structured-outputs),
 [OpenAI supported schema subset](https://developers.openai.com/api/docs/guides/structured-outputs#supported-schemas)).
+See [semantic-format.md](semantic-format.md) for the versioned model output
+and its evidence and error handling.
 
 HTTP outcomes include `200` processed or reviewed, `202` another worker is
 processing the same event, `401` bad API key, `409` payload/context conflict,

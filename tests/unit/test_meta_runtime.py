@@ -75,8 +75,10 @@ class MetaRuntimeTests(unittest.TestCase):
         self.assertTrue(self.runtime.enqueue_webhook(self.payload("456_3")))
         self.assertTrue(self.runtime.process_next())
         self.assertEqual(len(self.graph.replies), 3)
-        self.assertIn("Cảm ơn bạn đã tương tác!", self.model_contexts[1])
-        self.assertNotIn("Cảm ơn bạn đã tương tác!", self.model_contexts[2])
+        # The engine now answers a thank-you naturally; keep the same thread
+        # isolation assertion against the current reply text.
+        self.assertIn("Không có gì, bạn nhé!", self.model_contexts[1])
+        self.assertNotIn("Không có gì, bạn nhé!", self.model_contexts[2])
 
     def test_inbox_restart_preserves_live_lease_and_expired_lease_is_reclaimed(self):
         self.runtime.inbox.enqueue({"comment_id": "456_11"})
