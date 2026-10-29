@@ -10,7 +10,7 @@ from pathlib import Path
 from .state import Store
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations" / "postgresql"
-LATEST_VERSION = 5
+LATEST_VERSION = 6
 
 
 def _adapt_sql(sql):
@@ -106,9 +106,7 @@ def migrate(dsn):
                 continue
             conn.execute("BEGIN")
             try:
-                for statement in Path(filename).read_text(encoding="utf-8").split(";"):
-                    if statement.strip():
-                        conn.execute(statement)
+                conn.execute(Path(filename).read_text(encoding="utf-8"), prepare=False)
                 conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (%s, CURRENT_TIMESTAMP)",
                              (version,))
                 conn.commit()

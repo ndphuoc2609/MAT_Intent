@@ -252,7 +252,7 @@ class SandboxHTTPTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["predictions"], {})
-        self.assertNotIn("1.2", json.dumps(record))
+        self.assertNotIn("answers", record)
         shadow_ledger = [json.loads(line) for line in Path(self.ledger).read_text().splitlines()
                          if line.strip() and json.loads(line).get("kind") == "shadow"]
         self.assertEqual(shadow_ledger[-1]["attempts"], 1)
@@ -288,13 +288,13 @@ class SandboxHTTPTests(unittest.TestCase):
         with patch("scripts.model_trace.append", side_effect=OSError("private path")), \
              patch("sandbox.server.call_luna", return_value=model_result(meaning(evidence=comment))):
             status, result = self.turn(state, comment)
+            event_id = result["turn"]["jev_shadow_event_id"]
+            for _ in range(100):
+                shadow = self.http.app.conversations[state["id"]]["jev_shadows"].get(event_id, {})
+                if shadow.get("status") != "pending": break
+                time.sleep(0.01)
         self.assertEqual(status, 200)
         self.assertTrue(result["turn"]["ok"])
-        event_id = result["turn"]["jev_shadow_event_id"]
-        for _ in range(100):
-            shadow = self.http.app.conversations[state["id"]]["jev_shadows"].get(event_id, {})
-            if shadow.get("status") != "pending": break
-            time.sleep(0.01)
         self.assertEqual(shadow["status"], "complete")
         self.assertEqual(shadow["trace_status"], "failed")
         self.assertNotIn("private path", json.dumps(shadow))

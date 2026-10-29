@@ -144,6 +144,25 @@ class TestReviewFacts(unittest.TestCase):
         self.assertIn("HANDOFF", r["routing"])
         self.assertEqual(len(r.get("sends", [])), 0)
 
+    def test_each_conflicting_otr_fee_blocks_send(self):
+        for fee in ("reg_rate", "plate_fee", "road_fee"):
+            with self.subTest(fee=fee):
+                original = next(f for f in SEED_FACTS if f["type"] == fee and
+                                (fee == "road_fee" or f.get("location") == "Hà Nội"))
+                extra = dict(original, id="conflict_" + fee, value=original["value"] + 1)
+                eng = make_engine(clock=Clock(T0), facts=Facts(facts=list(SEED_FACTS) + [extra]))
+                result = eng.process(ev("fee_" + fee, "Creta Cao cấp lăn bánh Hà Nội"), PC, sem([
+                    dict(op="START_REQUEST", request_ref="topic:price", evidence_excerpt="Creta",
+                         slot=dict(kind="vehicle", value="Creta")),
+                    dict(op="UPDATE_SLOT", request_ref="topic:price", evidence_excerpt="Cao cấp",
+                         slot=dict(kind="variant", value="Cao cấp")),
+                    dict(op="UPDATE_SLOT", request_ref="topic:price", evidence_excerpt="Hà Nội",
+                         slot=dict(kind="location", value="Hà Nội")),
+                    dict(op="UPDATE_SLOT", request_ref="topic:price", evidence_excerpt="lăn bánh",
+                         slot=dict(kind="price_kind", value="otr"))]))
+                self.assertIn("HANDOFF", result["routing"])
+                self.assertEqual(result["sends"], [])
+
 class TestReviewTypedClaim(unittest.TestCase):
     def test_swapped_prices_rejected(self):
         used = [dict(fact_id="a", vehicle="Creta", variant="Cao cấp", attribute="list_price",

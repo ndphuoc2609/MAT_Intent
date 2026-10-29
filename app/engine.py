@@ -177,11 +177,18 @@ class Engine:
         query = parse_persona_query(event.get("text", ""), event.get("comment_id"),
                                     event.get("actor_id"), semantic=semantic)
         if query["topic"] == "none":
+            if "?" in event.get("text", "") or "？" in event.get("text", ""):
+                return {"status": "REVIEW", "reason": "UNRESOLVED_QUERY", "query": query}
             return None
         snapshot = store.get_binding_snapshot(event["page_id"], event.get("post_id"))
         if not isinstance(snapshot, dict):
             return {"status": "REVIEW", "reason": "BINDING_NOT_FOUND", "query": query}
-        result = render_persona_reply(snapshot, topic=query["topic"],
+        required_keys = set(query.get("canonical_keys") or ())
+        facts_by_id = {f.get("fact_id"): f for f in snapshot.get("facts", []) if isinstance(f, dict)}
+        filtered = dict(snapshot)
+        filtered["utterances"] = [u for u in snapshot.get("utterances", []) if isinstance(u, dict) and
+            required_keys and {facts_by_id.get(fid, {}).get("key") for fid in u.get("required_fact_ids", [])} == required_keys]
+        result = render_persona_reply(filtered, topic=query["topic"],
             revoked_ids=store.revoked_fact_ids(snapshot["persona_uuid"], snapshot["release_id"]),
             allow_fictional_fixture=self.allow_persona_fixtures)
         if result["status"] == "UNKNOWN" and query["topic"] != "unknown":
@@ -190,6 +197,50 @@ class Engine:
                 allow_fictional_fixture=self.allow_persona_fixtures)
         return {**result, "query": query, "persona_uuid": snapshot.get("persona_uuid"),
                 "release_id": snapshot.get("release_id")}
+
+    def _persona_dispatch_precheck(self, payload):
+        scope = payload.get("persona_scope")
+        if any(not isinstance(payload.get(k), str) or not payload[k] for k in ("persona_uuid", "release_id")):
+            return "BLOCKED_PERSONA_SCOPE"
+        if not isinstance(scope, dict) or any(not isinstance(scope.get(k), str) or not scope[k]
+                for k in ("page_id", "post_id", "thread_root_id", "actor_id")):
+            return "BLOCKED_PERSONA_SCOPE"
+        row = self.store.conn.execute(
+            "SELECT payload FROM events WHERE comment_id=? AND actor_id=? AND retracted=0 ORDER BY rowid DESC LIMIT 1",
+            (payload.get("comment_id"), scope["actor_id"])).fetchone()
+        try:
+            source = json.loads(row[0]) if row else {}
+        except (TypeError, ValueError):
+            return "BLOCKED_PERSONA_SCOPE"
+        if any(source.get(key) != value for key, value in scope.items()):
+            return "BLOCKED_PERSONA_SCOPE"
+        if self.kill_switch or self.store.blocks(scope["page_id"], scope["actor_id"]) & {"all", "public_reply"}:
+            return "BLOCKED_AT_DISPATCH"
+        handoff = self.store.conn.execute(
+            "SELECT 1 FROM handoffs h JOIN requests r ON r.id=h.request_id WHERE h.released_at IS NULL "
+            "AND r.page_id=? AND r.post_id=? AND r.thread_root_id=? AND r.actor_id=? LIMIT 1",
+            (scope["page_id"], scope["post_id"], scope["thread_root_id"], scope["actor_id"])).fetchone()
+        if handoff:
+            return "BLOCKED_HANDOFF_AT_DISPATCH"
+        state = self._trace_state_snapshot(scope)
+        token = hashlib.sha256(json.dumps(state, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+        if token != payload.get("persona_state_token"):
+            return "BLOCKED_STALE_STATE"
+        try:
+            store = self.persona_store
+            snapshot = store.get_binding_snapshot(scope["page_id"], scope["post_id"]) if store else None
+            if not snapshot or any(snapshot.get(k) != payload.get(k) for k in ("persona_uuid", "release_id")):
+                return "BLOCKED_STALE_PERSONA"
+            result = render_persona_reply(snapshot, plan={"schema_version": "persona_reply_plan_v1",
+                "utterance_ids": payload.get("utterance_ids"), "hook_id": None},
+                revoked_ids=store.revoked_fact_ids(payload["persona_uuid"], payload["release_id"]),
+                allow_fictional_fixture=self.allow_persona_fixtures)
+            if (result.get("status") != "OK" or result.get("text") != payload.get("text") or
+                    result.get("fact_ids") != payload.get("fact_ids")):
+                return "BLOCKED_STALE_PERSONA"
+        except Exception:
+            return "BLOCKED_STALE_PERSONA"
+        return None
     def _sweep_expired(self, event, now_iso):
         """Hết hạn: pending quá expires_at -> EXPIRED (request về OPEN nếu
         không còn pending mở); handoff quá SLA -> OVERDUE (escalation nội bộ),
@@ -312,11 +363,27 @@ class Engine:
                                       "current_version": req["version"]}, now_iso)
                     self.store.conn.commit()
                     drained.append((key, "BLOCKED_STALE_STATE")); continue
-                if self.kill_switch:
+                try:
+                    payload = json.loads(payload_json)
+                    if not isinstance(payload, dict):
+                        raise ValueError("invalid outbox payload")
+                except (TypeError, ValueError):
+                    self.store.set_outbox_status(key, "BLOCKED")
+                    self.store.audit(key, "drain_blocked", {"reason": "INVALID_PAYLOAD"}, now_iso)
+                    self.store.conn.commit()
+                    drained.append((key, "BLOCKED")); continue
+                is_persona = purpose == "persona_reply" or any(k in payload for k in ("persona_uuid", "release_id", "persona_scope", "utterance_ids", "fact_ids"))
+                if is_persona:
+                    err = self._persona_dispatch_precheck(payload)
+                    if err:
+                        self.store.set_outbox_status(key, "BLOCKED")
+                        self.store.audit(key, "drain_blocked", {"reason": err}, now_iso)
+                        self.store.conn.commit()
+                        drained.append((key, "BLOCKED")); continue
+                elif self.kill_switch:
                     self.store.set_outbox_status(key, "INTENDED")
                     self.store.conn.commit()
                     drained.append((key, "SKIPPED_KILL_SWITCH")); continue
-            payload = json.loads(payload_json)
             res = self.sender.send(payload)
             st = _delivery_status(res)
             with self.store.lock:
@@ -345,8 +412,10 @@ class Engine:
                 if cur and cur["status"] == "SENT":
                     return "SENT", {"status": "sent_to_fake_ledger", "id": key, "duplicate_delivery": True}
                 return "SKIPPED", None
-            if recheck is not None:
-                err = recheck()
+            is_persona = purpose == "persona_reply" or any(k in payload for k in ("persona_uuid", "release_id", "persona_scope", "utterance_ids", "fact_ids"))
+            if recheck is not None or is_persona:
+                err = self._persona_dispatch_precheck(payload) if is_persona else None
+                err = err or (recheck() if recheck is not None else None)
                 if err:
                     self.store.set_outbox_status(key, "BLOCKED")
                     self.store.audit(event["comment_id"], "dispatch_blocked", {"key": key, "reason": err}, now_iso)
@@ -891,12 +960,23 @@ class Engine:
                                            release_id=persona["release_id"],
                                            utterance_ids=persona["utterance_ids"],
                                            fact_ids=persona["fact_ids"])
+                            payload["persona_scope"] = {k: event.get(k) for k in
+                                ("page_id", "post_id", "thread_root_id", "actor_id")}
+                            state = self._trace_state_snapshot(event)
+                            payload["persona_state_token"] = hashlib.sha256(json.dumps(
+                                state, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+                            blocked = self._persona_dispatch_precheck(payload)
+                            if blocked:
+                                result["routing"].append(blocked)
+                                self.store.audit(event["comment_id"], "persona_reply_blocked", result, now_iso)
+                                commit_attempt(); return result
                         # A5b: ghi intent TRƯỚC commit (trong transaction này)
                         # để crash trước dispatcher vẫn còn INTENDED mà drain
                         # được; trước đây intent chỉ xuất hiện trong _dispatch
                         # nên crash trước _dispatch làm mất reply vĩnh viễn
                         # (redelivery bị dedupe chặn).
-                        self._outbox_intended(event, [], "reply", payload, now_iso)
+                        purpose = "persona_reply" if persona else "reply"
+                        self._outbox_intended(event, [], purpose, payload, now_iso)
                         self.store.audit(event["comment_id"], "processed", result, now_iso)
                         commit_attempt()
                         def persona_recheck():
@@ -908,12 +988,14 @@ class Engine:
                                     for key in ("text", "persona_uuid", "release_id", "utterance_ids", "fact_ids")):
                                 return "BLOCKED_STALE_PERSONA"
                             return None
-                        status, sres = self._dispatch(event, [], "reply", result["response_text"], now_iso, payload,
+                        status, sres = self._dispatch(event, [], purpose, result["response_text"], now_iso, payload,
                                                       recheck=persona_recheck if persona else None)
                         if status == "SENT":
                             result["outbound_permission"] = True; result["sends"].append(sres)
                         elif status == "FAILED":
                             result["routing"].append("SEND_FAILED")
+                        elif status == "BLOCKED":
+                            result["routing"].append("BLOCKED_AT_DISPATCH")
                         else:
                             result["routing"].append("SEND_UNKNOWN")
                         return result
@@ -1779,7 +1861,7 @@ class Engine:
                 return (["Bạn tính lăn bánh ở tỉnh/thành nào ạ?"], nums, "ask_clarification")
             fr, _, fconf = fresh("reg_rate", location=loc); fp, _, pconf = fresh("plate_fee", location=loc)
             fd, _, dconf = fresh("road_fee")
-            if False and (fconf or pconf or dconf):
+            if fconf or pconf or dconf:
                 # R07: không bỏ cờ conflict ở phí lăn bánh (dùng fact đầu tiên
                 # trong khi có 2 mức phí mâu thuẫn là trả lời sai).
                 return (["Dữ liệu phí lăn bánh hiện chưa thống nhất, nên mình chưa thể đưa ra con số chính xác."],

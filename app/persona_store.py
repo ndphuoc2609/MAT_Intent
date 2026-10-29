@@ -24,9 +24,16 @@ def _id(value=None):
 def migrate_sqlite(conn: sqlite3.Connection):
     """Apply the additive, versioned persona schema to an explicitly supplied DB."""
     conn.execute("PRAGMA foreign_keys=ON")
-    script = SQLITE_MIGRATION.read_text(encoding="utf-8")
-    conn.executescript("BEGIN IMMEDIATE;\nCREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);\n" +
-                       script + "\nINSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, CURRENT_TIMESTAMP);\nCOMMIT;")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+    for version, path in ((5, SQLITE_MIGRATION), (6, SQLITE_MIGRATION.with_name("006_persona_integrity.sql"))):
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone():
+            continue
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + path.read_text(encoding="utf-8") +
+                               f"\nINSERT INTO schema_migrations(version, applied_at) VALUES ({version}, CURRENT_TIMESTAMP);\nCOMMIT;")
+        except Exception:
+            conn.rollback()
+            raise
 
 
 class PersonaStore:
@@ -248,6 +255,14 @@ class PersonaStore:
                 raise ValueError("unknown release")
             if release[1] != "DRAFT":
                 raise ValueError("release already published")
+            invalid = self.conn.execute(
+                "SELECT 1 FROM release_facts rf LEFT JOIN persona_fact_approvals a "
+                "ON a.approval_id=rf.approval_id AND a.fact_id=rf.fact_id "
+                "WHERE rf.release_id=? AND (a.approval_id IS NULL OR a.seq <> "
+                "(SELECT MAX(x.seq) FROM persona_fact_approvals x WHERE x.fact_id=rf.fact_id)) LIMIT 1",
+                (release_id,)).fetchone()
+            if invalid:
+                raise ValueError("release fact requires its latest matching approval")
             fact_rows = self.conn.execute(
                 "SELECT f.fact_id,f.category,f.canonical_key,f.entity_id,f.valid_from,f.valid_to,f.tellable,a.decision,k.cardinality "
                 "FROM release_facts rf JOIN persona_facts f ON f.fact_id=rf.fact_id "
@@ -410,6 +425,12 @@ class PersonaStore:
             if fact["valid_to"] and on_date.isoformat() >= fact["valid_to"]:
                 continue
             if self.conn.execute("SELECT 1 FROM persona_revocations WHERE fact_id=?", (fact["fact_id"],)).fetchone():
+                continue
+            if self.conn.execute(
+                    "SELECT 1 FROM release_facts rf JOIN persona_fact_approvals original ON original.approval_id=rf.approval_id "
+                    "JOIN persona_fact_approvals later ON later.fact_id=rf.fact_id AND later.seq>original.seq "
+                    "WHERE rf.release_id=? AND rf.fact_id=? AND later.decision='rejected' LIMIT 1",
+                    (release_id, fact["fact_id"])).fetchone():
                 continue
             vtype = fact["value_type"]
             if vtype == "text": value = fact["value_text"]

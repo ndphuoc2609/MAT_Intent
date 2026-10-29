@@ -72,7 +72,7 @@ def _deterministic(text: str):
         ("occupation", ("occupation.title",),
          (r"\bban lam nghe gi\b", r"\bcong viec cua ban la gi\b",
           r"\bban lam gi\b")),
-        ("residence", ("location.base.province", "location.base.district"),
+        ("residence", ("location.base.province",),
          (r"\bban (?:dang )?(?:song|o|cu tru) o dau\b", r"\bban o dau vay\b")),
         ("residence", ("location.base.province",),
          (r"\bban (?:dang )?(?:song|o) o tinh nao\b", r"\bban o tinh nao\b")),

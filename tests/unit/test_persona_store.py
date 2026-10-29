@@ -16,6 +16,78 @@ class PersonaStoreTests(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
+    def test_release_rejects_approval_for_another_fact_and_later_rejection(self):
+        a = self.store.add_fact(self.persona, "identity", "age_years", 31,
+                                source_ref="fixture:a", source_kind="fictional_fixture", tellable="public")
+        b = self.store.add_fact(self.persona, "identity", "age_years", 32,
+                                source_ref="fixture:b", source_kind="fictional_fixture", tellable="public")
+        approval = self.store.approve_fact(a, "reviewer")
+        release = self.store.create_release(self.persona)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("INSERT INTO release_facts(release_id,persona_id,fact_id,approval_id) VALUES (?,?,?,?)",
+                            (release, self.persona, b, approval))
+        self.db.rollback()
+        self.store.add_release_fact(release, a)
+        self.store.approve_fact(a, "reviewer", approved=False)
+        with self.assertRaisesRegex(ValueError, "latest matching approval"):
+            self.store.publish_release(release, "reviewer")
+        self.assertEqual(self.db.execute("SELECT status FROM persona_releases WHERE release_id=?", (release,)).fetchone()[0], "DRAFT")
+
+    def test_rejection_after_publication_removes_fact_from_snapshot(self):
+        fact = self.store.add_fact(self.persona, "identity", "age_years", 31,
+                                   source_ref="fixture:a", source_kind="fictional_fixture", tellable="public")
+        self.store.approve_fact(fact, "reviewer")
+        release = self.store.create_release(self.persona)
+        self.store.add_release_fact(release, fact)
+        self.store.publish_release(release, "reviewer")
+        self.assertEqual(len(self.store.get_release_snapshot(self.persona, release)["facts"]), 1)
+        self.store.approve_fact(fact, "reviewer", approved=False)
+        self.assertEqual(self.store.get_release_snapshot(self.persona, release)["facts"], [])
+
+    def test_version_five_fixture_migrates_without_losing_binding(self):
+        from app.persona_fixture import seed_nam_creta
+        from app.persona_store import SQLITE_MIGRATION
+        db = sqlite3.connect(":memory:")
+        try:
+            db.executescript("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);" +
+                             SQLITE_MIGRATION.read_text() +
+                             "INSERT INTO schema_migrations VALUES (5, CURRENT_TIMESTAMP);")
+            store = PersonaStore(db)
+            persona, release = seed_nam_creta(store)
+            store.bind_post("p", "post", persona, release)
+            migrate_sqlite(db)
+            migrate_sqlite(db)
+            self.assertEqual(store.binding("p", "post")["release_id"], release)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(store.get_release_snapshot(persona, release)["release"]["status"], "FIXTURE")
+        finally:
+            db.close()
+
+    def test_version_six_rejects_existing_mismatched_approval_atomically(self):
+        from app.persona_store import SQLITE_MIGRATION
+        db = sqlite3.connect(":memory:")
+        try:
+            db.executescript("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);" +
+                             SQLITE_MIGRATION.read_text() +
+                             "INSERT INTO schema_migrations VALUES (5, CURRENT_TIMESTAMP);")
+            store = PersonaStore(db)
+            persona = store.create_persona("fixture", "Fixture Test", source_kind="fictional_fixture")
+            store.register_key("identity", "identity.age", value_type="integer")
+            a = store.add_fact(persona, "identity", "identity.age", 30, source_ref="a",
+                               source_kind="fictional_fixture", tellable="public")
+            b = store.add_fact(persona, "identity", "identity.age", 31, source_ref="b",
+                               source_kind="fictional_fixture", tellable="public")
+            approval = store.approve_fact(a, "reviewer")
+            release = store.create_release(persona)
+            db.execute("INSERT INTO release_facts VALUES (?,?,?,?)", (release, persona, b, approval))
+            db.commit()
+            with self.assertRaises(sqlite3.IntegrityError):
+                migrate_sqlite(db)
+            self.assertIsNone(db.execute("SELECT version FROM schema_migrations WHERE version=6").fetchone())
+            self.assertEqual(db.execute("SELECT fact_id FROM release_facts WHERE release_id=?", (release,)).fetchone()[0], b)
+        finally:
+            db.close()
+
     def test_fixture_source_cannot_be_marked_as_real_approved_persona(self):
         row = self.db.execute(
             "SELECT source_kind, status FROM personas WHERE persona_id=?", (self.persona,)
