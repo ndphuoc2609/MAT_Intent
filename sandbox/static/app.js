@@ -61,6 +61,22 @@ function showPost(post) {
   const duration = post.generation?.generation_latency_ms;
   $('post-timing').textContent = typeof duration === 'number' ? `Tạo bài: ${(duration / 1000).toFixed(1)} giây` : '';
 }
+function showPersonaRelease(release) {
+  const box = $('persona-release-box');
+  box.hidden = !release;
+  $('persona-facts').replaceChildren();
+  $('persona-utterances').replaceChildren();
+  if (!release) return;
+  $('persona-release-note').textContent = release.fixture_only
+    ? 'Kịch bản hư cấu để thử sandbox; không phải hồ sơ thật hoặc dữ kiện đã được duyệt cho hệ thống thật.'
+    : `Release đã duyệt · ${release.release?.id || ''}`;
+  for (const fact of release.facts || []) {
+    $('persona-facts').append(textNode('li', `${fact.key}: ${String(fact.value)} · ${fact.source_kind} · ${fact.source_ref}`));
+  }
+  for (const utterance of release.utterances || []) {
+    $('persona-utterances').append(textNode('li', utterance.text));
+  }
+}
 function showJev(node, result) {
   node.replaceChildren();
   node.append(textNode('p', 'JEV · ĐÁNH GIÁ SONG SONG', 'turn-label'));
@@ -121,6 +137,7 @@ async function pollJev(conversationId, eventId) {
 function render(state) {
   conversation = state;
   showPost(state.post);
+  showPersonaRelease(state.persona_release);
   const directory = state.dealer_directory;
   $('scope').textContent = directory?.status === 'available'
     ? `Danh sách đại lý: ${directory.count} địa chỉ · Chưa xác minh cập nhật trực tuyến`
@@ -130,7 +147,9 @@ function render(state) {
   for (const turn of state.history) {
     const item = textNode('article', '', 'turn');
     item.append(textNode('p', 'BẠN', 'turn-label'), textNode('p', turn.text, 'customer-text'));
-    item.append(textNode('p', state.post.persona_name ? `${state.post.persona_name} · PERSONA` : 'TƯ VẤN', 'turn-label'));
+    item.append(textNode('p', state.post.persona_name
+      ? `${state.post.persona_name} · PERSONA${state.post.persona_fixture_only ? ' · KỊCH BẢN HƯ CẤU' : ''}`
+      : 'TƯ VẤN', 'turn-label'));
     const modelFailure = turn.routing.includes('REVIEW_MODEL_ERROR');
     const reply = turn.response_text || (modelFailure
       ? turn.model_error_code === 'MODEL_REFUSAL'
@@ -243,9 +262,9 @@ $('turn-form').addEventListener('submit', async (event) => {
           : `Model ${health.model} sẵn sàng · Mỗi comment dùng OpenRouter và được tính ngân sách.`;
     $('persona-select').replaceChildren();
     for (const persona of setup.personas) {
-      const option = textNode('option', persona.name);
+      const option = textNode('option', persona.source_kind === 'fictional_fixture'
+        ? `${persona.name} · KỊCH BẢN HƯ CẤU` : persona.name);
       option.value = persona.id;
-      option.textContent = persona.name;
       $('persona-select').append(option);
     }
     $('vehicle-select').replaceChildren();

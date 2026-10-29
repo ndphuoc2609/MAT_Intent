@@ -15,6 +15,7 @@ AUTO_ACTIONS = frozenset({
     "answer_price", "answer_promo", "answer_loan_info", "answer_stock",
     "answer_spec", "answer_dealer", "ask_clarification", "social_ack",
     "propose_test_drive_slot", "answer_confirmation", "answer_general_advice",
+    "answer_persona",
 })
 
 # SLA handoff: quá số giờ này handoff chuyển OVERDUE (escalation nội bộ),

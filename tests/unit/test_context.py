@@ -5,6 +5,29 @@ from app.context import fmt_context
 
 
 class ContextFormattingTests(unittest.TestCase):
+    def test_validated_root_semantic_and_author_survive_context_serialization(self):
+        from app.harness import make_engine
+        text = "Giá Creta bao nhiêu?"
+        semantic = {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent",
+                    "scope": "in_scope", "requests": [], "uncertainties": [],
+                    "operations": [{"op": "UNRESOLVED", "reason": "context_only",
+                                     "evidence_excerpt": text}]}
+        engine = make_engine()
+        event = {"page_id": "page", "post_id": "post", "thread_root_id": "thread",
+                 "parent_id": "root-comment", "comment_id": "reply", "actor_id": "actor-b",
+                 "text": "Bản cao nhé"}
+        context = engine.context(event, {"text": "Post text", "vehicles": ["Creta"]}, [{
+            "message_id": "root-comment", "page_id": "page", "post_id": "post",
+            "thread_root_id": "thread", "actor_id": "actor-a", "role": "root",
+            "text": text, "semantic": semantic,
+        }])
+        serialized = json.loads(fmt_context(context))
+        root = next(m for m in serialized["messages"] if m["message_id"] == "root-comment")
+        self.assertEqual(root["actor_id"], "actor-a")
+        self.assertEqual(root["role"], "root")
+        self.assertEqual(root["semantic"], semantic)
+        self.assertEqual(serialized["messages"][0]["role"], "post")
+
     def test_drops_prior_copy_of_recent_actor_message_but_keeps_provenance(self):
         serialized = fmt_context({
             "postcard": {"id": "post-1", "text": "Hyundai Creta", "vehicles": ["Creta"]},

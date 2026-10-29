@@ -44,6 +44,7 @@ QUY TẮC BẮT BUỘC:
 - Phủ định/điều kiện: "không lấy bản cao nữa, lấy bản tiêu chuẩn" = UPDATE_SLOT variant sang Tiêu chuẩn, giữ request mua; "đừng hủy lịch, chỉ đổi sang chiều" = UPDATE_SLOT datetime, KHÔNG CANCEL_REQUEST; "không phải Tucson, Creta" = vehicle Creta, không Tucson.
 - "oke/ừ/đc/👍" chỉ là xác nhận khi context có pending yes/no cụ thể; không pending thì SOCIAL_ACK.
 - Khen + "chưa có nhu cầu" = social, không buy. Quảng cáo vay của người khác = scope out_of_scope, không loan. "Cho số tư vấn bảo hành" = service, không buy. "Đừng gọi, gửi giá tại đây" = SET_CONTACT_PREFERENCE scope call + request price.
+- Hỏi trực tiếp người viết trong Page về đời tư/trải nghiệm ("Bạn mua xe ở đại lý nào?", "Bạn ở đâu?", "Bạn đang đi xe gì?") = social/SOCIAL_ACK; đây không phải dữ kiện của khách, không tạo slot dealer/location/vehicle cho khách.
 - Khiếu nại, tranh chấp cọc, yêu cầu gặp người = REPORT_COMPLAINT hoặc REQUEST_HUMAN.
 - PostCard chỉ là bối cảnh: post nhiều xe + "xe này" chưa rõ thì UNRESOLVED, không tự chọn xe.
 - Sarcasm: khen ngược/mỉa mai = present; không chắc = uncertain; không dùng số confidence.

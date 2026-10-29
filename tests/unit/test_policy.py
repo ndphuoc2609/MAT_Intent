@@ -31,6 +31,9 @@ def _load_yaml(path):
     return out
 
 class TestPolicyConsistency(unittest.TestCase):
+    def test_persona_answer_is_an_engine_action(self):
+        self.assertIn("answer_persona", policy.AUTO_ACTIONS)
+
     def test_yaml_mirrors_code(self):
         y = _load_yaml(os.path.join(os.path.dirname(os.path.dirname(
             os.path.dirname(os.path.abspath(__file__)))), "config", "policy.yaml"))
@@ -42,7 +45,7 @@ class TestPolicyConsistency(unittest.TestCase):
         from app import pg_adapter
         from app.state import Store
         self.assertTrue(issubclass(pg_adapter.PostgresStore, Store))
-        self.assertEqual(pg_adapter.LATEST_VERSION, 4)
+        self.assertEqual(pg_adapter.LATEST_VERSION, 5)
 
 if __name__ == "__main__":
     unittest.main()

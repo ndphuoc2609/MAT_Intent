@@ -5,6 +5,7 @@ import json
 import ipaddress
 import hashlib
 import os
+import sqlite3
 from pathlib import Path
 import threading
 import time
@@ -19,6 +20,8 @@ from app.adapters.jev import JevOpenRouter, intent_questions, validate_answers
 from app.engine import WallClock
 from app.facts import Facts, dealer_public_address
 from app.harness import make_engine
+from app.persona_fixture import seed_nam_creta
+from app.persona_store import PersonaStore, migrate_sqlite
 from app.renderer import style_from_tone
 from app.semantics import attach_context_provenance, validate_semantic
 from scripts import budget_ledger
@@ -50,7 +53,7 @@ def required_text(data, key, maximum=10000):
 
 
 class Sandbox:
-    def __init__(self, ledger_path=None, dealer_db_path=None):
+    def __init__(self, ledger_path=None, dealer_db_path=None, persona_db_path=None):
         self.ledger_path = ledger_path or budget_ledger.DEFAULT_PATH
         self.dealer_db_path = dealer_db_path or os.environ.get("SANDBOX_DEALER_DB") or str(
             Path(__file__).resolve().parents[1] / "fact_db.sqlite3")
@@ -61,19 +64,42 @@ class Sandbox:
         self.jev_lock = threading.Lock()
         self.jev_adapter = JevOpenRouter()
         self.jev_trace_path = str(JEV_TRACE_PATH)
+        self.persona_db_path = persona_db_path or os.environ.get("SANDBOX_PERSONA_DB") or str(
+            Path(__file__).resolve().parents[1] / "runs" / "persona_sandbox.sqlite3")
+        self.persona_conn = None
+        self.persona_store = None
+
+    def persona_repository(self):
+        if self.persona_store is None:
+            Path(self.persona_db_path).parent.mkdir(parents=True, exist_ok=True)
+            self.persona_conn = sqlite3.connect(self.persona_db_path, check_same_thread=False, timeout=10)
+            migrate_sqlite(self.persona_conn)
+            self.persona_store = PersonaStore(self.persona_conn)
+            seed_nam_creta(self.persona_store)
+        return self.persona_store
 
     def personas(self):
+        repository = self.persona_repository()
+        fixtures = [dict(id=item["id"], name=item["display_name"], slug=item["slug"],
+                         source_kind=item["source_kind"], status=item["status"])
+                    for item in repository.list_personas()]
         if not os.environ.get("DB_Host"):
-            raise ValueError("Persona database is not configured")
-        import psycopg
-        from psycopg.rows import dict_row
-        with psycopg.connect(host=os.environ["DB_Host"], port=os.environ.get("DB_Port", "5432"),
-                             dbname="content_ai_fac", user=os.environ.get("DB_Username"),
-                             password=os.environ.get("DB_Password"), connect_timeout=5,
-                             options="-c default_transaction_read_only=on", row_factory=dict_row) as conn:
-            return [dict(row, id=str(row["id"])) for row in conn.execute(
-                "SELECT id,name,occupation,car_owned,category,role,tone,perspective,sample_quote "
-                "FROM public.personas ORDER BY name,id")]
+            return fixtures
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+            with psycopg.connect(host=os.environ["DB_Host"], port=os.environ.get("DB_Port", "5432"),
+                                 dbname="content_ai_fac", user=os.environ.get("DB_Username"),
+                                 password=os.environ.get("DB_Password"), connect_timeout=5,
+                                 options="-c default_transaction_read_only=on", row_factory=dict_row) as conn:
+                personas = [dict(row, id=str(row["id"])) for row in conn.execute(
+                    "SELECT id,name,occupation,car_owned,category,role,tone,perspective,sample_quote "
+                    "FROM public.personas ORDER BY name,id")]
+            return personas + fixtures
+        except Exception:
+            if fixtures:
+                return fixtures
+            raise
 
     def generate_post(self, persona, vehicle, _metrics=None):
         started = time.perf_counter()
@@ -130,6 +156,7 @@ class Sandbox:
     def create(self, data):
         actor = required_text(data, "actor_id", 200)
         persona = None
+        fixture_binding = None
         if data.get("persona_id"):
             persona_id = required_text(data, "persona_id", 50)
             persona = next((p for p in self.personas() if p["id"] == persona_id), None)
@@ -139,11 +166,19 @@ class Sandbox:
             if vehicle not in VEHICLES:
                 raise ValueError("vehicle must be one of the available sample vehicles")
             generation = {}
+            if persona.get("source_kind") == "fictional_fixture":
+                persona = {"id": persona_id, "name": persona["name"], "tone": "warm",
+                           "perspective": "người dùng Hyundai Creta trong kịch bản hư cấu"}
+                release = self.persona_repository().get_release_snapshot(persona_id)
+                fixture_binding = {"persona_uuid": persona_id, "release_id": release["release"]["id"]}
             post = {"id": uuid.uuid4().hex, "page_id": "sample-hyundai",
                     "title": f"Hyundai {vehicle} · {persona['name']}",
                     "text": self.generate_post(persona, vehicle, _metrics=generation), "vehicles": [vehicle],
                     "generation": generation,
                     "persona_id": persona_id, "persona_name": persona["name"]}
+            if fixture_binding:
+                post.update(release_id=fixture_binding["release_id"], persona_source_kind="fictional_fixture",
+                            persona_fixture_only=True)
         elif data.get("post_id"):
             post = next((dict(p) for p in POSTS if p["id"] == data["post_id"]), None)
             if post is None:
@@ -158,6 +193,8 @@ class Sandbox:
             post["vehicles"] = [v.strip() for v in vehicles]
         cid = uuid.uuid4().hex
         engine = make_engine(clock=WallClock(), facts=Facts(facts=[]), dealer_db_path=self.dealer_db_path)
+        engine.persona_store = self.persona_store
+        engine.allow_persona_fixtures = True
         engine.response_style = style_from_tone(persona.get("tone") if persona else None)
         conversation = dict(id=cid, page_id=post["page_id"], actor_id=actor, thread_id="root-" + cid,
                             post=post, engine=engine, history=[], counter=0, jev_shadows={})
@@ -165,9 +202,10 @@ class Sandbox:
                                         text=post["text"], title=post.get("title"),
                                         topic="vehicle", vehicles=post["vehicles"],
                                         persona_default=persona.get("persona_default", "tư vấn viên") if persona else "tư vấn viên")
-        root = self.event(conversation, post["text"], conversation["thread_id"])
-        root.update(actor_id="page-self:" + cid, actor_role="page_self", parent_id=None)
-        engine.process(root, conversation["postcard"], None)
+        if fixture_binding:
+            self.persona_repository().bind_post(post["page_id"], post["id"],
+                                         fixture_binding["persona_uuid"], fixture_binding["release_id"])
+            conversation["postcard"]["persona_binding"] = fixture_binding
         self.conversations[cid] = conversation
         return self.state(conversation)
 
@@ -175,12 +213,36 @@ class Sandbox:
     def event(conversation, text="", comment_id=None):
         return dict(page_id=conversation["page_id"], actor_id=conversation["actor_id"],
                     post_id=conversation["post"]["id"], thread_root_id=conversation["thread_id"],
-                    parent_id=conversation["thread_id"], comment_id=comment_id or "preview",
+                    parent_id=conversation.get("root_comment_id") or conversation["thread_id"],
+                    comment_id=comment_id or "preview",
                     actor_role="user", event_type="create", content_version=1, text=text)
+
+    def context(self, conversation, event):
+        engine = conversation["engine"]
+        store = getattr(self, "persona_store", None)
+        if store is None or not conversation.get("post", {}).get("release_id"):
+            return engine.context(event, conversation["postcard"])
+        root = store.root_analysis(conversation["page_id"], conversation["post"]["id"],
+                                   conversation["thread_id"])
+        messages = []
+        if root:
+            messages.append({"message_id": root["root_comment_id"],
+                "page_id": conversation["page_id"], "post_id": conversation["post"]["id"],
+                "thread_root_id": conversation["thread_id"], "parent_id": None,
+                "actor_id": root["root_actor_id"], "role": "root", "text": root["root_text"],
+                "event_time": root.get("created_at"), "semantic": root.get("semantic")})
+        return engine.context(event, conversation["postcard"], messages)
 
     def state(self, conversation):
         engine = conversation["engine"]
-        context = engine.context(self.event(conversation), conversation["postcard"])
+        context = self.context(conversation, self.event(conversation))
+        persona_release = None
+        if self.persona_store and conversation["post"].get("release_id"):
+            binding = self.persona_store.get_binding_snapshot(conversation["page_id"], conversation["post"]["id"])
+            if binding:
+                persona_release = {"persona": binding["snapshot"]["persona"],
+                    "release": binding["snapshot"]["release"], "fixture_only": binding["fixture_only"],
+                    "facts": binding["facts"], "utterances": binding["utterances"]}
         with engine.store.lock:
             outbox = [dict(dedupe_key=r[0], purpose=r[1], status=r[2]) for r in
                       engine.store.conn.execute("SELECT dedupe_key,purpose,status FROM outbox ORDER BY rowid")]
@@ -190,6 +252,7 @@ class Sandbox:
                     dealer_directory={"status": "unavailable" if engine.dealer_directory_error else "available",
                         "count": sum(1 for fact in engine.facts.facts
                                      if fact.get("source") == "local_dealer_directory")},
+                    persona_release=persona_release,
                     outbox=outbox, fake_sends=engine.sender.sent, sample_facts=False, simulated_send=True)
 
     def budget(self, inflight=0):
@@ -215,6 +278,11 @@ class Sandbox:
                    any(send.get("status") == "sent_to_fake_ledger" for send in turn.get("sends", [])
                        if isinstance(send, dict)) and
                    isinstance(turn.get("response_text"), str)][-5:]
+        if getattr(self, "persona_store", None) and conversation.get("post", {}).get("release_id"):
+            root = self.persona_store.root_analysis(conversation["page_id"], conversation["post"]["id"],
+                                                    conversation["thread_id"])
+            if root and root.get("reply_text"):
+                replies = [root["reply_text"], *replies][-5:]
         model_context = fmt_context({**context, "recent_bot_replies": replies},
                                     prior_customer_turns=customer_turns)
         jev_shadow_event_id = self.start_jev_shadow(conversation, f"{conversation['id']}-{conversation['counter']}",
@@ -406,7 +474,7 @@ class Sandbox:
         conversation["counter"] += 1
         event = self.event(conversation, text, f"{conversation['id']}-{conversation['counter']}")
         engine = conversation["engine"]
-        context = engine.context(event, conversation["postcard"])
+        context = self.context(conversation, event)
         engine_processed = False
         turn = dict(text=text, ok=False, semantic=None, routing=[], response_text=None,
                     sends=[], errors=[], attempts=0, cost_usd_est=0.0, cost_unknown=False,
@@ -484,9 +552,12 @@ class Sandbox:
                     turn.update(error="Model semantics failed validation", routing=["REVIEW_SCHEMA"])
                     continue
                 result = engine.process(event, conversation["postcard"], turn["semantic"],
-                                        expected_state_token=context["state_token"])
+                                        expected_state_token=context["state_token"],
+                                        trusted_context_messages=context["messages"])
                 engine_processed = not any(route.startswith("ERROR_") for route in result["routing"])
-                turn.update({k: result[k] for k in ("routing", "response_text", "sends", "errors", "outbound_permission", "state_changes")})
+                turn.update({k: result[k] for k in ("routing", "response_text", "sends", "errors",
+                    "outbound_permission", "state_changes") if k in result})
+                turn["response_plan"] = result.get("response_plan")
                 turn["dealer_maps"] = []
                 if result.get("outbound_permission") and "answer_dealer" in result["routing"]:
                     used = set((result.get("response_plan") or {}).get("facts_used") or [])
@@ -500,6 +571,23 @@ class Sandbox:
                             turn["dealer_maps"].append({"name": name, "url": f"https://www.google.com/maps/search/?{query}"})
                 turn["ok"] = not any(route.startswith(("REVIEW", "BLOCKED", "ERROR_")) for route in turn["routing"])
                 turn.pop("error", None)
+                if result.get("semantic") is not None and not conversation.get("root_comment_id"):
+                    conversation["root_comment_id"] = event["comment_id"]
+                    if getattr(self, "persona_store", None) and conversation["post"].get("release_id"):
+                        binding = self.persona_store.get_binding_snapshot(
+                            conversation["page_id"], conversation["post"]["id"])
+                        if binding:
+                            metadata = {"source_kind": binding.get("source_kind"),
+                                "release_checksum": binding.get("snapshot", {}).get("release", {}).get("checksum"),
+                                "fixture_only": bool(binding.get("fixture_only"))}
+                            self.persona_store.record_root_analysis(
+                                conversation["page_id"], conversation["post"]["id"], conversation["thread_id"],
+                                event["comment_id"], event["actor_id"], result["semantic"],
+                                turn.get("response_text") if turn.get("outbound_permission") else None,
+                                persona_snapshot=metadata, persona_id=binding["persona_id"],
+                                release_id=binding["release_id"], root_text=event["text"],
+                                tags=result.get("tags") or [], model_version=turn.get("model"),
+                                schema_version=result.get("semantic_version"), source_kind="sandbox")
                 break
         if not engine_processed:
             engine.process(event, conversation["postcard"], None)
@@ -558,7 +646,10 @@ class Handler(BaseHTTPRequestHandler):
                                  simulated_send=True))
         elif path == "/api/personas":
             try:
-                self.reply(200, {"personas": [{"id": p["id"], "name": p["name"]} for p in self.server.app.personas()],
+                self.reply(200, {"personas": [{"id": p["id"], "name": p["name"],
+                                                "slug": p.get("slug"),
+                                                "source_kind": p.get("source_kind"),
+                                                "status": p.get("status")} for p in self.server.app.personas()],
                                  "vehicles": list(VEHICLES)})
             except Exception:
                 self.reply(503, {"error": "Không tải được persona từ database. Kiểm tra cấu hình và kết nối."})

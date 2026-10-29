@@ -20,7 +20,9 @@
         <button type="submit" id="start">Tạo bài viết</button>
       </form>
       <label for="conversation-select">Hội thoại trong phiên này</label><select id="conversation-select"><option value="">Chưa có hội thoại</option></select>
-      <div class="post-preview"><h3>Bài viết hiện tại</h3><p id="post-preview">Chọn bài viết rồi tạo hội thoại.</p><p id="post-timing" class="muted"></p><p id="scope" class="muted"></p></div>
+      <div class="post-preview"><h3>Bài viết hiện tại</h3><p id="post-preview">Chọn bài viết rồi tạo hội thoại.</p><p id="post-timing" class="muted"></p><p id="scope" class="muted"></p>
+        <details id="persona-release-box" hidden><summary>Fact và câu được phép dùng cho persona</summary><p id="persona-release-note" class="muted"></p><ul id="persona-facts"></ul><ul id="persona-utterances"></ul></details>
+      </div>
     </section>
     <section class="chat panel" aria-labelledby="chat-title">
       <p class="eyebrow">02 · HỘI THOẠI</p><h2 id="chat-title">Bạn muốn hỏi gì?</h2>

@@ -67,6 +67,7 @@ services:
       DB_Username: ${DB_Username:-}
       DB_Password: ${DB_Password:-}
       SANDBOX_ENFORCE_BUDGET: ${SANDBOX_ENFORCE_BUDGET:-false}
+      SANDBOX_PERSONA_DB: /app/runs/persona_sandbox.sqlite3
     volumes:
       - ./runs:/app/runs
       - ./fact_db.sqlite3:/app/fact_db.sqlite3:ro

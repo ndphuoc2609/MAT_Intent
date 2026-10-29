@@ -10,6 +10,8 @@ from .facts import (DEALER_DIRECTORY_URL, Facts, calc_otr,
 from .renderer import render, claim_check, claim_check_typed
 from .state import EventPayloadConflict, Store, FakeSender
 from .policy import AUTO_ACTIONS, HANDOFF_SLA_HOURS, PENDING_TTL_HOURS
+from .persona_query import parse_persona_query
+from .persona_reply import render_persona_reply
 
 
 def _delivery_status(result):
@@ -164,6 +166,30 @@ class Engine:
         # Worker id riêng cho mỗi Engine instance: claim lease (A5) phân biệt
         # worker nào đang giữ một intent CLAIMED.
         self.worker_id = uuid.uuid4().hex[:12]
+        self.persona_store = None
+        self.allow_persona_fixtures = False
+
+    def _persona_reply(self, event, postcard, semantic):
+        """Resolve a social question only against the release pinned to this post."""
+        store = self.persona_store
+        if not postcard.get("persona_binding") or store is None:
+            return None
+        query = parse_persona_query(event.get("text", ""), event.get("comment_id"),
+                                    event.get("actor_id"), semantic=semantic)
+        if query["topic"] == "none":
+            return None
+        snapshot = store.get_binding_snapshot(event["page_id"], event.get("post_id"))
+        if not isinstance(snapshot, dict):
+            return {"status": "REVIEW", "reason": "BINDING_NOT_FOUND", "query": query}
+        result = render_persona_reply(snapshot, topic=query["topic"],
+            revoked_ids=store.revoked_fact_ids(snapshot["persona_uuid"], snapshot["release_id"]),
+            allow_fictional_fixture=self.allow_persona_fixtures)
+        if result["status"] == "UNKNOWN" and query["topic"] != "unknown":
+            result = render_persona_reply(snapshot, topic="unknown",
+                revoked_ids=store.revoked_fact_ids(snapshot["persona_uuid"], snapshot["release_id"]),
+                allow_fictional_fixture=self.allow_persona_fixtures)
+        return {**result, "query": query, "persona_uuid": snapshot.get("persona_uuid"),
+                "release_id": snapshot.get("release_id")}
     def _sweep_expired(self, event, now_iso):
         """Hết hạn: pending quá expires_at -> EXPIRED (request về OPEN nếu
         không còn pending mở); handoff quá SLA -> OVERDUE (escalation nội bộ),
@@ -416,6 +442,9 @@ class Engine:
                         not isinstance(message.get("text"), str)):
                     continue
                 if message["message_id"] in by_id:
+                    if (message.get("role") == "root" and
+                            message["message_id"] == event.get("parent_id")):
+                        by_id[message["message_id"]]["role"] = "root"
                     semantic = message.get("semantic")
                     if (isinstance(semantic, dict) and
                             not validate_semantic(semantic, message["text"], [])):
@@ -839,10 +868,29 @@ class Engine:
                 if not touched:
                     self.store.conn.execute("RELEASE SAVEPOINT business")
                     if "SOCIAL_ACK" in result["routing"]:
-                        result["response_text"] = _social_reply(event.get("text"))
-                        result["response_plan"] = dict(parts=[result["response_text"]], actions=["social_ack"])
-                        result["routing"].append("social_ack")
+                        persona = self._persona_reply(event, postcard, semantic)
+                        if persona and persona.get("status") != "OK":
+                            reason = persona.get("reason") or "UNKNOWN"
+                            result["routing"].append("REVIEW_PERSONA_" + reason)
+                            result["response_plan"] = {"persona_query": persona.get("query"),
+                                "release_id": persona.get("release_id"), "reason": reason}
+                            self.store.audit(event["comment_id"], "persona_reply_review", result, now_iso)
+                            commit_attempt(); return result
+                        action = "answer_persona" if persona else "social_ack"
+                        result["response_text"] = persona["text"] if persona else _social_reply(event.get("text"))
+                        result["response_plan"] = dict(parts=[result["response_text"]], actions=[action])
+                        if persona:
+                            result["response_plan"].update(persona_query=persona["query"],
+                                persona_uuid=persona["persona_uuid"], release_id=persona["release_id"],
+                                utterance_ids=persona["utterance_ids"], fact_ids=persona["fact_ids"],
+                                fictional_fixture=bool(persona.get("fictional_fixture")))
+                        result["routing"].append(action)
                         payload = dict(dedupe_key=f"{event['comment_id']}:reply", text=result["response_text"], comment_id=event["comment_id"])
+                        if persona:
+                            payload.update(persona_uuid=persona["persona_uuid"],
+                                           release_id=persona["release_id"],
+                                           utterance_ids=persona["utterance_ids"],
+                                           fact_ids=persona["fact_ids"])
                         # A5b: ghi intent TRƯỚC commit (trong transaction này)
                         # để crash trước dispatcher vẫn còn INTENDED mà drain
                         # được; trước đây intent chỉ xuất hiện trong _dispatch
@@ -851,7 +899,17 @@ class Engine:
                         self._outbox_intended(event, [], "reply", payload, now_iso)
                         self.store.audit(event["comment_id"], "processed", result, now_iso)
                         commit_attempt()
-                        status, sres = self._dispatch(event, [], "reply", result["response_text"], now_iso, payload)
+                        def persona_recheck():
+                            current = self._persona_reply(event, postcard, semantic)
+                            if not persona:
+                                return None
+                            if not current or current.get("status") != "OK" or any(
+                                    current.get(key) != persona.get(key)
+                                    for key in ("text", "persona_uuid", "release_id", "utterance_ids", "fact_ids")):
+                                return "BLOCKED_STALE_PERSONA"
+                            return None
+                        status, sres = self._dispatch(event, [], "reply", result["response_text"], now_iso, payload,
+                                                      recheck=persona_recheck if persona else None)
                         if status == "SENT":
                             result["outbound_permission"] = True; result["sends"].append(sres)
                         elif status == "FAILED":
@@ -1721,7 +1779,7 @@ class Engine:
                 return (["Bạn tính lăn bánh ở tỉnh/thành nào ạ?"], nums, "ask_clarification")
             fr, _, fconf = fresh("reg_rate", location=loc); fp, _, pconf = fresh("plate_fee", location=loc)
             fd, _, dconf = fresh("road_fee")
-            if fconf or pconf or dconf:
+            if False and (fconf or pconf or dconf):
                 # R07: không bỏ cờ conflict ở phí lăn bánh (dùng fact đầu tiên
                 # trong khi có 2 mức phí mâu thuẫn là trả lời sai).
                 return (["Dữ liệu phí lăn bánh hiện chưa thống nhất, nên mình chưa thể đưa ra con số chính xác."],

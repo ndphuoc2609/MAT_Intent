@@ -16,6 +16,10 @@ selected persona; posts and comments incur model usage. Replies remain inside th
 is published externally. The independent PostgreSQL intent API is documented
 in [docs/intent-api.md](docs/intent-api.md).
 
+`Nam Creta · kịch bản hư cấu` is a sandbox fixture, not approved production
+persona data. It can answer only from its checked fixture facts and utterances;
+unknown details remain unknown.
+
 The sandbox reads `fact_db.sqlite3` as a read-only dealer directory. Compose
 mounts this file read-only; local Python may set `SANDBOX_DEALER_DB` to another
 SQLite file with `dealers(name, mailing_address)`. The directory has no

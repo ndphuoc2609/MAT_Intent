@@ -29,7 +29,8 @@ class SandboxHTTPTests(unittest.TestCase):
         from sandbox.server import Sandbox
         self.tmp = tempfile.TemporaryDirectory()
         self.ledger = str(Path(self.tmp.name) / "budget.jsonl")
-        self.http = SimpleNamespace(app=Sandbox(ledger_path=self.ledger))
+        self.http = SimpleNamespace(app=Sandbox(ledger_path=self.ledger,
+            persona_db_path=str(Path(self.tmp.name) / "personas.sqlite3")))
         self.network = patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("network forbidden"))
         self.network.start()
 
@@ -38,6 +39,8 @@ class SandboxHTTPTests(unittest.TestCase):
         for conversation in self.http.app.conversations.values():
             conversation["engine"].store.conn.close()
             conversation["engine"].sender.receiver.conn.close()
+        if self.http.app.persona_conn:
+            self.http.app.persona_conn.close()
         self.tmp.cleanup()
 
     def request(self, method, path, payload=None, host="127.0.0.1:8766", origin=None):
@@ -350,6 +353,47 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertEqual(result["turn"]["usage"], {"prompt_tokens": 500, "completion_tokens": 100,
                                                      "total_tokens": 600})
         self.assertTrue(result["turn"]["usage_complete"])
+
+    def test_fictional_persona_release_answers_and_persists_root_semantic(self):
+        status, personas = self.request("GET", "/api/personas")
+        self.assertEqual(status, 200)
+        fixture = next(item for item in personas["personas"] if item["slug"] == "nam_creta")
+        with patch("sandbox.server.Sandbox.generate_post", return_value="Cùng trao đổi về Creta."):
+            state = self.conversation(post_id=None, persona_id=fixture["id"], vehicle="Creta")
+        self.assertTrue(state["persona_release"]["fixture_only"])
+        self.assertFalse(state["persona_release"]["release"]["approved"])
+
+        first_text = "Bạn ở đâu vậy?"
+        first_semantic = {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent",
+            "scope": "in_scope", "requests": [{"topic": "social", "desired_outcome": "ack",
+            "polarity": "positive"}], "operations": [{"op": "SOCIAL_ACK", "evidence_excerpt": first_text}],
+            "uncertainties": []}
+        with patch("sandbox.server.call_luna", return_value=model_result(first_semantic)):
+            _, first = self.turn(state, first_text)
+        self.assertEqual(first["turn"]["response_text"], "Mình ở Hà Nội.")
+        self.assertTrue(first["turn"]["response_plan"]["fictional_fixture"])
+        root_record = self.http.app.persona_store.root_analysis(
+            state["page_id"], state["post"]["id"], state["thread_id"])
+        self.assertEqual(root_record["root_text"], first_text)
+        self.assertEqual(root_record["root_actor_id"], "customer-1")
+        self.assertEqual(root_record["semantic"], first["turn"]["semantic"])
+        self.assertEqual(root_record["reply_text"], first["turn"]["response_text"])
+
+        second_text = "Bạn đang đi xe gì?"
+        captured = {}
+        def luna(_post, _text, **kwargs):
+            captured["context"] = json.loads(kwargs["context"])
+            semantic = dict(first_semantic)
+            semantic["operations"] = [{"op": "SOCIAL_ACK", "evidence_excerpt": second_text}]
+            return model_result(semantic)
+        with patch("sandbox.server.call_luna", side_effect=luna):
+            _, second = self.turn(first, second_text)
+        root = next(message for message in captured["context"]["messages"]
+                    if message.get("role") == "root")
+        self.assertEqual(root["text"], first_text)
+        self.assertEqual(root["actor_id"], "customer-1")
+        self.assertEqual(root["semantic"], first["turn"]["semantic"])
+        self.assertEqual(second["turn"]["response_text"], "Mình đang đi Hyundai Creta.", second["turn"])
 
     def test_persona_tone_changes_wording_without_changing_intent_or_pending(self):
         personas = [{"id": "warm", "name": "An", "tone": "thân thiện"},
@@ -810,7 +854,15 @@ class SandboxHTTPTests(unittest.TestCase):
         conversation = self.http.app.conversations[state["id"]]
         context = conversation["engine"].context(self.http.app.event(conversation), conversation["postcard"])
         self.assertEqual(context["recent"], [])
-        self.assertIn("Creta", context["parent_texts"][0])
+        self.assertEqual(context["parent_texts"], [])
+        self.assertEqual([message["role"] for message in context["messages"]], ["post", "current"])
+
+    def test_post_is_not_inserted_as_a_fake_root_comment(self):
+        state = self.conversation()
+        conversation = self.http.app.conversations[state["id"]]
+        rows = conversation["engine"].store.conn.execute(
+            "SELECT actor_id, comment_id, payload FROM events ORDER BY rowid").fetchall()
+        self.assertEqual(rows, [])
 
     def test_concurrent_sandbox_turns_are_not_blocked_by_spend_ledger(self):
         from scripts import budget_ledger

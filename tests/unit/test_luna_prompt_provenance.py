@@ -4,6 +4,12 @@ from app.adapters.luna import SYSTEM, SYSTEM_V2
 
 
 class LunaPromptProvenanceTests(unittest.TestCase):
+    def test_direct_questions_about_page_author_are_social_not_customer_slots(self):
+        for prompt in (SYSTEM, SYSTEM_V2):
+            with self.subTest(version="v2" if prompt is SYSTEM_V2 else "v1"):
+                self.assertIn("Bạn mua xe ở đại lý nào", prompt)
+                self.assertIn("không phải dữ kiện của khách", prompt)
+
     def test_both_versions_leave_inherited_slot_provenance_to_server(self):
         for prompt in (SYSTEM, SYSTEM_V2):
             with self.subTest(version="v2" if prompt is SYSTEM_V2 else "v1"):
