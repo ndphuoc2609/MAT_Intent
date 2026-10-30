@@ -20,6 +20,7 @@ SQLITE_MIGRATIONS = (
     (11, SQLITE_MIGRATION.with_name("011_persona_memory_reservations.sql")),
     (12, SQLITE_MIGRATION.with_name("012_persona_stories.sql")),
     (13, SQLITE_MIGRATION.with_name("013_customer_facts.sql")),
+    (14, SQLITE_MIGRATION.with_name("014_story_revisions.sql")),
 )
 SOURCE_KINDS = {"fictional_fixture", "user_provided", "official_source", "document", "other"}
 

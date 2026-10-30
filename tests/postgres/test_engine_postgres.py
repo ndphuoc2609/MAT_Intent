@@ -9,7 +9,6 @@ from app.engine import Engine, WallClock
 from app.facts import Facts
 from app.pg_adapter import connect, migrate
 from app.state import FakeSender
-from meta_services.runtime import CommentInbox
 from app.intent_api import IntentService
 
 
@@ -113,39 +112,47 @@ class PostgreSqlEngineTests(unittest.TestCase):
             expected_state_token=token)
         self.assertIn("REVIEW_STALE_CONTEXT", result["routing"])
 
-    def test_inbox_claim_lease_survives_worker_restart_and_expiry_reclaims_once(self):
-        worker_a = CommentInbox(self.a, lease_seconds=30)
-        worker_b = CommentInbox(self.b, lease_seconds=30)
-        event_id = "inbox-" + uuid.uuid4().hex
-        event = {"comment_id": event_id, "text": "hello"}
-        self.assertTrue(worker_a.enqueue(event))
-        barrier = threading.Barrier(2)
-        claimed = []
-        def run(worker):
-            barrier.wait(timeout=3)
-            claimed.append((worker, worker.claim()))
-        threads = [threading.Thread(target=run, args=(worker,)) for worker in (worker_a, worker_b)]
-        for thread in threads: thread.start()
-        for thread in threads: thread.join(10)
-        self.assertTrue(all(not thread.is_alive() for thread in threads))
-        leases = [(worker, item) for worker, item in claimed if item]
-        self.assertEqual(len(leases), 1)
-        old_worker, _ = leases[0]
-        # A newly constructed worker must leave the live lease owned by the old worker.
-        restarted = CommentInbox(connect(self.dsn), lease_seconds=30)
-        self.addCleanup(restarted.store.conn.close)
-        self.assertIsNone(restarted.claim())
-        self.a.conn.execute("UPDATE meta_inbox SET lease_until=? WHERE comment_id=?",
-            ("2000-01-01T00:00:00+00:00", event_id))
-        self.a.conn.commit()
-        reclaimer = CommentInbox(connect(self.dsn), lease_seconds=30)
-        self.addCleanup(reclaimer.store.conn.close)
-        reclaimed = reclaimer.claim()
-        self.assertIsNotNone(reclaimed)
-        self.assertEqual(reclaimed[0], event_id)
-        self.assertEqual(reclaimed[2], 2)
-        self.assertFalse(old_worker.finish(event_id, "DONE"))
-        self.assertTrue(reclaimer.finish(event_id, "DONE"))
+    def test_story_addendum_is_versioned_inside_api_style_transaction_guard(self):
+        from app.persona_fixture import seed_nam_creta
+        from app.persona_store import PersonaStore
+        from app.persona_stories import StoryStore
+        repo = PersonaStore(self.a)
+        persona_id, release_id = seed_nam_creta(repo)
+        nonce = uuid.uuid4().hex
+        page, post = "story-page-" + nonce, "story-post-" + nonce
+        repo.bind_post(page, post, persona_id, release_id)
+        snapshot = repo.get_binding_snapshot(page, post)
+        vehicle = next(f for f in snapshot["facts"] if f["key"] == "vehicle.current.model")
+        stories = StoryStore(repo)
+        original = {'proposal_id': 'story-v1', 'idempotency_key': nonce + '-story',
+            'persona_version': release_id, 'topic': 'travel_story',
+            'event': 'Mình đi Đà Lạt bằng Creta', 'time_start': '2025-04-01', 'time_end': None,
+            'entities': {'vehicle': 'Creta', 'location': 'Đà Lạt', 'people': []},
+            'base_fact_ids': [vehicle['fact_id']], 'new_details': [], 'relation': None,
+            'vehicle_use': 'owned'}
+        created = stories.propose(snapshot, original)
+        self.assertEqual(created['status'], 'ACCEPTED', created)
+        addition = dict(original, proposal_id='story-v2', idempotency_key=nonce + '-addendum',
+            new_details=['Trong chuyến đó xe bị ngập'],
+            relation={'type': 'addendum', 'memory_id': created['memory_id'], 'base_version': 1})
+
+        def read_guard(operation):
+            with self.a.lock:
+                return operation()
+
+        def mutation_guard(operation):
+            with self.a.lock, self.a.conn.raw.transaction():
+                return operation()
+
+        updated = stories.propose(snapshot, addition, judge=lambda *_: 'ADDENDUM',
+            read_guard=read_guard, mutation_guard=mutation_guard)
+        self.assertEqual(updated['status'], 'ADDENDUM', updated)
+        self.assertEqual(updated['memory_id'], created['memory_id'])
+        self.assertEqual(updated['memory']['version'], 2)
+        self.assertEqual(updated['memory']['new_details'], ['Trong chuyến đó xe bị ngập'])
+        self.assertEqual(repo.conn.execute(
+            'SELECT count(*) FROM persona_story_revisions WHERE memory_id=?',
+            (created['memory_id'],)).fetchone()[0], 1)
 
     def test_intent_api_postgres_persistence_duplicate_and_scope_isolation(self):
         from tests.unit.test_intent_api import request, semantic_for

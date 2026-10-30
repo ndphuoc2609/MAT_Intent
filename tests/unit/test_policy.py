@@ -45,7 +45,7 @@ class TestPolicyConsistency(unittest.TestCase):
         from app import pg_adapter
         from app.state import Store
         self.assertTrue(issubclass(pg_adapter.PostgresStore, Store))
-        self.assertEqual(pg_adapter.LATEST_VERSION, 13)
+        self.assertEqual(pg_adapter.LATEST_VERSION, 14)
 
 if __name__ == "__main__":
     unittest.main()

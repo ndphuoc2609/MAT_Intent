@@ -6,6 +6,7 @@ import json
 import math
 import re
 import time
+from datetime import date, datetime
 
 from .persona_turn import PERSONA_PREDICATES, persona_turn_model_schema, parse_persona_turn
 from .persona_fact_policy import NAMESPACES
@@ -39,21 +40,68 @@ def conversation_tool_schema():
         'topic': _nullable(_text()), 'query': _nullable(_text(500)), 'keys': _array(_text()),
         'entities': entity, 'time_start': _nullable(_text(10)), 'time_end': _nullable(_text(10)),
         'variant': _nullable(_text())})
-    relation = _obj({'type': {'enum': ['retell', 'addendum']}, 'memory_id': _text()})
+    relation = _obj({'type': {'enum': ['retell', 'addendum']}, 'memory_id': _text(),
+        'base_version': _nullable({'type': 'integer', 'minimum': 0})})
     proposal = _obj({'proposal_id': _text(), 'idempotency_key': _text(), 'persona_version': _text(),
         'topic': _text(), 'event': _text(1000), 'time_start': _nullable(_text(10)),
         'time_end': _nullable(_text(10)), 'entities': entity, 'base_fact_ids': _array(_text()),
-        'new_details': _array(_text(500)), 'relation': _nullable(relation)})
+        'new_details': _array(_text(500)), 'relation': _nullable(relation),
+        'vehicle_use': {'enum': ['owned', 'borrowed', 'test_drive', 'unknown']}})
     customer = _obj({'predicate': _text(), 'value': _text(500), 'evidence_excerpt': _text(500),
         'subject': {'enum': ['customer']}, 'certainty': {'enum': ['explicit', 'inferred', 'unknown']}})
+    intent = _obj({'kind': {'enum': ['persona_question', 'product_question', 'share_need',
+            'pending_answer', 'social', 'buying_interest', 'transaction', 'correction',
+            'decline', 'third_party', 'handoff', 'other']},
+        'subject': {'enum': ['customer', 'persona', 'third_party', 'unclear']},
+        'normalized': _text(240), 'evidence': _text(500),
+        'context_source': {'enum': ['current_comment', 'post', 'history', 'unclear']},
+        'certainty': {'enum': ['explicit', 'inferred', 'unknown']}})
+    plan = _obj({'intents': _array(intent, 12),
+        'priority_order': _array({'type': 'integer', 'minimum': 0, 'maximum': 11}, 12),
+        'unresolved': _array(_text(200), 8), 'objective': _text(240),
+        'next_action': {'enum': ['answer', 'ask', 'clarify', 'continue', 'stop', 'handoff']},
+        'question': _nullable(_text(240)), 'handoff_reason': _nullable(_text(160))})
     variants = []
     for action, payload in (
+            ('plan', plan),
             ('retrieve', retrieve), ('propose_memory', proposal),
             ('record_customer_facts', _obj({'facts': _array(customer, 8)})),
-            ('final', persona_turn_model_schema(persona_predicates=FINAL_PREDICATES)),
+            ('final', persona_turn_model_schema(persona_predicates=FINAL_PREDICATES, proposals=True)),
             ('abstain', _obj({'reason': _text(500)}))):
         variants.append(_obj({'action': {'enum': [action]}, 'payload': payload}))
     return _obj({'schema_version': {'enum': [VERSION]}, 'message': {'anyOf': variants}})
+
+
+def _valid_plan(value, current_text):
+    if not isinstance(value, dict) or set(value) != {'intents', 'priority_order', 'unresolved',
+            'objective', 'next_action', 'question', 'handoff_reason'}:
+        return False
+    intents, order = value['intents'], value['priority_order']
+    if (not isinstance(intents, list) or len(intents) > 12 or not isinstance(order, list)
+            or len(order) != len(set(order)) or any(type(i) is not int or i < 0 or i >= len(intents) for i in order)
+            or not isinstance(value['unresolved'], list) or len(value['unresolved']) > 8
+            or any(not isinstance(item, str) or not item.strip() for item in value['unresolved'])
+            or not isinstance(value['objective'], str) or not value['objective'].strip()):
+        return False
+    for item in intents:
+        if (not isinstance(item, dict) or set(item) != {'kind', 'subject', 'normalized', 'evidence',
+                'context_source', 'certainty'} or not isinstance(item['evidence'], str)
+                or not item['evidence'] or item['evidence'] not in current_text):
+            return False
+    action, question = value['next_action'], value['question']
+    if action in ('ask', 'clarify'):
+        if not isinstance(question, str) or not question.strip() or len(question) > 240 or question.count('?') > 1:
+            return False
+    elif question is not None:
+        return False
+    if action == 'handoff':
+        if (not isinstance(value['handoff_reason'], str) or not value['handoff_reason'].strip()
+                or not any(item['kind'] == 'handoff' and item['subject'] == 'customer'
+                    and item['certainty'] == 'explicit' for item in intents)):
+            return False
+    elif value['handoff_reason'] is not None:
+        return False
+    return True
 
 
 def _matches(value, schema):
@@ -90,6 +138,8 @@ def _matches(value, schema):
 
 
 def _public(value):
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
     if isinstance(value, dict):
         return {k: _public(v) for k, v in value.items()
                 if k not in ('source_ref', 'consent_ref', 'persona_uuid', 'release_id', 'scope')}
@@ -105,7 +155,7 @@ def orchestrate(context, model, tools, validate_final, *, budget_guard, max_roun
     provider result with ok/message/attempts/usage/cost_usd_est/cost_unknown.
     Tool callbacks receive only validated business payloads and return status objects.
     """
-    result = {'status': 'ABSTAIN', 'reason': None, 'final': None, 'trace': [], 'attempts': 0,
+    result = {'status': 'ABSTAIN', 'reason': None, 'final': None, 'plan': None, 'trace': [], 'attempts': 0,
               'usage': {}, 'cost_usd_est': 0.0, 'cost_unknown': False}
     if (not isinstance(context, dict) or not isinstance(context.get('scope'), dict)
             or any(not isinstance(context['scope'].get(k), str) or not context['scope'][k] for k in SCOPE)
@@ -130,6 +180,7 @@ def orchestrate(context, model, tools, validate_final, *, budget_guard, max_roun
     messages, searches = [], {}
     deadline = time.monotonic() + total_timeout
     tool_count = 0
+    conversation_plan = None
     for _ in range(max_rounds):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -171,19 +222,24 @@ def orchestrate(context, model, tools, validate_final, *, budget_guard, max_roun
             result['reason'] = 'INVALID_MODEL_MESSAGE'; break
         message = envelope['message']; action = message['action']; payload = message['payload']
         result['trace'].append({'action': action})
+        if conversation_plan is None and action not in ('plan', 'abstain'):
+            result['trace'][-1]['validation'] = 'PLAN_REQUIRED'
+            messages.extend([envelope, {'tool_result': {'status': 'REJECTED', 'reason': 'PLAN_REQUIRED'}}])
+            continue
         if action == 'abstain':
             result['reason'] = 'MODEL_ABSTAIN'; break
         if action == 'final':
             try:
-                turn = parse_persona_turn(payload, current_text=context['current_text'],
+                turn = parse_persona_turn(payload, current_text=context['current_text'], proposals=True,
                                           persona_predicates=FINAL_PREDICATES)
                 if turn['reply_candidate'] is None:
                     raise ValueError('invalid reply')
+                turn['conversation_plan'] = copy.deepcopy(conversation_plan)
                 validation = validate_final(turn)
             except Exception:
                 validation = {'status': 'REVIEW', 'reason': 'VALIDATION_ERROR'}
             if isinstance(validation, dict) and validation.get('status') == 'OK':
-                result.update(status='FINAL', reason=None, final=turn); return result
+                result.update(status='FINAL', reason=None, final=turn, plan=copy.deepcopy(conversation_plan)); return result
             reason = validation.get('reason', 'INVALID_FINAL') if isinstance(validation, dict) else 'INVALID_FINAL'
             result['trace'][-1]['validation'] = reason
             messages.extend([envelope, {'tool_result': {'status': 'REJECTED', 'reason': reason}}])
@@ -191,7 +247,15 @@ def orchestrate(context, model, tools, validate_final, *, budget_guard, max_roun
         if tool_count >= max_tool_calls:
             result['reason'] = 'TOOL_LIMIT'; break
         tool_count += 1
-        if action == 'propose_memory':
+        if action == 'plan':
+            if conversation_plan is not None or not _valid_plan(payload, context['current_text']):
+                answer = {'status': 'REJECTED', 'reason': 'INVALID_CONVERSATION_PLAN'}
+            else:
+                conversation_plan = copy.deepcopy(payload)
+                public_context['conversation_plan'] = copy.deepcopy(payload)
+                result['plan'] = copy.deepcopy(payload)
+                answer = {'status': 'ACCEPTED', 'intent_count': len(payload['intents'])}
+        elif action == 'propose_memory':
             if payload['persona_version'] != context['release_id']:
                 answer = {'status': 'CONFLICT', 'reason': 'PERSONA_VERSION_MISMATCH'}
             elif searches.get(payload['topic']) not in ('NOT_FOUND', 'FOUND'):

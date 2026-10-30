@@ -17,11 +17,11 @@ from .persona_fact_policy import validate_proposals, purchase_year
 from .persona_generation import allowed_generation_facts, _specific_entities
 
 _FIELDS = {'proposal_id', 'idempotency_key', 'persona_version', 'topic', 'event',
-           'time_start', 'time_end', 'entities', 'base_fact_ids', 'new_details', 'relation'}
+           'time_start', 'time_end', 'entities', 'base_fact_ids', 'new_details', 'relation', 'vehicle_use'}
 _ENTITIES = {'vehicle', 'location', 'people'}
 _COLUMNS = ('memory_id', 'persona_id', 'release_id', 'topic', 'event_text', 'time_start',
             'time_end', 'entities_json', 'base_fact_ids_json', 'new_details_json',
-            'relation_json', 'label', 'status')
+            'relation_json', 'label', 'status', 'vehicle_use')
 
 
 def _json(value):
@@ -36,6 +36,22 @@ def _date_bounds(value):
     if re.fullmatch(r'\d{4}', value):
         y = int(value)
         return date(y, 1, 1), date(y, 12, 31)
+    month = re.fullmatch(r'(\d{4})-(\d{2})', value)
+    if not month:
+        month = re.fullmatch(r'(\d{2})/(\d{4})', value)
+        if month:
+            y, m = int(month.group(2)), int(month.group(1))
+        else:
+            y = m = None
+    else:
+        y, m = int(month.group(1)), int(month.group(2))
+    if y is not None:
+        first = date(y, m, 1)
+        if m == 12:
+            last = date(y, 12, 31)
+        else:
+            last = date(y, m + 1, 1).fromordinal(date(y, m + 1, 1).toordinal() - 1)
+        return first, last
     parsed = date.fromisoformat(value)
     return parsed, parsed
 
@@ -48,7 +64,18 @@ def _story(row):
             'entities': json.loads(item['entities_json']), 'base_fact_ids': json.loads(item['base_fact_ids_json']),
             'new_details': json.loads(item['new_details_json']),
             'relation': json.loads(item['relation_json']) if item['relation_json'] else None,
+            'vehicle_use': item['vehicle_use'],
             'label': item['label'], 'status': item['status']}
+
+
+def canonical_story(story):
+    """Fields that define the event; delivery/UI metadata never changes this hash."""
+    return {key: story.get(key) for key in ('memory_id', 'persona_uuid', 'release_id', 'topic',
+        'event', 'time_start', 'time_end', 'entities', 'base_fact_ids', 'new_details', 'relation', 'vehicle_use')}
+
+
+def story_content_hash(story):
+    return hashlib.sha256(_json(canonical_story(story)).encode()).hexdigest()
 
 
 def _nonempty(value, maximum):
@@ -105,9 +132,30 @@ class StoryStore:
         return persona, release
 
     def _rows(self, persona_id):
-        return [_story(row) for row in self.conn.execute(
+        stories = [_story(row) for row in self.conn.execute(
             'SELECT ' + ','.join(_COLUMNS) + ' FROM persona_stories WHERE persona_id=? AND status=\'ACTIVE\' '
             'ORDER BY created_at,memory_id', (persona_id,)).fetchall()]
+        for story in stories:
+            self._attach_revisions(story)
+        return stories
+
+    def _attach_revisions(self, story):
+        rows = self.conn.execute('SELECT revision_id,version,base_version,revision_type,details_json,provenance_json,created_at '
+            'FROM persona_story_revisions WHERE memory_id=? ORDER BY version', (story['memory_id'],)).fetchall()
+        revisions, details = [], list(story['new_details'])
+        for row in rows:
+            revision = dict(revision_id=row[0], version=row[1], base_version=row[2],
+                revision_type=row[3], details=json.loads(row[4]), provenance=json.loads(row[5]), created_at=row[6])
+            revisions.append(revision)
+            if revision['revision_type'] == 'ADDENDUM':
+                for detail in revision['details']:
+                    if detail not in details:
+                        details.append(detail)
+        story['version'] = 1 + len(revisions)
+        story['new_details'] = details
+        story['revisions'] = revisions
+        story['content_hash'] = story_content_hash(story)
+        return story
 
     def get(self, snapshot, memory_id):
         try:
@@ -115,7 +163,7 @@ class StoryStore:
             row = self.conn.execute('SELECT ' + ','.join(_COLUMNS) +
                 " FROM persona_stories WHERE persona_id=? AND memory_id=? AND status='ACTIVE'",
                 (persona, memory_id)).fetchone()
-            return _story(row) if row else None
+            return self._attach_revisions(_story(row)) if row else None
         except Exception:
             return None
 
@@ -153,8 +201,12 @@ class StoryStore:
 
     def _validate(self, snapshot, p, customer_texts):
         persona, release = self._binding(snapshot)
-        if not isinstance(p, dict) or set(p) != _FIELDS:
+        required_fields = _FIELDS - {'vehicle_use'}
+        if not isinstance(p, dict) or not required_fields <= set(p) or set(p) - _FIELDS:
             raise ValueError('proposal shape')
+        p.setdefault('vehicle_use', 'unknown')
+        if p['vehicle_use'] not in ('owned', 'borrowed', 'test_drive', 'unknown'):
+            raise ValueError('invalid vehicle use')
         if (not _nonempty(p['proposal_id'], 100) or not _nonempty(p['idempotency_key'], 200)
                 or not _nonempty(p['topic'], 100) or not _nonempty(p['event'], 160)
                 or p['persona_version'] != release):
@@ -171,9 +223,13 @@ class StoryStore:
         if (start and start[0] > date.today()) or (end and end[0] > date.today()) or (end and not start) or (start and end and start[0] > end[1]):
             raise ValueError('invalid timeline')
         relation = p['relation']
-        if relation is not None and (not isinstance(relation, dict) or set(relation) != {'type', 'memory_id'}
+        if relation is not None and (not isinstance(relation, dict)
+                or set(relation) not in ({'type', 'memory_id'}, {'type', 'memory_id', 'base_version'})
                 or relation['type'] not in ('retell', 'addendum') or not _nonempty(relation['memory_id'], 200)):
             raise ValueError('invalid relation')
+        if relation and relation['type'] == 'addendum' and (
+                type(relation.get('base_version')) is not int or relation['base_version'] < 0 or not details):
+            raise ValueError('addendum needs base version and details')
         allowed = allowed_generation_facts(snapshot,
             revoked_ids=self.repo.revoked_fact_ids(persona, release), allow_fictional_fixture=True)
         facts = {x['fact_id']: x for x in allowed if not x.get('generated')}
@@ -188,10 +244,23 @@ class StoryStore:
                 return persona, release, 'AMBIGUOUS'
             if not any(f['fact_id'] in ids for f in vehicle_facts):
                 raise ValueError('vehicle needs a base fact')
-            year = purchase_year(list(facts.values()))
-            if year and start and start[1].year < year and any(f.get('key') == 'vehicle.current.model' for f in vehicle_facts) and not any(
-                    f.get('key') == 'vehicle.experience.model' and norm(vehicle) in norm(str(f.get('value'))) for f in facts.values()):
-                return persona, release, 'CONFLICT'
+            purchase = next((f for f in facts.values() if f.get('key') in
+                ('purchase.date', 'vehicle.current.usage_started_at')), None)
+            purchase_bounds = None
+            if purchase:
+                try: purchase_bounds = _date_bounds(str(purchase.get('value')))
+                except (ValueError, TypeError): pass
+            if purchase_bounds and start and start[1] < purchase_bounds[0]:
+                experience = any(f.get('key') == 'vehicle.experience.model'
+                    and norm(vehicle) in norm(str(f.get('value'))) for f in facts.values())
+                use = p.get('vehicle_use', 'unknown')
+                if use == 'owned':
+                    return persona, release, 'CONFLICT'
+                if use not in ('borrowed', 'test_drive') or not experience:
+                    return persona, release, 'AMBIGUOUS'
+            elif purchase_bounds and start and start[0] <= purchase_bounds[1] and start[1] >= purchase_bounds[0]:
+                if p.get('vehicle_use', 'unknown') == 'owned':
+                    return persona, release, 'AMBIGUOUS'
         for i, value in enumerate([p['event'], *details]):
             if re.search(r'\b(?:vo|chong|bo|me|con trai|con gai|con minh|anh trai|chi gai|gia dinh|nguoi than|ban be)\b', norm(value)):
                 return persona, release, 'REJECTED'
@@ -210,7 +279,18 @@ class StoryStore:
         overlap = _overlap(proposal['time_start'], proposal['time_end'], old['time_start'], old['time_end'])
         relation = proposal['relation']
         explicitly_same = bool(relation and relation['memory_id'] == old['memory_id'])
-        if explicitly_same and (_entity_conflict(proposal['entities'], old['entities']) or overlap is False):
+        if explicitly_same and _entity_conflict(proposal['entities'], old['entities']):
+            return 'CONFLICT'
+        if explicitly_same and relation['type'] == 'addendum':
+            if relation.get('base_version') != old.get('version'):
+                return 'CONFLICT'
+            if proposal['time_start'] and old['time_start'] and proposal['time_start'] != old['time_start']:
+                return 'AMBIGUOUS'
+            if judge is None:
+                return 'AMBIGUOUS'
+            verdict = judge(proposal, old)
+            return 'ADDENDUM' if verdict == 'ADDENDUM' else verdict
+        if explicitly_same and overlap is False:
             return 'CONFLICT'
         if explicitly_same and relation['type'] == 'retell':
             known_entities = [key for key in ('vehicle', 'location')
@@ -224,22 +304,18 @@ class StoryStore:
                     and proposal['new_details'] == old['new_details']):
                 return 'SAME'
             return 'AMBIGUOUS'
-        if overlap is False and not explicitly_same:
-            return 'DIFFERENT'
         if _entity_conflict(proposal['entities'], old['entities']):
-            return 'AMBIGUOUS'
+            return 'CONFLICT' if explicitly_same else 'AMBIGUOUS'
         if proposal['new_details'] and proposal['new_details'] != old['new_details']:
             return 'AMBIGUOUS'
         if norm(proposal['event']) == norm(old['event']) and proposal['new_details'] == old['new_details']:
             return 'SAME'
-        if relation and relation['type'] == 'addendum':
-            return 'AMBIGUOUS'
         if judge is None:
             return 'AMBIGUOUS'
         verdict = judge(proposal, old)
         if verdict not in ('SAME', 'DIFFERENT', 'CONFLICT', 'AMBIGUOUS'):
             raise ValueError('semantic judge unavailable')
-        if verdict == 'DIFFERENT' and (overlap is not False):
+        if verdict == 'DIFFERENT' and overlap is not False:
             return 'AMBIGUOUS'
         if verdict == 'SAME':
             # shortcut: distinct wording requires matching known time and entities, upgrade with structured event identities.
@@ -248,17 +324,24 @@ class StoryStore:
                 return 'AMBIGUOUS'
         return verdict
 
-    def propose(self, snapshot, proposal, *, customer_texts=(), judge=None):
+    def propose(self, snapshot, proposal, *, customer_texts=(), judge=None,
+                read_guard=None, mutation_guard=None):
         try:
-            persona, release, reject = self._validate(snapshot, proposal, customer_texts)
+            if ((read_guard is not None and not callable(read_guard)) or
+                    (mutation_guard is not None and not callable(mutation_guard))):
+                raise ValueError('invalid mutation guard')
+            guarded_read = read_guard or (lambda operation: operation())
+            persona, release, reject = guarded_read(
+                lambda: self._validate(snapshot, proposal, customer_texts))
             request_hash = hashlib.sha256(_json(proposal).encode()).hexdigest()
             key = proposal['idempotency_key']
+            retry = object()
             for _ in range(3):
-                existing = self.conn.execute('SELECT request_hash,result_json FROM persona_story_requests WHERE persona_id=? AND idempotency_key=?', (persona, key)).fetchone()
+                existing, version, rows = guarded_read(lambda: (
+                    self.conn.execute('SELECT request_hash,result_json FROM persona_story_requests WHERE persona_id=? AND idempotency_key=?',
+                        (persona, key)).fetchone(), self._version(persona), self._rows(persona)))
                 if existing:
                     return json.loads(existing[1]) if existing[0] == request_hash else {'status': 'CONFLICT', 'reason': 'IDEMPOTENCY_KEY_REUSED'}
-                version = self._version(persona)
-                rows = self._rows(persona)
                 decision, target = reject, None
                 if not decision:
                     relation = proposal['relation']
@@ -266,36 +349,61 @@ class StoryStore:
                         decision = 'CONFLICT'
                     for old in rows:
                         if decision: break
+                        if relation and old['memory_id'] != relation['memory_id']:
+                            continue
                         comparison = self._compare(proposal, old, judge)
-                        if comparison == 'SAME': decision, target = 'EXISTING', old
+                        if comparison == 'ADDENDUM': decision, target = 'ADDENDUM', old
+                        elif comparison == 'SAME': decision, target = 'EXISTING', old
                         elif comparison in ('AMBIGUOUS', 'CONFLICT'): decision = comparison
-                with self.repo._atomic():
-                    self._lock(persona)
-                    if not self.repo.sqlite:
-                        for fact_id in sorted(proposal['base_fact_ids']):
-                            self.conn.execute('SELECT fact_id FROM persona_facts WHERE fact_id=? FOR UPDATE', (fact_id,)).fetchone()
-                    existing = self.conn.execute('SELECT request_hash,result_json FROM persona_story_requests WHERE persona_id=? AND idempotency_key=?', (persona, key)).fetchone()
-                    if existing:
-                        return json.loads(existing[1]) if existing[0] == request_hash else {'status': 'CONFLICT', 'reason': 'IDEMPOTENCY_KEY_REUSED'}
-                    if self._version(persona) != version:
-                        continue
-                    _, _, latest_reject = self._validate(snapshot, proposal, customer_texts)
-                    if latest_reject:
-                        decision, target = latest_reject, None
-                    if decision is None:
-                        mid, now = str(uuid.uuid4()), datetime.now(timezone.utc).isoformat()
-                        self.conn.execute('INSERT INTO persona_stories(memory_id,persona_id,release_id,topic,event_text,time_start,time_end,entities_json,base_fact_ids_json,new_details_json,relation_json,label,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,\'fictional_generated\',\'ACTIVE\',?)',
-                            (mid, persona, release, proposal['topic'], proposal['event'], proposal['time_start'], proposal['time_end'],
-                             _json(proposal['entities']), _json(proposal['base_fact_ids']), _json(proposal['new_details']),
-                             _json(proposal['relation']) if proposal['relation'] else None, now))
-                        self.conn.execute('UPDATE persona_story_versions SET version=version+1 WHERE persona_id=?', (persona,))
-                        target = self.get(snapshot, mid)
-                        decision = 'ACCEPTED'
-                    result = {'status': decision, 'memory_id': target['memory_id'] if target else None,
-                              'memory': target, 'version': self._version(persona)}
-                    self.conn.execute('INSERT INTO persona_story_requests(persona_id,idempotency_key,request_hash,result_json) VALUES (?,?,?,?)',
-                        (persona, key, request_hash, _json(result)))
-                    return result
+                def commit():
+                    nonlocal decision, target
+                    with self.repo._atomic():
+                        self._lock(persona)
+                        if not self.repo.sqlite:
+                            for fact_id in sorted(proposal['base_fact_ids']):
+                                self.conn.execute('SELECT fact_id FROM persona_facts WHERE fact_id=? FOR UPDATE', (fact_id,)).fetchone()
+                        existing = self.conn.execute('SELECT request_hash,result_json FROM persona_story_requests WHERE persona_id=? AND idempotency_key=?', (persona, key)).fetchone()
+                        if existing:
+                            return json.loads(existing[1]) if existing[0] == request_hash else {'status': 'CONFLICT', 'reason': 'IDEMPOTENCY_KEY_REUSED'}
+                        if self._version(persona) != version:
+                            return retry
+                        _, _, latest_reject = self._validate(snapshot, proposal, customer_texts)
+                        if latest_reject:
+                            decision, target = latest_reject, None
+                        if decision == 'ADDENDUM':
+                            current = self.get(snapshot, target['memory_id'])
+                            if not current or current.get('version') != proposal['relation'].get('base_version'):
+                                return retry
+                            revision_id = str(uuid.uuid4())
+                            now = datetime.now(timezone.utc).isoformat()
+                            next_version = current['version'] + 1
+                            details = list(dict.fromkeys(proposal['new_details']))
+                            self.conn.execute('INSERT INTO persona_story_revisions(revision_id,memory_id,version,base_version,revision_type,details_json,provenance_json,created_at) VALUES (?,?,?,?,?,?,?,?)',
+                                (revision_id, current['memory_id'], next_version, current['version'], 'ADDENDUM',
+                                 _json(details), _json({'proposal_id': proposal['proposal_id'],
+                                 'idempotency_key': key, 'base_fact_ids': proposal['base_fact_ids'],
+                                 'event': proposal['event']}), now))
+                            self.conn.execute('UPDATE persona_story_versions SET version=version+1 WHERE persona_id=?', (persona,))
+                            target = self.get(snapshot, current['memory_id'])
+                        elif decision is None:
+                            mid, now = str(uuid.uuid4()), datetime.now(timezone.utc).isoformat()
+                            self.conn.execute('INSERT INTO persona_stories(memory_id,persona_id,release_id,topic,event_text,time_start,time_end,entities_json,base_fact_ids_json,new_details_json,relation_json,label,status,created_at,vehicle_use) VALUES (?,?,?,?,?,?,?,?,?,?,?,\'fictional_generated\',\'ACTIVE\',?,?)',
+                                (mid, persona, release, proposal['topic'], proposal['event'], proposal['time_start'], proposal['time_end'],
+                                 _json(proposal['entities']), _json(proposal['base_fact_ids']), _json(proposal['new_details']),
+                                 _json(proposal['relation']) if proposal['relation'] else None, now, proposal['vehicle_use']))
+                            self.conn.execute('UPDATE persona_story_versions SET version=version+1 WHERE persona_id=?', (persona,))
+                            target = self.get(snapshot, mid)
+                            decision = 'ACCEPTED'
+                        result = {'status': decision, 'memory_id': target['memory_id'] if target else None,
+                                  'memory': target, 'version': self._version(persona)}
+                        self.conn.execute('INSERT INTO persona_story_requests(persona_id,idempotency_key,request_hash,result_json) VALUES (?,?,?,?)',
+                            (persona, key, request_hash, _json(result)))
+                        return result
+
+                result = mutation_guard(commit) if mutation_guard else commit()
+                if result is retry:
+                    continue
+                return result
             return {'status': 'AMBIGUOUS', 'reason': 'VERSION_CHANGED'}
         except ValueError as exc:
             return {'status': 'REJECTED', 'reason': str(exc)}

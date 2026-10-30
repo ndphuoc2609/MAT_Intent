@@ -1,6 +1,7 @@
 import hashlib
 import json
 import unittest
+from datetime import datetime, timezone
 
 from app.persona_generation import (
     allowed_generation_facts,
@@ -58,7 +59,7 @@ def claim(text="Mình đang đi Hyundai Creta.", *, subject="persona",
 
 
 def candidate(text="Mình đang đi Hyundai Creta.", *, claims=None, fact_ids=None,
-              memory_ids=None, asks_question=False, question=None):
+              memory_ids=None, asks_question=False, question=None, product_claims=None):
     claims = [claim(text)] if claims is None else claims
     return {
         "reply_text": text,
@@ -67,6 +68,7 @@ def candidate(text="Mình đang đi Hyundai Creta.", *, claims=None, fact_ids=No
         "memory_ids": sorted({value for item in claims for value in item["memory_ids"]})
         if memory_ids is None else memory_ids,
         "claims": claims,
+        "product_claims": [] if product_claims is None else product_claims,
         "asks_question": asks_question,
         "question": question,
     }
@@ -80,6 +82,32 @@ def memory_checksum(memory):
 
 
 class PersonaGenerationTests(unittest.TestCase):
+    def test_product_claim_requires_matching_fresh_non_sample_fact(self):
+        now = datetime(2026, 10, 30, 5, tzinfo=timezone.utc)
+        product = {"id": "official-creta-standard-price", "type": "list_price",
+            "vehicle": "Creta", "variant": "Tiêu chuẩn", "location": None,
+            "value": 599_000_000, "unit": "VND", "source": "dealer_feed",
+            "valid_from": "2026-10-01", "valid_to": "2026-12-31", "ttl_hours": 8760,
+            "verified_at": now, "version": 3}
+        text = "Giá Creta Tiêu chuẩn là 599 triệu đồng."
+        product_claim = {"text": text, "product_fact_id": product["id"],
+            "product_type": "list_price", "effective_at": product["valid_from"],
+            "vehicle": "Creta", "variant": "Tiêu chuẩn", "location": None}
+        value = candidate(text, claims=[], product_claims=[product_claim])
+        result = validate_generated_reply(value, snapshot(), product_facts=[product],
+            product_verified_at=now, now=now)
+        self.assertEqual(result["status"], "OK", result)
+        self.assertEqual(result["manifest"]["product_fact_ids"], [product["id"]])
+
+        stale = dict(product, valid_to="2026-10-29")
+        wrong_vehicle = dict(product, vehicle="Tucson")
+        wrong_source = dict(product, source="SAMPLE")
+        for changed in (stale, wrong_vehicle, wrong_source):
+            with self.subTest(changed=changed):
+                result = validate_generated_reply(value, snapshot(), product_facts=[changed],
+                    product_verified_at=now, now=now)
+                self.assertEqual(result["status"], "REVIEW")
+
     def test_validate_generated_post_accepts_grounded_content_with_one_question(self):
         from app.persona_generation import validate_generated_post
 

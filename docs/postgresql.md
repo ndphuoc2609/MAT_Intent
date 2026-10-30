@@ -1,8 +1,8 @@
 # PostgreSQL state backend
 
-Meta, the intent API, the event harness, and the sandbox use the shared engine
-state operations on PostgreSQL via `META_DATABASE_URL`, `MAT_INTENT_DATABASE_URL`,
-and `SANDBOX_DATABASE_URL` (each falls back to `DB_NEON` in Compose). Runtime
+The intent API, event harness, and sandbox use shared engine state operations
+on PostgreSQL via `MAT_INTENT_DATABASE_URL` and `SANDBOX_DATABASE_URL` (each
+falls back to `DB_NEON` in Compose). Runtime
 services do not fall back to SQLite; SQLite remains available to isolated tests.
 PostgreSQL changes are applied only by the explicit migration command; starting
 a service never migrates a database.

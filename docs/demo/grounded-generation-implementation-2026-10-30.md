@@ -1,6 +1,6 @@
 # Grounded persona generation — triển khai và đo kiểm
 
-Ngày 30/10/2026 · Nhánh `codex/grounded-persona-20261030`. Không reset, commit hay gộp các thay đổi đang có. Hội thoại chạy qua `FakeSender`; không gửi Meta.
+Ngày 30/10/2026 · Nhánh `codex/grounded-persona-20261030`. Hội thoại chạy qua `FakeSender` trong sandbox.
 
 ## Hành vi đã triển khai
 
@@ -10,7 +10,7 @@ Ngày 30/10/2026 · Nhánh `codex/grounded-persona-20261030`. Không reset, comm
 - Fact mới nằm ngoài release/checksum, gắn `generated`, có trạng thái PENDING/ACTIVE/DISCARDED/REVOKED và thời hạn PENDING 30 phút. Proposal thành ACTIVE sau FakeSender xác nhận SENT; bị chặn hoặc gửi lỗi thì DISCARD. Có giới hạn hai proposal/lượt, hai mươi/ngày/persona và nút thu hồi trong sandbox.
 - Lời đáp phải trích đúng proposal ID ở `reply.fact_ids` và claim. `proposal.value` phải xuất hiện nguyên văn; fact có trong cùng câu cũng phải có claim riêng. Kiểm tra chỉ bảo đảm nhất quán nội bộ, không chứng minh câu chuyện có thật.
 - Bài do chính persona viết được dùng làm bằng chứng cho chính các fact IDs gắn với bài. Validator chặn câu đáp mâu thuẫn với bài. Nội dung khách và bài của người khác vẫn không phải nguồn xác nhận fact persona.
-- Sandbox tự gửi nội dung hợp lệ qua FakeSender, không có duyệt nháp. Cổng Meta `META_OUTBOUND_ENABLED` là cấu hình riêng, mặc định tắt. UI hiển thị intent/confidence, fact đã cấp, proposals/status và lý do từ chối; generated facts có nhãn và nút thu hồi.
+- Sandbox tự gửi nội dung hợp lệ qua FakeSender, không có duyệt nháp. UI hiển thị intent/confidence, fact đã cấp, proposals/status và lý do từ chối; generated facts có nhãn và nút thu hồi.
 - Caller semantic-only cũ vẫn giữ tương thích khi không bật chế độ hai pha. Không thêm `send_lead` vào `AUTO_ACTIONS`.
 
 ## Sáu hội thoại mẫu chạy với Luna thật
@@ -63,8 +63,8 @@ Artifacts chỉ ở `/tmp`: `/tmp/persona-legacy-current.json` và `/tmp/persona
 
 - Không có `MAT_INTENT_PERSONA_TEST_DSN`, nên PostgreSQL migration chưa được chạy trên DB test thật trong lượt này. SQLite migration đã được kiểm tra.
 - Không có transcript khách thật hoặc chấm mù bởi người; số liệu A/B đo routing/gate, không chứng minh hội thoại tự nhiên hơn.
-- Generated story là nội dung tổng hợp, có thể sai sự thật dù qua kiểm tra. Auto-send hiện chỉ tới FakeSender. Nếu sau này bật Meta thật, cần hiểu rằng fact do Luna tạo có thể bị gửi ra ngoài như lời persona; hiện cổng Meta vẫn tắt.
-- Không kiểm thử tải production, Meta Graph API hoặc chi phí Jev shadow.
+- Generated story là nội dung tổng hợp, có thể sai sự thật dù qua kiểm tra. Auto-send hiện chỉ tới FakeSender.
+- Không kiểm thử tải production hoặc chi phí Jev shadow.
 
 ## Bổ sung sau lỗi tạo bài
 

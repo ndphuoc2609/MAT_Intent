@@ -31,7 +31,7 @@ class StoryTests(unittest.TestCase):
         return {'proposal_id': 'new1', 'idempotency_key': key, 'persona_version': self.release,
             'topic': 'chuyến đi', 'event': event, 'time_start': '2025-04-01', 'time_end': None,
             'entities': {'vehicle': 'Creta', 'location': 'Đà Lạt', 'people': []},
-            'base_fact_ids': [self.vehicle], 'new_details': [], 'relation': None}
+            'vehicle_use': 'owned', 'base_fact_ids': [self.vehicle], 'new_details': [], 'relation': None}
 
     def test_commit_before_use_idempotency_and_revoke(self):
         p = self.proposal()
@@ -59,6 +59,79 @@ class StoryTests(unittest.TestCase):
         uncertain = self.proposal('uncertain', 'Mình tới Đà Lạt cuối tuần')
         uncertain['time_start'] = None
         self.assertEqual(self.stories.propose(self.snap, uncertain, judge=lambda *_: 'SAME')['status'], 'AMBIGUOUS')
+
+    def test_semantic_story_proposal_commits_through_caller_mutation_guard(self):
+        original = self.stories.propose(self.snap, self.proposal())
+        seen = []
+
+        def read_guard(operation):
+            seen.append('read-start')
+            result = operation()
+            seen.append('read-end')
+            return result
+
+        def mutation_guard(operation):
+            seen.append('commit')
+            return operation()
+
+        def judge(*_):
+            seen.append('judge')
+            return 'SAME'
+
+        result = self.stories.propose(self.snap,
+            self.proposal('guarded-retell', 'Mình lái Creta tới Đà Lạt'),
+            judge=judge, read_guard=read_guard, mutation_guard=mutation_guard)
+
+        self.assertEqual(result['status'], 'EXISTING', result)
+        self.assertEqual(result['memory_id'], original['memory_id'])
+        self.assertEqual(seen, ['read-start', 'read-end', 'read-start', 'read-end', 'judge', 'commit'])
+
+    def test_addendum_appends_revision_and_reuses_event_id(self):
+        original = self.stories.propose(self.snap, self.proposal())
+        self.assertEqual(original['status'], 'ACCEPTED', original)
+        addition = self.proposal('addendum')
+        addition['new_details'] = ['Trong chuyến đó xe bị ngập']
+        addition['relation'] = {'type': 'addendum', 'memory_id': original['memory_id'], 'base_version': 1}
+        result = self.stories.propose(self.snap, addition, judge=lambda *_: 'ADDENDUM')
+        self.assertEqual(result['status'], 'ADDENDUM', result)
+        self.assertEqual(result['memory_id'], original['memory_id'])
+        self.assertEqual(result['memory']['version'], 2)
+        self.assertIn('Trong chuyến đó xe bị ngập', result['memory']['new_details'])
+        self.assertEqual(len(result['memory']['revisions']), 1)
+        self.assertEqual(result['memory']['revisions'][0]['base_version'], 1)
+        self.assertEqual(self.stories.get(self.snap, original['memory_id'])['version'], 2)
+
+    def test_stale_or_conflicting_addendum_does_not_change_canonical_story(self):
+        original = self.stories.propose(self.snap, self.proposal())
+        addition = self.proposal('stale')
+        addition['new_details'] = ['Xe bị ngập']
+        addition['relation'] = {'type': 'addendum', 'memory_id': original['memory_id'], 'base_version': 0}
+        self.assertEqual(self.stories.propose(self.snap, addition, judge=lambda *_: 'ADDENDUM')['status'], 'CONFLICT')
+        addition['idempotency_key'] = 'conflicting'
+        addition['relation']['base_version'] = 1
+        self.assertEqual(self.stories.propose(self.snap, addition, judge=lambda *_: 'CONFLICT')['status'], 'CONFLICT')
+        current = self.stories.get(self.snap, original['memory_id'])
+        self.assertEqual(current['version'], 1)
+        self.assertEqual(current['new_details'], [])
+
+    def test_story_claim_rejects_unsaved_clause_and_accepts_saved_addendum(self):
+        from app.persona_runtime import _story_claim_compatible
+        story = self.stories.propose(self.snap, self.proposal())['memory']
+        text = 'Mình đi Đà Lạt bằng Creta bị ngập.'
+        self.assertFalse(_story_claim_compatible(text, story))
+        story['new_details'] = ['Trong chuyến đó xe bị ngập']
+        self.assertTrue(_story_claim_compatible(text, story))
+
+    def test_purchase_month_rejects_owned_event_before_purchase_month(self):
+        proposal = self.proposal()
+        proposal['time_start'] = '2024-01-01'
+        self.assertEqual(self.stories.propose(self.snap, proposal)['status'], 'CONFLICT')
+
+    def test_pre_purchase_test_drive_without_evidence_is_ambiguous(self):
+        proposal = self.proposal()
+        proposal['time_start'] = '2024-01-01'
+        proposal['vehicle_use'] = 'test_drive'
+        self.assertEqual(self.stories.propose(self.snap, proposal)['status'], 'AMBIGUOUS')
 
     def test_explicit_retell_reuses_story_when_known_time_and_entities_match(self):
         first = self.stories.propose(self.snap, self.proposal())

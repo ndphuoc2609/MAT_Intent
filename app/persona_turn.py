@@ -57,6 +57,14 @@ def persona_turn_model_schema(persona_predicates=None, *, proposals=False):
     reply_properties = {
         "reply_text": text(600), "fact_ids": identifiers, "memory_ids": identifiers,
         "claims": {"type": "array", "maxItems": 20, "items": claim},
+        "product_claims": {"type": "array", "maxItems": 12, "items": {"type": "object",
+            "properties": {"text": text(600), "product_fact_id": text(200),
+                "product_type": {"enum": ["list_price", "promo", "stock", "spec", "warranty", "dealer"]},
+                "effective_at": text(40), "vehicle": {"anyOf": [text(100), {"type": "null"}]},
+                "variant": {"anyOf": [text(100), {"type": "null"}]},
+                "location": {"anyOf": [text(100), {"type": "null"}]}},
+            "required": ["text", "product_fact_id", "product_type", "effective_at", "vehicle", "variant", "location"],
+            "additionalProperties": False}},
         "asks_question": {"type": "boolean"},
         "question": {"anyOf": [{"type": "object", "properties": {
             "kind": {"enum": list(QUESTION_KINDS)},
@@ -76,7 +84,7 @@ def persona_turn_model_schema(persona_predicates=None, *, proposals=False):
             }, "required": ["proposal_id", "namespace", "slug", "value", "precision"],
             "additionalProperties": False}}
     reply = {"type": "object", "properties": reply_properties,
-        "required": ["reply_text", "fact_ids", "memory_ids", "claims", "asks_question", "question"] +
+        "required": ["reply_text", "fact_ids", "memory_ids", "claims", "product_claims", "asks_question", "question"] +
                    (["fact_proposals"] if proposals else []),
         "additionalProperties": False}
     diagnostics = {"type": "object", "properties": {
@@ -151,7 +159,7 @@ def _unique_strings(value):
 
 
 def _valid_reply(value, *, proposals=False, persona_predicates=None):
-    expected = {"reply_text", "fact_ids", "memory_ids", "claims", "asks_question", "question"}
+    expected = {"reply_text", "fact_ids", "memory_ids", "claims", "product_claims", "asks_question", "question"}
     if proposals:
         expected.add("fact_proposals")
     if not isinstance(value, dict) or set(value) != expected:
@@ -182,6 +190,19 @@ def _valid_reply(value, *, proposals=False, persona_predicates=None):
                     for p in proposal_rows)):
             return False
     fact_ids, memory_ids = set(), set()
+    product_claims = value.get('product_claims')
+    if not isinstance(product_claims, list) or len(product_claims) > 12:
+        return False
+    for claim in product_claims:
+        if (not isinstance(claim, dict) or set(claim) != {'text', 'product_fact_id', 'product_type',
+                'effective_at', 'vehicle', 'variant', 'location'}
+                or not isinstance(claim['text'], str) or not claim['text'] or claim['text'] not in text
+                or not isinstance(claim['product_fact_id'], str) or not claim['product_fact_id'].strip()
+                or claim['product_type'] not in ('list_price', 'promo', 'stock', 'spec', 'warranty', 'dealer')
+                or not isinstance(claim['effective_at'], str) or not claim['effective_at'].strip()
+                or any(claim[key] is not None and not isinstance(claim[key], str)
+                       for key in ('vehicle', 'variant', 'location'))):
+            return False
     allowed_persona_predicates = set(persona_predicates or PERSONA_PREDICATES) | {
         f"gen.{namespace}" for namespace in NAMESPACES
     }
@@ -303,6 +324,8 @@ def parse_persona_turn(envelope: Any, *, current_text="", evidence_texts=None,
     evidence = ([current_text] if evidence_texts is None else
                 (list(evidence_texts) if isinstance(evidence_texts, (list, tuple)) else []) + [current_text])
     reply = envelope.get("reply")
+    if isinstance(reply, dict) and 'product_claims' not in reply:
+        reply = dict(reply, product_claims=[])
     diagnostics = envelope.get("diagnostics")
     peer = envelope.get("peer_interpretation")
     result = {

@@ -156,8 +156,10 @@ Nếu người bình luận hỏi bạn có phải AI/bot không, không phủ n
 Hãy trả lời đúng câu minh bạch sau: "Đây là trợ lý AI hỗ trợ trả lời theo hồ sơ của người viết." Không nhận mình là người thật. Không
 tự bịa cảm xúc, sở thích hay trải nghiệm cá nhân mới.
 Không giả làm người thật, không thêm độ trễ để tạo cảm giác có người đang gõ. Trong kênh public,
-không hỏi số điện thoại, địa chỉ nhà hoặc thông tin liên hệ riêng. Không báo giá, tồn kho, ưu đãi,
-nhận cọc, xác nhận giao dịch/lịch hẹn hoặc hứa sẽ liên hệ.
+không hỏi số điện thoại, địa chỉ nhà hoặc thông tin liên hệ riêng. Chỉ trả lời giá, tồn kho, ưu đãi,
+thông số, bảo hành hoặc đại lý khi product facts đã được engine truy xuất; mỗi mệnh đề sản phẩm phải
+có product_claims trỏ đúng product_fact_id, product_type, effective_at và xe/phiên bản/địa điểm nếu có.
+Không nhận cọc, xác nhận giao dịch/lịch hẹn hoặc hứa sẽ liên hệ.
 diagnostics.intent_confidence là tự đánh giá chưa hiệu chuẩn, không phải xác suất đúng; ghi evidence
 đúng nguồn comment/context. Mỗi intent đã chọn có một mục, confidence có thể null.
 """
@@ -527,17 +529,34 @@ def call_luna_tool(context, transcript, schema, timeout, *, budget_guard, model=
         return {'ok': False, 'error_code': 'MODEL_INPUT_INVALID', 'attempts': 0,
                 'cost_usd_est': 0.0, 'cost_unknown': False, 'usage': {}}
     instruction = ("Bạn trả JSON conversation_tools_v1 đúng schema. Đọc bình luận và ngữ cảnh, "
-        "gọi retrieve để lấy thông tin trước khi viết. Chỉ đề xuất ký ức sau khi truy xuất NOT_FOUND; "
-        "không tự tạo dữ kiện sản phẩm hay thông tin nhạy cảm. Dữ kiện khách cần evidence nguyên văn "
+        "Lượt đầu tiên bắt buộc gọi action plan, tách mọi ý trong bình luận theo chủ thể/evidence và chọn thứ tự xử lý. "
+        "Sau đó mới gọi công cụ hoặc final. Trả lời câu hỏi trực tiếp trước khi gợi mở. "
+        "gọi retrieve để lấy thông tin trước khi viết. Product facts chỉ được dùng sau retrieve FOUND; "
+        "chỉ đề xuất ký ức sau khi truy xuất persona_memory NOT_FOUND; không tự tạo dữ kiện sản phẩm "
+        "hay thông tin nhạy cảm. Dữ kiện khách cần evidence nguyên văn "
         "đúng người nói; lưu fact trước khi dùng. Tôn trọng opt-out, không ép mua hoặc hỏi lại dữ kiện "
         "đã có. Trả lời đúng câu hỏi trước; tối đa một câu hỏi có ý nghĩa. Ký ức mới phải được chấp nhận "
         "và trích memory_id trước khi kể. Khi được hỏi về AI, trả lời minh bạch. "
-        "Final phải gồm semantic v2 và persona_turn_v1 với claims có nguồn; dùng abstain khi không đủ dữ liệu.")
+        "Final phải gồm semantic v2 và persona_turn_v1 với claims có nguồn; khi persona fact được phép tạo còn thiếu, "
+        "chỉ khai báo qua reply.fact_proposals và cite new1/new2; tuyệt đối không tạo product fact. "
+        "Dùng abstain khi dữ liệu UNKNOWN hoặc không thể trả lời an toàn.")
+    schema_name = context.get('_schema_name', 'conversation_tools_v1')
+    if context.get('_task') == 'story_comparison':
+        instruction = ("Bạn là bộ so sánh sự kiện. Chỉ xét hai mô tả và dữ kiện cấu trúc được cung cấp. "
+            "Trả verdict SAME nếu cùng một sự kiện; ADDENDUM nếu bổ sung tương thích cho cùng sự kiện; "
+            "DIFFERENT khi đủ căn cứ là sự kiện riêng; CONFLICT khi mâu thuẫn; AMBIGUOUS khi thiếu căn cứ. "
+            "Không dùng cùng địa điểm/xe làm bằng chứng đủ để kết luận cùng chuyện. Không suy đoán thời gian hoặc người. "
+            "Chỉ trả đúng JSON schema.")
+    else:
+        instruction += (" 'Đang cân nhắc/muốn mua một chiếc' là buying_interest, không phải giao dịch: tiếp tục hỏi chuyện phù hợp; "
+            "chỉ handoff khi khách yêu cầu nhân viên, đặt cọc, thanh toán hoặc xác nhận giao dịch rõ ràng. "
+            "Không gán lời hỏi hộ cho người nói; không đánh dấu câu hỏi chờ đã trả lời nếu khách chuyển sang ý khác. "
+            "Nếu khách muốn dừng, chọn stop và không gợi hỏi tiếp.")
     body = {'model': model, 'messages': [{'role': 'system', 'content': instruction},
         {'role': 'user', 'content': json.dumps({'context': context, 'exchanges': transcript},
                                                ensure_ascii=False, separators=(',', ':'))}],
         'max_tokens': max_tokens, 'response_format': {'type': 'json_schema',
-            'json_schema': {'name': 'conversation_tools_v1', 'strict': True, 'schema': schema}},
+            'json_schema': {'name': schema_name, 'strict': True, 'schema': schema}},
         'provider': {'require_parameters': True}}
     request = urllib.request.Request('https://openrouter.ai/api/v1/chat/completions',
         data=json.dumps(body).encode('utf-8'), method='POST',

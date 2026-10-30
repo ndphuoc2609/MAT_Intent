@@ -506,7 +506,7 @@ class IntentService:
                 model_context = fmt_context(snapshot)
                 if inference_attempt == 0 and not self.model_led_enabled:
                     self._start_jev_shadow(request, event, model_context)
-                generation_context = reply_candidate = peer_signals = None
+                generation_context = reply_candidate = peer_signals = conversation_plan = None
                 if self.model_led_enabled:
                     event['generation_mode'] = 'generated'
                     outcome = self._call_model_led(request, postcard, event, snapshot, attempt_token)
@@ -514,10 +514,12 @@ class IntentService:
                     generation_context = outcome.get('generation_context')
                     reply_candidate = final.get('reply_candidate')
                     peer_signals = final.get('peer_signals')
+                    conversation_plan = final.get('conversation_plan') or outcome.get('plan')
                     model_trace = {'prompt_version': 'conversation_tools_v1',
                         'attempts': outcome.get('attempts'), 'usage': outcome.get('usage', {}),
                         'cost_usd': outcome.get('cost_usd_est'),
                         'cost_unknown': outcome.get('cost_unknown', True),
+                        'conversation_plan': conversation_plan,
                         'tool_trace': outcome.get('trace', [])}
                     if outcome.get('status') != 'FINAL' or not isinstance(generation_context, dict) or not isinstance(reply_candidate, dict):
                         reason = outcome.get('reason') or 'INVALID_FINAL'
@@ -592,7 +594,7 @@ class IntentService:
                         "text": request["post"]["text"], "actor_id": request["page_id"], "role": "post",
                         "vehicles": request["post"]["vehicles"]}},
                     reply_candidate=reply_candidate, generation_context=generation_context,
-                    peer_signals=peer_signals)
+                    peer_signals=peer_signals, conversation_plan=conversation_plan)
                 if "REVIEW_STALE_CONTEXT" not in engine_result.get("routing", []):
                     break
                 if inference_attempt == 2:

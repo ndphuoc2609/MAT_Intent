@@ -119,7 +119,7 @@ class Sandbox:
 
     def generate_post(self, persona, snapshot, _metrics=None, owner_id=None):
         from app.persona_fact_policy import purchase_year, select_facts, validate_proposals
-        from app.persona_generation import allowed_generation_facts, validate_generated_post
+        from app.persona_generation import allowed_generation_facts
         from app.persona_query import KEY_REGISTRY
 
         started = time.perf_counter()
@@ -199,10 +199,6 @@ class Sandbox:
                            "source_kind": snapshot["persona"].get("source_kind")}
         repository = self.persona_repository()
 
-        def discard_pending():
-            with repository._atomic():
-                repository.discard_generated(owner_id, datetime.now(timezone.utc).isoformat())
-
         revoked = repository.revoked_fact_ids(persona_id, release_id)
         scoped_snapshot = repository.attach_generated(scoped_snapshot)
         facts = allowed_generation_facts(scoped_snapshot, revoked_ids=revoked,
@@ -236,81 +232,69 @@ class Sandbox:
                 "Sửa đúng lỗi này. Mỗi claim dùng predicate đúng key của fact được trích; "
                 "chỉ dùng gen.<namespace> khi fact_id là proposal_id new1/new2. "
                 "fact_ids cấp bài phải bằng hợp các fact_ids trong claims.")
+
+        def record_proposals(candidate):
+            proposals = candidate.get("fact_proposals", [])
+            refs = set(candidate.get("fact_ids", []))
+            for claim in candidate.get("claims", []):
+                refs.update(claim.get("fact_ids", []))
+            live = repository.live_generated_keys(persona_id)
+            created_today = repository.generated_created_today(
+                persona_id, datetime.now(timezone.utc).date().isoformat())
+            proposal_ids, proposal_results, seen_ids = {}, [], set()
+            if not isinstance(proposals, list) or len(proposals) > 2:
+                raise ValueError("Số fact proposal của bài vượt giới hạn.")
+            for proposal in proposals:
+                proposal_id = proposal.get("proposal_id") if isinstance(proposal, dict) else None
+                if proposal_id in seen_ids:
+                    proposal_results.append({"proposal_id": proposal_id, "status": "REJECTED",
+                                             "reason": "GENERATED_FACT_SHAPE"})
+                    continue
+                seen_ids.add(proposal_id)
+                accepted, reason = validate_proposals([proposal], live_keys=live,
+                    created_today=created_today, anchors={"purchase_year": purchase_year(facts)},
+                    source_text=[])
+                if reason or proposal_id not in refs:
+                    reason = reason or "GENERATED_FACT_UNREFERENCED"
+                    proposal_results.append({"proposal_id": proposal_id, "status": "REJECTED",
+                                             "reason": reason})
+                    continue
+                item = accepted[0]
+                try:
+                    fact_id = repository.propose_generated(persona_id, item["key"], item["value"],
+                        item["precision"], f"luna_generated_post:{owner_id.removeprefix('post:')}",
+                        owner_id, datetime.now(timezone.utc).isoformat())
+                except Exception:
+                    proposal_results.append({"proposal_id": proposal_id, "key": item["key"],
+                        "status": "REJECTED", "reason": "GENERATED_FACT_EXISTS" if item["key"] in live
+                        else "GENERATED_FACT_STORAGE_FAILED"})
+                    continue
+                live.add(item["key"]); created_today += 1; proposal_ids[proposal_id] = fact_id
+                proposal_results.append({"proposal_id": proposal_id, "fact_id": fact_id,
+                    "key": item["key"], "status": "PENDING", "reason": None})
+            rejected_ids = {item.get("proposal_id") for item in proposal_results
+                            if item["status"] == "REJECTED"}
+            candidate = dict(candidate,
+                fact_ids=[proposal_ids.get(fid, fid) for fid in candidate["fact_ids"]
+                          if fid not in rejected_ids],
+                claims=[dict(claim, fact_ids=[proposal_ids.get(fid, fid) for fid in claim["fact_ids"]
+                                               if fid not in rejected_ids])
+                        for claim in candidate["claims"]])
+            return candidate, proposal_results, proposal_ids
+
         candidate = generated.get("post_candidate") if generated.get("ok") else None
-        if not isinstance(candidate, dict):
+        if isinstance(candidate, dict):
+            candidate, proposal_results, proposal_ids = record_proposals(candidate)
+        else:
             reason = generated.get("error") or generated.get("error_code") or "MODEL_ERROR"
             metrics_update(generation_validation={"status": "REVIEW", "reason": "POST_GENERATION_FAILED",
                 "model_error_code": generated.get("error_code"), "model_error": reason})
             raise ValueError(f"Luna chưa tạo được bài viết có cấu trúc và đủ nguồn ({reason}).")
 
-        proposals = candidate.get("fact_proposals", [])
-        refs = set(candidate.get("fact_ids", []))
-        for claim in candidate.get("claims", []):
-            refs.update(claim.get("fact_ids", []))
-        live, created_today = repository.live_generated_keys(persona_id), repository.generated_created_today(
-            persona_id, datetime.now(timezone.utc).date().isoformat())
-        proposal_ids, proposal_results = {}, []
-        seen_ids = set()
-        if not isinstance(proposals, list) or len(proposals) > 2:
-            raise ValueError("Số fact proposal của bài vượt giới hạn.")
-        for proposal in proposals:
-            proposal_id = proposal.get("proposal_id") if isinstance(proposal, dict) else None
-            if proposal_id in seen_ids:
-                proposal_results.append({"proposal_id": proposal_id, "status": "REJECTED",
-                                         "reason": "GENERATED_FACT_SHAPE"})
-                continue
-            seen_ids.add(proposal_id)
-            accepted, reason = validate_proposals([proposal], live_keys=live,
-                created_today=created_today, anchors={"purchase_year": purchase_year(facts)},
-                source_text=[])
-            if reason or proposal_id not in refs:
-                reason = reason or "GENERATED_FACT_UNREFERENCED"
-                proposal_results.append({"proposal_id": proposal_id, "status": "REJECTED", "reason": reason})
-                continue
-            item = accepted[0]
-            try:
-                fact_id = repository.propose_generated(persona_id, item["key"], item["value"],
-                    item["precision"], f"luna_generated_post:{owner_id.removeprefix('post:')}",
-                    owner_id, datetime.now(timezone.utc).isoformat())
-            except Exception:
-                proposal_results.append({"proposal_id": proposal_id, "key": item["key"],
-                    "status": "REJECTED", "reason": "GENERATED_FACT_EXISTS" if item["key"] in live
-                    else "GENERATED_FACT_STORAGE_FAILED"})
-                continue
-            live.add(item["key"]); created_today += 1; proposal_ids[proposal_id] = fact_id
-            proposal_results.append({"proposal_id": proposal_id, "fact_id": fact_id,
-                "key": item["key"], "status": "PENDING", "reason": None})
-        candidate = dict(candidate, fact_ids=[proposal_ids.get(fid, fid) for fid in candidate["fact_ids"]],
-            claims=[dict(claim, fact_ids=[proposal_ids.get(fid, fid) for fid in claim["fact_ids"]])
-                    for claim in candidate["claims"]])
-        authored = {key: value for key, value in candidate.items() if key != "fact_proposals"}
-        authored.update(memory_ids=[], asks_question=False, question=None)
-        if any(item["status"] == "REJECTED" and item.get("proposal_id") in refs for item in proposal_results):
-            discard_pending()
-            metrics_update(proposal_results=proposal_results, generated_fact_ids=[],
-                generation_validation={"status": "REVIEW", "reason": "POST_FACT_PROPOSAL_REJECTED"})
-            raise ValueError("Fact mới của bài không vượt qua kiểm tra; bài chưa được tạo.")
-        try:
-            scoped_snapshot = repository.attach_generated(scoped_snapshot, owner_id)
-            authored_ids = set(authored["fact_ids"])
-            scoped_snapshot["persona_authored_post"] = {"text": candidate["post_text"],
-                "fact_ids": sorted(authored_ids), "persona_uuid": persona_id, "release_id": release_id}
-            validation = validate_generated_post(authored, scoped_snapshot,
-                revoked_ids=repository.revoked_fact_ids(persona_id, release_id),
-                allow_fictional_fixture=True, channel="public")
-        except Exception:
-            discard_pending()
-            raise
-        if validation.get("status") != "OK":
-            discard_pending()
-            metrics_update(proposal_results=[dict(item, status="DISCARDED", reason="POST_" +
-                str(validation.get("reason"))) if item["status"] == "PENDING" else item
-                for item in proposal_results], generated_fact_ids=[],
-                generation_validation={"status": "REVIEW", "reason": validation.get("reason")})
-            raise ValueError("Bài viết chưa vượt qua kiểm tra dữ kiện.")
-        metrics_update(post_candidate=candidate, fact_ids=validation.get("fact_ids", []),
+        metrics_update(post_candidate=candidate, fact_ids=candidate.get("fact_ids", []),
             generated_fact_ids=sorted(proposal_ids.values()), proposal_results=proposal_results,
-            generation_validation={"status": "OK", "reason": None}, needs=needs, gaps=gaps,
+            generation_validation={"status": "SKIPPED", "reason": "POST_CONTENT_VALIDATION_DISABLED"},
+            needs=needs, gaps=gaps,
             facts_supplied=[{key: fact.get(key) for key in
                 ("fact_id", "key", "value", "precision", "source_kind") if key in fact} for fact in selected])
         return candidate["post_text"].strip()
@@ -630,7 +614,7 @@ class Sandbox:
             model_effective=latest.get("model_effective", MODEL),
             jev_shadow_event_id=latest.get("jev_shadow_event_id"),
             phase_calls=[Sandbox._persona_call_trace(phase, result) for phase, result in calls])
-        for key in ("semantic", "reply_candidate", "diagnostics", "peer_signals", "needs",
+        for key in ("semantic", "reply_candidate", "diagnostics", "peer_signals", "needs", "conversation_plan",
                     "generation_context", "phase_errors", "error", "error_code", "finish_reason"):
             if key in values:
                 combined[key] = values[key]
@@ -675,6 +659,7 @@ class Sandbox:
         final = outcome.get('final') or {}
         values = dict(semantic=final.get('semantic'), reply_candidate=final.get('reply_candidate'),
             peer_signals=final.get('peer_signals'), diagnostics=final.get('diagnostics'),
+            conversation_plan=final.get('conversation_plan') or outcome.get('plan'),
             generation_context=outcome.get('generation_context'),
             phase_errors=[] if outcome.get('status') == 'FINAL' else
                 [{'phase': 'tool_loop', 'error': outcome.get('reason')}])
@@ -1042,11 +1027,12 @@ class Sandbox:
                 if generation_context is not None:
                     process_args.update(reply_candidate=api.get("reply_candidate"),
                                         generation_context=generation_context,
-                                        peer_signals=api.get("peer_signals"))
+                                        peer_signals=api.get("peer_signals"),
+                                        conversation_plan=api.get("conversation_plan"))
                 result = engine.process(event, conversation["postcard"], turn["semantic"], **process_args)
                 engine_processed = not any(route.startswith("ERROR_") for route in result["routing"])
                 turn.update({k: result[k] for k in ("routing", "response_text", "candidate_text", "sends", "errors",
-                    "outbound_permission", "state_changes", "proposal_results") if k in result})
+                    "outbound_permission", "state_changes", "proposal_results", "conversation_plan") if k in result})
                 turn["response_plan"] = result.get("response_plan")
                 for key in ("response_kind", "generation_validation"):
                     if key in result:

@@ -281,6 +281,7 @@ function render(state) {
     }
     details.append(textNode('pre', JSON.stringify({semantic: turn.semantic, diagnostics: turn.diagnostics,
       peer_signals: turn.peer_signals, needs: turn.persona_needs, gaps: turn.persona_gaps,
+      conversation_plan: turn.conversation_plan, tool_trace: turn.tool_trace,
       supplied_facts: turn.persona_facts_supplied, proposals: turn.proposal_results,
       phase_errors: turn.phase_errors, error: turn.error, errors: turn.errors,
       model_calls: turn.model_calls}, null, 2)));

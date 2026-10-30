@@ -9,6 +9,7 @@ import json
 import re
 import uuid
 import copy
+from datetime import datetime
 from contextlib import contextmanager
 
 from .lead_flow import address, FIELDS
@@ -18,54 +19,29 @@ SCOPE = ('page_id', 'post_id', 'thread_root_id', 'actor_id')
 
 
 def _story_claim_compatible(text, story):
-    """Accept a conservative paraphrase without changing stored story facts."""
+    """Allow paraphrases whose event-bearing words are all in the canonical event."""
     if not isinstance(text, str) or not isinstance(story.get('event'), str):
         return False
-    source, reply = norm(story['event']), norm(text)
+    source_text = ' '.join([story['event'], *(story.get('new_details') or [])])
+    source, reply = norm(source_text), norm(text)
     if source == reply:
         return True
-    if re.search(r'[.!?;,]\s+\S', text.strip()[:-1]):
-        return False
-    # shortcut: lexical checks cannot prove entailment; reject added emotion, cause or excess detail.
-    from .persona_generation import _CAUSE_RE, _EMOTION_RE, _FAMILY_RE, _SPOUSE_OPINION_RE
-    for pattern in (_CAUSE_RE, _EMOTION_RE, _FAMILY_RE, _SPOUSE_OPINION_RE):
-        if pattern.search(reply) and not pattern.search(source):
-            return False
-    entity_tokens = set()
-    for key in ('vehicle', 'location'):
-        value = story.get('entities', {}).get(key)
-        if not value:
-            continue
-        aliases = {norm(value)}
-        if key == 'vehicle' and norm(value).startswith('hyundai '):
-            aliases.add(norm(value).removeprefix('hyundai '))
-        if not any(re.search(r'(?<!\w)' + re.escape(alias) + r'(?!\w)', reply) for alias in aliases):
-            return False
-        entity_tokens.update(token for alias in aliases for token in alias.split())
+    for value in (story.get('entities') or {}).values():
+        if isinstance(value, str): source += ' ' + norm(value)
+    stop = {'minh','toi','ban','anh','chi','em','bac','co','chu','la','cua','voi','va','nhung',
+        'thi','ma','da','se','rat','mot','nhieu','nay','do','kia','nhe','a','ha','bang','tren',
+        'duoi','o','den','tu','chiec','xe','chuyen','do','nay','khi','khoang','ve','thoi'}
+    equivalence = {'lai': 'di', 'chay': 'di', 'ghe': 'di', 'den': 'di', 'toi': 'di',
+                   'du lich': 'di', 'len': 'di'}
+    def atoms(value):
+        words = [word for word in re.findall(r'\w+', value) if word not in stop and len(word) > 1]
+        return {equivalence.get(word, word) for word in words}
+    source_atoms, reply_atoms = atoms(source), atoms(reply)
     number = re.compile(r'(?<!\w)\d+(?:[.,/]\d+)*(?!\w)')
-    if set(number.findall(reply)) - set(number.findall(source)):
-        return False
-    negation = re.compile(r'\b(?:khong|chua|chang|bao gio khong|never)\b')
-    if bool(negation.search(source)) != bool(negation.search(reply)):
-        return False
-    stop = {'minh', 'toi', 'ban', 'anh', 'chi', 'em', 'bac', 'co', 'chu', 'la', 'cua',
-            'voi', 'va', 'nhung', 'thi', 'ma', 'da', 'se', 'rat', 'mot', 'nhieu',
-            'nay', 'do', 'kia', 'nhe', 'a', 'ha', 'bang', 'tren', 'duoi', 'o', 'den', 'tu'}
-    words = lambda value: {word for word in re.findall(r'\w+', value)
-                           if len(word) > 2 and word not in stop and word not in entity_tokens}
-    source_words, reply_words = words(source), words(reply)
-    overlap = source_words & reply_words
-    travel_verbs = {'di', 'den', 'toi', 'ghe', 'tham', 'lai', 'chay', 'du lich'}
-    source_verbs = {verb for verb in travel_verbs if re.search(r'(?<!\w)' + re.escape(verb) + r'(?!\w)', source)}
-    reply_verbs = {verb for verb in travel_verbs if re.search(r'(?<!\w)' + re.escape(verb) + r'(?!\w)', reply)}
-    verb_overlap = bool(source_verbs & reply_verbs or
-                        source_verbs & {'di', 'den', 'toi', 'ghe', 'tham', 'lai', 'chay', 'du lich'}
-                        and reply_verbs & {'di', 'den', 'toi', 'ghe', 'tham', 'lai', 'chay', 'du lich'})
-    extra = reply_words - source_words
-    if verb_overlap:
-        extra -= {'di', 'den', 'toi', 'ghe', 'tham', 'lai', 'chay', 'du', 'lich'}
-    return (bool(overlap or verb_overlap) and len(extra) <= 1 and
-            (not source_words or len(overlap) / len(source_words) >= 0.4 or verb_overlap))
+    negation = {'khong', 'chua', 'chang', 'never'}
+    return (bool(reply_atoms & source_atoms) and reply_atoms <= source_atoms
+        and not (set(number.findall(reply)) - set(number.findall(source)))
+        and bool(reply_atoms & negation) == bool(source_atoms & negation))
 
 
 def digest(value):
@@ -194,7 +170,10 @@ class PersonaGenerationRuntime:
         facts, memories = list(snapshot.get('facts', [])), list(snapshot.get('memories', []))
         for memory_id in sorted(ids):
             story = repository.get(snapshot, memory_id)
-            if (not isinstance(story, dict) or story != by_id[memory_id]
+            from .persona_stories import story_content_hash
+            supplied_hash = by_id[memory_id].get('content_hash')
+            if (not isinstance(story, dict) or
+                    (supplied_hash is not None and supplied_hash != story_content_hash(story))
                     or story.get('status') != 'ACTIVE' or story.get('label') != 'fictional_generated'
                     or story.get('persona_uuid') != snapshot.get('persona_uuid')
                     or story.get('release_id') != snapshot.get('release_id')
@@ -455,8 +434,20 @@ class PersonaGenerationRuntime:
             now = self.clock.now()
             rejected_reason = None
             initial_live = self.persona_store.live_generated_keys(snapshot['persona_uuid'])
+            same_comment_pending = {row['fact_key']: row for row in
+                self.persona_store.generated_rows(snapshot['persona_uuid'], event['comment_id'])
+                if row.get('status') == 'PENDING' and
+                row.get('source_ref') == f"luna_generated:{event['comment_id']}"}
+            retry_keys = {f"gen.{item.get('namespace')}.{item.get('slug')}": item
+                for item in proposals if isinstance(item, dict)}
+            retry_matches = {key for key, row in same_comment_pending.items()
+                if (item := retry_keys.get(key)) is not None
+                and item.get('value') == row.get('value_text')
+                and item.get('precision') == row.get('precision')}
+            initial_live.difference_update(retry_matches)
             created_today = self.persona_store.generated_created_today(
                 snapshot['persona_uuid'], now.date().isoformat())
+            created_today = max(0, created_today - len(retry_matches))
             if not isinstance(proposals, list) or len(proposals) > 2:
                 rejected_reason = 'GENERATED_FACT_LIMIT'
             seen_proposal_ids = set()
@@ -484,15 +475,23 @@ class PersonaGenerationRuntime:
                         proposal_results.append(dict(proposal_id=pid, key=key, status='REJECTED',
                                                      reason='GENERATED_FACT_UNREFERENCED'))
                         continue
-                    try:
-                        gen_id = self.persona_store.propose_generated(snapshot['persona_uuid'], key,
-                            item['value'], item['precision'], f"luna_generated:{event['comment_id']}",
-                            event['comment_id'], now.isoformat())
-                    except Exception:
-                        why = ('GENERATED_FACT_EXISTS' if key in self.persona_store.live_generated_keys(
-                            snapshot['persona_uuid']) else 'GENERATED_FACT_STORAGE_FAILED')
-                        proposal_results.append(dict(proposal_id=pid, key=key, status='REJECTED', reason=why))
-                        continue
+                    existing = same_comment_pending.get(key)
+                    if existing and existing.get('value_text') == item['value'] \
+                            and existing.get('precision') == item['precision']:
+                        gen_id = existing['gen_fact_id']
+                    else:
+                        try:
+                            gen_id = self.persona_store.propose_generated(snapshot['persona_uuid'], key,
+                                item['value'], item['precision'], f"luna_generated:{event['comment_id']}",
+                                event['comment_id'], now.isoformat())
+                            same_comment_pending[key] = {'gen_fact_id': gen_id, 'fact_key': key,
+                                'value_text': item['value'], 'precision': item['precision'],
+                                'source_ref': f"luna_generated:{event['comment_id']}", 'status': 'PENDING'}
+                        except Exception:
+                            why = ('GENERATED_FACT_EXISTS' if key in self.persona_store.live_generated_keys(
+                                snapshot['persona_uuid']) else 'GENERATED_FACT_STORAGE_FAILED')
+                            proposal_results.append(dict(proposal_id=pid, key=key, status='REJECTED', reason=why))
+                            continue
                     live.add(key)
                     created_today += 1
                     proposal_ids[pid] = gen_id
@@ -535,7 +534,7 @@ class PersonaGenerationRuntime:
         relevant_namespaces = {'travel_story': {'trip', 'memory'}, 'memory': {'memory', 'trip'},
             'vehicle_experience': {'memory', 'trip'},
             'opinion': {'taste', 'memory'}, 'preference': {'taste', 'hobby'},
-            'maintenance': {'habit'}}
+            'maintenance': {'habit'}, 'vehicle_current': {'car'}}
         proposal_namespaces = set().union(*(relevant_namespaces.get(topic, set())
                                             for topic in requested_topics))
         if not requested_keys and not requested_topics:
@@ -642,8 +641,14 @@ class PersonaGenerationRuntime:
                     return rejected('MEMORY_CITATION_REQUIRED')
         if context.get('channel') == 'public' and re.search(r'\b(?:so dien thoai|sdt|dia chi nha|cccd|cmnd)\b', norm(candidate.get('reply_text', ''))):
             return rejected('PUBLIC_PERSONAL_DATA')
+        product_verified_at = context.get('product_verified_at')
+        if isinstance(product_verified_at, str):
+            try: product_verified_at = datetime.fromisoformat(product_verified_at.replace('Z', '+00:00'))
+            except ValueError: product_verified_at = None
         result = validate_generated_reply(candidate, snapshot, messages=context.get('messages', []),
             allowed_memory_ids=memories, allowed_question=question, channel=context.get('channel', 'public'),
+            product_facts=context.get('product_facts', []),
+            product_verified_at=product_verified_at, now=self.clock.now(),
             revoked_ids=self.persona_store.revoked_fact_ids(snapshot['persona_uuid'], snapshot['release_id']),
             allow_fictional_fixture=self.allow_persona_fixtures)
         if result.get('status') != 'OK':

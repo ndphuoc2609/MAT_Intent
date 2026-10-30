@@ -292,7 +292,9 @@ class IntentApiServiceTests(unittest.TestCase):
             service = IntentService(store=Store(":memory:"), api_key="local-test-key",
                 model_call=call_luna, budget_path=ledger)
             self.addCleanup(service.close)
-            service.budget_max_calls = 300
+            # Exhaust the cap using only this test's ledger entry; do not rely on
+            # historical shared-budget usage from the developer's machine.
+            service.budget_max_calls = 24
             service.budget_max_cost = 2.0
             service.budget_reserve = 0.00032
             with patch.dict(os.environ, {"OPENROUTER_API_KEY": "offline-placeholder"}):
@@ -301,7 +303,9 @@ class IntentApiServiceTests(unittest.TestCase):
             self.assertEqual(result["status"], "MODEL_UNAVAILABLE")
             self.assertTrue(any("exhausted" in reason for reason in result["reasons"]))
             self.assertTrue(Sandbox(ledger).budget()[0])
-            with patch.dict(os.environ, {"SANDBOX_ENFORCE_BUDGET": "true"}):
+            with patch.dict(os.environ, {"SANDBOX_ENFORCE_BUDGET": "true",
+                                         "INTENT_MODEL_MAX_CALLS": "24",
+                                         "INTENT_MODEL_MAX_COST_USD": "2"}):
                 self.assertFalse(Sandbox(ledger).budget()[0])
             self.assertEqual(budget_ledger.totals(ledger)[0], 24)
 

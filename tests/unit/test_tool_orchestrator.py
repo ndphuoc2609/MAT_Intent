@@ -19,6 +19,13 @@ def msg(action, payload):
     return {'schema_version': VERSION, 'message': {'action': action, 'payload': payload}}
 
 
+def plan(text='Cuối tuần bạn hay đi đâu?'):
+    return {'intents': [{'kind': 'persona_question', 'subject': 'persona', 'normalized': text,
+        'evidence': text, 'context_source': 'current_comment', 'certainty': 'explicit'}],
+        'priority_order': [0], 'unresolved': [], 'objective': 'Trả lời câu hỏi trực tiếp',
+        'next_action': 'answer', 'question': None, 'handoff_reason': None}
+
+
 def retrieval():
     return {'kind': 'persona_memory', 'topic': 'trip', 'query': 'cuối tuần', 'keys': [],
         'entities': {'vehicle': None, 'location': None, 'people': []},
@@ -29,7 +36,7 @@ def proposal():
     return {'proposal_id': 'p1', 'idempotency_key': 'key1', 'persona_version': 'release-a',
         'topic': 'trip', 'event': 'Một chuyến đi cuối tuần.', 'time_start': None, 'time_end': None,
         'entities': {'vehicle': None, 'location': None, 'people': []}, 'base_fact_ids': [],
-        'new_details': [], 'relation': None}
+        'new_details': [], 'relation': None, 'vehicle_use': 'unknown'}
 
 
 def final():
@@ -37,7 +44,7 @@ def final():
         'sarcasm': 'absent', 'scope': 'in_scope', 'requests': [], 'operations': [],
         'uncertainties': [], 'intent_labels': [], 'category': None, 'tags': []},
         'reply': {'reply_text': 'Ừ, mình hiểu rồi.', 'fact_ids': [], 'memory_ids': [], 'claims': [],
-                  'asks_question': False, 'question': None},
+                  'product_claims': [], 'fact_proposals': [], 'asks_question': False, 'question': None},
         'diagnostics': None, 'peer_interpretation': None}
 
 
@@ -55,12 +62,12 @@ class ToolOrchestrationTests(unittest.TestCase):
         tools = {'retrieve': lambda q: {'status': 'NOT_FOUND'},
             'propose_memory': lambda p: calls.append(p) or
                 {'status': 'ACCEPTED', 'memory_id': 'm1', 'source_ref': 'private'}}
-        model = model_stream(iter([msg('retrieve', retrieval()), msg('propose_memory', proposal()),
+        model = model_stream(iter([msg('plan', plan()), msg('retrieve', retrieval()), msg('propose_memory', proposal()),
                                    msg('final', final())]), seen)
         result = orchestrate(context(), model, tools, lambda turn: {'status': 'OK'}, budget_guard=lambda: True)
         self.assertEqual(result['status'], 'FINAL')
-        self.assertEqual(result['attempts'], 3)
-        self.assertAlmostEqual(result['cost_usd_est'], 0.03)
+        self.assertEqual(result['attempts'], 4)
+        self.assertAlmostEqual(result['cost_usd_est'], 0.04)
         self.assertEqual(len(calls), 1)
         self.assertNotIn('source_ref', seen[0][0])
         self.assertNotIn('source_ref', seen[2][1][-1]['tool_result'])
@@ -68,14 +75,15 @@ class ToolOrchestrationTests(unittest.TestCase):
 
     def test_database_error_cannot_authorize_creating_memory(self):
         calls = []
-        model = model_stream(iter([msg('retrieve', retrieval()), msg('propose_memory', proposal()),
+        model = model_stream(iter([msg('plan', plan()), msg('retrieve', retrieval()), msg('propose_memory', proposal()),
                                    msg('abstain', {'reason': 'chưa đủ dữ liệu'})]), [])
         tools = {'retrieve': lambda _: (_ for _ in ()).throw(RuntimeError('db down')),
                  'propose_memory': lambda p: calls.append(p)}
         result = orchestrate(context(), model, tools, lambda _: {'status': 'OK'}, budget_guard=lambda: True)
         self.assertEqual(calls, [])
-        self.assertEqual(result['trace'][0]['status'], 'UNKNOWN')
+        self.assertEqual(result['trace'][0]['status'], 'ACCEPTED')
         self.assertEqual(result['trace'][1]['status'], 'UNKNOWN')
+        self.assertEqual(result['trace'][2]['status'], 'UNKNOWN')
 
     def test_other_persona_id_is_not_a_tool_parameter(self):
         illegal = retrieval(); illegal['persona_id'] = 'persona-b'
@@ -88,22 +96,23 @@ class ToolOrchestrationTests(unittest.TestCase):
         customer = {'facts': [{'predicate': 'budget', 'value': '700 triệu',
             'evidence_excerpt': '700 triệu', 'subject': 'customer', 'certainty': 'explicit'}]}
         called = []
-        model = model_stream(iter([msg('retrieve', retrieval()), msg('propose_memory', wrong),
+        model = model_stream(iter([msg('plan', plan()), msg('retrieve', retrieval()), msg('propose_memory', wrong),
             msg('record_customer_facts', customer), msg('abstain', {'reason': 'chưa rõ'})]), [])
         result = orchestrate(context(), model, {'retrieve': lambda _: {'status': 'NOT_FOUND'},
             'propose_memory': lambda _: called.append('memory'),
             'record_customer_facts': lambda _: called.append('customer')}, lambda _: {'status': 'OK'},
             budget_guard=lambda: True)
         self.assertEqual(called, [])
-        self.assertEqual([item.get('status') for item in result['trace'][:3]], ['NOT_FOUND', 'CONFLICT', 'REJECTED'])
+        self.assertEqual([item.get('status') for item in result['trace'][:4]],
+                         ['ACCEPTED', 'NOT_FOUND', 'CONFLICT', 'REJECTED'])
 
     def test_rejected_final_can_be_repaired_within_budget(self):
         seen = []
-        model = model_stream(iter([msg('final', final()), msg('final', final())]), seen)
+        model = model_stream(iter([msg('plan', plan()), msg('final', final()), msg('final', final())]), seen)
         checks = iter([{'status': 'REVIEW', 'reason': 'UNSUPPORTED'}, {'status': 'OK'}])
         result = orchestrate(context(), model, {}, lambda _: next(checks), budget_guard=lambda: True)
         self.assertEqual(result['status'], 'FINAL')
-        self.assertEqual(seen[1][1][-1]['tool_result']['reason'], 'UNSUPPORTED')
+        self.assertEqual(seen[2][1][-1]['tool_result']['reason'], 'UNSUPPORTED')
 
     def test_limit_and_budget_are_fail_closed(self):
         called = []

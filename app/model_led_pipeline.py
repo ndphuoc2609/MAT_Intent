@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import time
+from datetime import date, datetime
 from .customer_facts import list_customer_facts, record_customer_facts
 from .persona_fact_policy import select_facts
 from .persona_runtime import digest, peer_plan_from_signals, validated_peer_signals
@@ -34,12 +36,57 @@ def run_model_led(engine, event, postcard, engine_context, model, budget_guard, 
     except Exception:
         return {'status': 'ABSTAIN', 'reason': 'CONTEXT_UNAVAILABLE'}
     stories = StoryStore(repo)
+    comparison_trace = []
+    comparison_usage = {}
+    comparison_cost = [0.0]
+    comparison_cost_unknown = [False]
+    comparison_attempts = [0]
+    comparison_deadline = time.monotonic() + float(limits.get('total_timeout', 90))
+    comparison_schema = {'type': 'object', 'properties': {
+        'verdict': {'enum': ['SAME', 'ADDENDUM', 'DIFFERENT', 'CONFLICT', 'AMBIGUOUS']},
+        'evidence': {'type': 'string', 'maxLength': 300}},
+        'required': ['verdict', 'evidence'], 'additionalProperties': False}
+
+    def compare_story(proposal, existing):
+        if len(comparison_trace) >= 3 or time.monotonic() >= comparison_deadline or budget_guard() is not True:
+            comparison_trace.append({'status': 'UNKNOWN', 'reason': 'COMPARISON_BUDGET_OR_LIMIT'})
+            return 'AMBIGUOUS'
+        try:
+            call = model({'_task': 'story_comparison', '_schema_name': 'story_comparison_v1',
+                'persona_version': snapshot['release_id'], 'candidate_event': proposal,
+                'canonical_event': existing}, [], comparison_schema,
+                max(0.1, min(float(limits.get('timeout', 15)), comparison_deadline - time.monotonic())))
+        except Exception:
+            call = {}
+        verdict = None
+        if isinstance(call, dict):
+            attempts = call.get('attempts')
+            comparison_attempts[0] += attempts if type(attempts) is int and attempts >= 0 else 0
+            usage = call.get('usage') if isinstance(call.get('usage'), dict) else {}
+            for key in ('prompt_tokens', 'completion_tokens', 'total_tokens'):
+                if type(usage.get(key)) is int and usage[key] >= 0:
+                    comparison_usage[key] = comparison_usage.get(key, 0) + usage[key]
+            cost = call.get('cost_usd_est')
+            if call.get('cost_unknown', cost is None) or type(cost) not in (int, float):
+                comparison_cost_unknown[0] = bool(attempts)
+            elif not comparison_cost_unknown[0]:
+                comparison_cost[0] += cost
+            message = call.get('message')
+            if (call.get('ok') and attempts == 1 and isinstance(message, dict)
+                    and set(message) == {'verdict', 'evidence'}
+                    and message.get('verdict') in ('SAME', 'ADDENDUM', 'DIFFERENT', 'CONFLICT', 'AMBIGUOUS')
+                    and isinstance(message.get('evidence'), str)):
+                verdict = message['verdict']
+        comparison_trace.append({'status': verdict or 'UNKNOWN',
+            'candidate': proposal.get('proposal_id'), 'memory_id': existing.get('memory_id')})
+        return verdict or 'AMBIGUOUS'
     with engine.store.lock:
         told = stories.told(snapshot, scope)
     if told.get('status') == 'UNKNOWN':
         return {'status': 'ABSTAIN', 'reason': 'STORY_CONTEXT_UNAVAILABLE'}
     told_ids = {item['memory_id'] for item in told.get('deliveries', [])}
     supplied_stories = {}
+    supplied_product_facts = {}
     customer_texts = [event['text']] + [m['text'] for m in generation.get('messages', [])
                      if m.get('actor_id') == scope['actor_id'] and isinstance(m.get('text'), str)]
 
@@ -70,7 +117,10 @@ def run_model_led(engine, event, postcard, engine_context, model, budget_guard, 
                 vehicle=args['entities'].get('vehicle'), variant=args['variant'],
                 location=args['entities'].get('location'), now=engine.clock.now())
             if conflict: return {'status': 'CONFLICT', 'facts': []}
-            return {'status': 'FOUND' if fresh else 'NOT_FOUND', 'facts': fresh}
+            for fact in fresh:
+                supplied_product_facts[fact['id']] = copy.deepcopy(fact)
+            return {'status': 'FOUND' if fresh else 'NOT_FOUND', 'facts': fresh,
+                    'stale_count': len(stale)}
         return {'status': 'UNKNOWN'}
 
     def mutate(operation):
@@ -78,8 +128,14 @@ def run_model_led(engine, event, postcard, engine_context, model, budget_guard, 
             return {'status': 'UNKNOWN', 'reason': 'MUTATION_GUARD_REQUIRED'}
         return mutation_guard(operation)
 
+    def read(operation):
+        with engine.store.lock:
+            return operation()
+
     def propose(args):
-        result = mutate(lambda: stories.propose(snapshot, args, customer_texts=customer_texts))
+        result = stories.propose(snapshot, args, customer_texts=customer_texts,
+                                 judge=compare_story, read_guard=read,
+                                 mutation_guard=mutation_guard)
         if not isinstance(result, dict):
             return {'status': 'UNKNOWN', 'reason': 'MUTATION_RESULT_INVALID'}
         story = result.get('memory')
@@ -100,6 +156,11 @@ def run_model_led(engine, event, postcard, engine_context, model, budget_guard, 
             return {'status': 'REVIEW', 'reason': 'INVALID_SEMANTIC'}
         ctx = copy.deepcopy(generation)
         ctx['stories'] = list(supplied_stories.values())
+        ctx['product_facts'] = list(supplied_product_facts.values())
+        for fact in ctx['product_facts']:
+            if isinstance(fact.get('verified_at'), (date, datetime)):
+                fact['verified_at'] = fact['verified_at'].isoformat()
+        ctx['product_verified_at'] = engine.facts.verified_at.isoformat()
         ctx['context_token'] = digest({k: v for k, v in ctx.items() if k != 'context_token'})
         pending = engine.store.open_pending_for(scope['actor_id'], page_id=scope['page_id'],
             post_id=scope['post_id'], thread_root_id=scope['thread_root_id'])
@@ -158,5 +219,16 @@ def run_model_led(engine, event, postcard, engine_context, model, budget_guard, 
         'release_id': snapshot['release_id'], 'current_text': event['text'], 'model_context': model_context},
         model, {'retrieve': retrieve, 'propose_memory': propose, 'record_customer_facts': record},
         validate, budget_guard=budget_guard, **limits)
+    if comparison_trace:
+        result['trace'].extend({'action': 'story_comparison', **item} for item in comparison_trace)
+        if result['attempts'] is not None:
+            result['attempts'] += comparison_attempts[0]
+        for key, value in comparison_usage.items():
+            result['usage'][key] = result['usage'].get(key, 0) + value
+        if comparison_cost_unknown[0]:
+            result['cost_unknown'] = True
+            result['cost_usd_est'] = None
+        elif not result['cost_unknown']:
+            result['cost_usd_est'] += comparison_cost[0]
     result['generation_context'] = latest_generation[0]
     return result

@@ -1,7 +1,6 @@
 # Standalone intent API
 
-`app.intent_api` serves an authenticated intent endpoint without importing or
-calling Meta/Facebook services. It accepts the source post, root, direct parent,
+`app.intent_api` serves an authenticated intent endpoint. It accepts the source post, root, direct parent,
 current message and their authors. PostgreSQL stores input events, semantic
 results and the engine's scoped request/pending state. The API has no outbound
 comment effect.

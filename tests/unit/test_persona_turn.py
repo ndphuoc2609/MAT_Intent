@@ -25,6 +25,7 @@ def reply():
                     "predicate": "location.base.province", "fact_ids": ["f1"],
                     "memory_ids": [], "message_ids": []}],
         "asks_question": False, "question": None,
+        "product_claims": [],
     }
 
 

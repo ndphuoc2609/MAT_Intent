@@ -842,6 +842,69 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertEqual(result, post_text)
         self.assertEqual(calls, [('analysis', True), ('post', True)])
 
+    def test_generated_post_does_not_gate_on_semantic_fact_validation(self):
+        from app.persona_fixture import seed_nam_creta
+        repository = self.http.app.persona_repository()
+        persona_id, release_id = seed_nam_creta(repository)
+        snapshot = repository.get_release_snapshot(persona_id, release_id)
+        vehicle = next(fact for fact in snapshot['facts'] if fact['key'] == 'vehicle.current.model')
+        def candidate(text):
+            return {'post_text': text, 'fact_ids': [vehicle['fact_id']], 'claims': [
+                {'text': text, 'subject': 'persona', 'predicate': vehicle['key'],
+                 'fact_ids': [vehicle['fact_id']], 'memory_ids': [], 'message_ids': []}],
+                'fact_proposals': []}
+        invalid_text = 'Mình đang đi Hyundai Tucson.'
+        invalid = candidate(invalid_text)
+        post_calls = []
+        def call(_post, _text, **kwargs):
+            phase = kwargs['persona_phase']
+            if phase == 'analysis':
+                return {'ok': True, 'needs': {'topics': ['vehicle_current'],
+                    'keys': ['vehicle.current.model']}, 'attempts': 1, 'usage': {},
+                    'cost_usd_est': 0.001, 'cost_unknown': False}
+            post_calls.append(kwargs)
+            return {'ok': True, 'post_candidate': invalid,
+                    'attempts': 1, 'usage': {}, 'cost_usd_est': 0.001,
+                    'cost_unknown': False}
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-key'}), \
+             patch('sandbox.server.call_luna', side_effect=call), \
+             patch('app.persona_generation.validate_generated_post',
+                   side_effect=AssertionError('semantic post validator must not run')) as validator:
+            result = self.http.app.generate_post({'name': 'Nam'}, snapshot)
+        self.assertEqual(result, invalid_text)
+        self.assertEqual(len(post_calls), 1)
+        validator.assert_not_called()
+
+    def test_rejected_post_fact_proposal_does_not_block_article_output(self):
+        from app.persona_fixture import seed_nam_creta
+        repository = self.http.app.persona_repository()
+        persona_id, release_id = seed_nam_creta(repository)
+        snapshot = repository.get_release_snapshot(persona_id, release_id)
+        vehicle = next(fact for fact in snapshot['facts'] if fact['key'] == 'vehicle.current.model')
+        text = 'Mình có một chuyến đi đáng nhớ.'
+        candidate = {'post_text': text, 'fact_ids': ['new1'], 'claims': [
+            {'text': text, 'subject': 'persona', 'predicate': 'gen.trip',
+             'fact_ids': ['new1'], 'memory_ids': [], 'message_ids': []}],
+            'fact_proposals': [{'proposal_id': 'new1', 'namespace': 'trip', 'slug': 'trip_1',
+                                'value': 'Một chuyến đi đáng nhớ.', 'precision': 'approximate'}]}
+        def call(_post, _text, **kwargs):
+            if kwargs['persona_phase'] == 'analysis':
+                return {'ok': True, 'needs': {'topics': ['vehicle_current'],
+                    'keys': [vehicle['key']]}, 'attempts': 1, 'usage': {},
+                    'cost_usd_est': 0.001, 'cost_unknown': False}
+            return {'ok': True, 'post_candidate': candidate, 'attempts': 1, 'usage': {},
+                    'cost_usd_est': 0.001, 'cost_unknown': False}
+        metrics = {}
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-key'}), \
+             patch('sandbox.server.call_luna', side_effect=call), \
+             patch('app.persona_fact_policy.validate_proposals', return_value=([], 'GENERATED_FACT_POLICY')):
+            result = self.http.app.generate_post({'name': 'Nam'}, snapshot, _metrics=metrics)
+        self.assertEqual(result, text)
+        self.assertEqual(metrics['proposal_results'][0]['status'], 'REJECTED')
+        self.assertEqual(metrics['proposal_results'][0]['reason'], 'GENERATED_FACT_POLICY')
+        self.assertEqual(metrics['post_candidate']['fact_ids'], [])
+        self.assertEqual(metrics['generated_fact_ids'], [])
+
     def test_generated_post_reports_budget_exhaustion_without_writing_phase(self):
         from app.persona_fixture import seed_nam_creta
         repository = self.http.app.persona_repository()

@@ -52,7 +52,7 @@ Bài sinh qua `persona_post_v1`, cũng theo needs → fact → proposal. Proposa
 - Validator kiểm source/persona/release, fact IDs, claims, subject, giá trị, phủ định, evidence khách, câu hỏi, kênh public/private, memory eligibility và mâu thuẫn với bài authored. Không dùng text do model sinh làm evidence cho semantic.
 - Pha 2 lỗi hoặc reply không qua kiểm tra thì không tự gửi reply đó. Persona có utterance đã duyệt phù hợp có thể dùng làm fallback; nếu không có thì không gửi. Không dùng utterance Nam cho persona khác.
 - Fact mới được ghi PENDING cùng outbox INTENDED. Chỉ SENT làm fact ACTIVE; BLOCKED, FAILED hoặc hết TTL làm DISCARD. Precheck tức thời, drain và retry đọc lại binding, block/handoff, fact revocation và context. Unique key giải quyết race giữa hai khách; lượt thua không gửi.
-- Sandbox tự gửi nội dung hợp lệ bằng `FakeSender`, không có bước duyệt của người. Cổng Meta thật `META_OUTBOUND_ENABLED` là cấu hình riêng và mặc định tắt; bật auto-send sandbox không bật Meta.
+- Sandbox tự gửi nội dung hợp lệ bằng `FakeSender`, không có bước duyệt của người. Đường giao nhận hiện chỉ chạy trong sandbox.
 - Không phủ nhận là AI, không giả làm người đang gõ, không xin thông tin liên hệ nơi công khai, không báo giá/nhận cọc/xác nhận lịch hoặc giao dịch. Kill switch, opt-out, handoff, TTL và dedupe tiếp tục có hiệu lực.
 
 ## UI, audit và tương thích
@@ -63,4 +63,4 @@ Sandbox hiển thị intent, confidence, Jev score khi có, fact được cấp,
 
 Bộ 12 hội thoại frozen hiện vẫn là dữ liệu tổng hợp cho Nam; runner cũ/mới cùng dùng FakeSender, ghi attempts, latency, token/cost và trạng thái qua cổng gửi. Không sửa `datasets/` hoặc run cũ chỉ để khớp báo cáo. Chưa có transcript thật và nhãn chấm mù của con người thì chưa thể kết luận chất lượng “như người thật”.
 
-Generated story là **chi tiết tổng hợp do Luna đề xuất**, không phải ký ức đã được xác minh. Kiểm tra chỉ bảo đảm cấu trúc và nhất quán nội bộ với fact/bài được cấp; không bảo đảm sự kiện là thật. Điều này đúng cả khi persona được lấy từ hồ sơ thật. Không gửi Meta thật trong phạm vi hiện tại.
+Generated story là **chi tiết tổng hợp do Luna đề xuất**, không phải ký ức đã được xác minh. Kiểm tra chỉ bảo đảm cấu trúc và nhất quán nội bộ với fact/bài được cấp; không bảo đảm sự kiện là thật. Điều này đúng cả khi persona được lấy từ hồ sơ thật. Giao nhận hiện chỉ dùng `FakeSender`.

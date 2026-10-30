@@ -9,6 +9,7 @@ from datetime import date, datetime
 import hashlib
 import json
 import re
+import copy
 from typing import Any
 
 from .normalize import norm
@@ -30,7 +31,7 @@ _QUESTION_FIELDS = frozenset({
 _CUSTOMER_ROLES = frozenset({"user", "customer", "commenter"})
 _ID_FIELDS = {"fact_ids", "memory_ids", "message_ids"}
 _CLAIM_FIELDS = {"text", "subject", "predicate", "fact_ids", "memory_ids", "message_ids"}
-_CANDIDATE_FIELDS = {"reply_text", "fact_ids", "memory_ids", "claims", "asks_question", "question"}
+_CANDIDATE_FIELDS = {"reply_text", "fact_ids", "memory_ids", "claims", "product_claims", "asks_question", "question"}
 _QUESTION_CANDIDATE_FIELDS = {"kind", "field", "text"}
 
 _STOP_WORDS = frozenset(norm(word) for word in (
@@ -51,13 +52,14 @@ _CAPITALIZED_RE = re.compile(r"[^\W\d_]+(?:[’'-][^\W\d_]+)?", re.UNICODE)
 _MILEAGE_KEYS = frozenset({"vehicle.current.mileage_km"})
 
 _TRANSACTION_RE = re.compile(
-    r"\b(?:bao gia|gia ban|gia xe|gia lan banh|gia niem yet|khuyen mai|uu dai|"
-    r"giam gia|chiet khau|con hang|con xe|ton kho|nhan coc|dat coc|coc xe|coc|"
+    r"\b(?:nhan coc|dat coc|coc xe|coc|"
     r"giu xe|giu cho|giu lich|hen lich|hen gap|hen ban|dat lich|dat hen|dat xe|"
     r"lich giao xe|giao xe|chuyen khoan|chot don|xac nhan don|giao dich|"
     r"goi lai|goi cho ban|goi ban|lien he lai|lien he voi ban|lien he ban|"
     r"nhan tin lai|nhan tin cho ban|xac nhan lich)\b"
 )
+_PRODUCT_ASSERTION_RE = re.compile(r"\b(?:gia|khuyen mai|uu dai|giam gia|chiet khau|con hang|con xe|"
+    r"ton kho|bao hanh|thong so|dung tich|dong co|dai ly|phien ban)\b")
 _SYSTEM_RE = re.compile(
     r"\b(?:khong phai|khong la|khong phai la)\s+(?:ai|bot|robot|nguoi that)\b|"
     r"\b(?:minh|toi|em)\s+la\s+nguoi that\b|"
@@ -432,16 +434,28 @@ def _validate_shape(candidate, max_text_length=600):
     if not isinstance(claims, list) or len(claims) > 20:
         return None
     for item in claims:
-        if not isinstance(item, dict) or set(item) != _CLAIM_FIELDS:
-            return None
-        if not isinstance(item.get("text"), str) or not item["text"].strip() \
+        if not isinstance(item, dict) or set(item) != _CLAIM_FIELDS \
+                or not isinstance(item.get("text"), str) or not item["text"].strip() \
                 or len(item["text"]) > 600 or item["text"] not in text \
-                or text.count(item["text"]) != 1:
+                or text.count(item["text"]) != 1 \
+                or not isinstance(item.get("subject"), str) or item["subject"] not in {"persona", "customer"} \
+                or not isinstance(item.get("predicate"), str) or not item["predicate"] \
+                or any(not _id_list(item.get(key)) for key in _ID_FIELDS):
             return None
-        if not isinstance(item.get("subject"), str) or item["subject"] not in {"persona", "customer"} \
-                or not isinstance(item.get("predicate"), str) or not item["predicate"]:
+    product_claims = candidate['product_claims']
+    if not isinstance(product_claims, list) or len(product_claims) > 12:
+        return None
+    for item in product_claims:
+        if (not isinstance(item, dict) or set(item) != {'text', 'product_fact_id', 'product_type',
+                'effective_at', 'vehicle', 'variant', 'location'}
+                or not isinstance(item.get('text'), str) or not item['text'] or item['text'] not in text
+                or not isinstance(item.get('product_fact_id'), str) or not item['product_fact_id'].strip()
+                or item.get('product_type') not in {'list_price','promo','stock','spec','warranty','dealer'}
+                or not isinstance(item.get('effective_at'), str) or not item['effective_at'].strip()
+                or any(item.get(key) is not None and not isinstance(item.get(key), str)
+                    for key in ('vehicle','variant','location'))):
             return None
-        if any(not _id_list(item.get(key)) for key in _ID_FIELDS):
+        if len(item['text']) > 600 or text.count(item['text']) != 1:
             return None
     if type(candidate["asks_question"]) is not bool:
         return None
@@ -572,6 +586,80 @@ def _fact_value_supported(text, fact):
                 if _contains_phrase(text_norm, " ".join(tokens[index:index + size])):
                     return True
     return False
+
+
+def _product_value_supported(text, fact):
+    value, unit = fact.get('value'), norm(str(fact.get('unit') or ''))
+    normalized = norm(text)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        n = int(value) if int(value) == value else value
+        forms = {str(n), f'{n:,}'.replace(',', '.'), f'{n:,}'}
+        if unit == 'vnd':
+            if n % 1_000_000 == 0: forms.add(f'{n // 1_000_000} trieu')
+            if n % 1_000_000_000 == 0: forms.add(f'{n // 1_000_000_000} ty')
+        unit_words = {'years': ('nam',), 'percent': ('%', 'phan tram'),
+                      'percent_per_year': ('%/nam', 'phan tram/nam'), 'vnd': ('dong', 'vnd', 'trieu', 'ty')}
+        for form in forms:
+            if form in normalized and (not unit_words.get(unit) or any(word in normalized for word in unit_words[unit])):
+                return True
+        return False
+    if isinstance(value, str):
+        return norm(value) in normalized
+    return False
+
+
+def _product_claims_valid(candidate, product_facts, now, verified_at=None):
+    if not candidate.get('product_claims'):
+        return True, None, []
+    if not isinstance(product_facts, list):
+        return False, 'PRODUCT_SOURCE_UNKNOWN', []
+    by_id = {fact.get('id'): fact for fact in product_facts if isinstance(fact, dict)}
+    cited, grounded = [], []
+    from .facts import Facts
+    if isinstance(verified_at, str):
+        try: verified_at = datetime.fromisoformat(verified_at.replace('Z', '+00:00'))
+        except ValueError: return False, 'PRODUCT_FACT_STALE_OR_MISMATCHED', []
+    for claim in candidate['product_claims']:
+        fact = by_id.get(claim['product_fact_id'])
+        fact_verified_at = fact.get('verified_at') if fact else None
+        if isinstance(fact_verified_at, str):
+            try: fact_verified_at = datetime.fromisoformat(fact_verified_at.replace('Z', '+00:00'))
+            except ValueError: return False, 'PRODUCT_FACT_STALE_OR_MISMATCHED', []
+            fact = dict(fact, verified_at=fact_verified_at)
+            by_id[claim['product_fact_id']] = fact
+        if (not fact or fact.get('source') in (None, 'SAMPLE') or fact.get('type') != claim['product_type']
+                or fact.get('valid_from') != claim['effective_at']
+                or any(claim[key] != fact.get(key) for key in ('vehicle','variant','location'))
+                or not Facts([fact], verified_at=fact_verified_at or verified_at).is_fresh(fact, now)):
+            return False, 'PRODUCT_FACT_STALE_OR_MISMATCHED', []
+        if fact.get('vehicle') and not _contains_phrase(norm(claim['text']), norm(fact['vehicle'])):
+            return False, 'PRODUCT_VEHICLE_MISMATCH', []
+        if fact.get('variant') and not _contains_phrase(norm(claim['text']), norm(fact['variant'])):
+            return False, 'PRODUCT_VARIANT_MISMATCH', []
+        if fact.get('location') and not _contains_phrase(norm(claim['text']), norm(fact['location'])):
+            return False, 'PRODUCT_LOCATION_MISMATCH', []
+        extra = fact.get('extra') or {}
+        supported = _product_value_supported(claim['text'], fact)
+        if fact.get('type') == 'spec':
+            supported = any(_product_value_supported(claim['text'], {'value': value, 'unit': 'years' if key == 'warranty_years' else fact.get('unit')})
+                or isinstance(value, str) and norm(str(value)) in norm(claim['text'])
+                for key, value in extra.items())
+        elif fact.get('type') == 'dealer':
+            supported = supported or any(isinstance(value, str) and len(norm(value)) > 3
+                and _contains_phrase(norm(claim['text']), norm(value)) for value in extra.values())
+        if not supported:
+            return False, 'PRODUCT_VALUE_MISMATCH', []
+        cited.append(fact['id'])
+        aliases = [fact.get(key) for key in ('vehicle','variant','location') if fact.get(key)]
+        aliases.extend(str(value) for value in extra.values() if isinstance(value, (str,int,float)))
+        grounded.append({'text': claim['text'], 'aliases': aliases})
+    if len(cited) != len(set(cited)):
+        return False, 'DUPLICATE_PRODUCT_CLAIM', []
+    for sentence in _sentences(candidate['reply_text']):
+        if _PRODUCT_ASSERTION_RE.search(norm(sentence)) and not any(claim['text'] in sentence for claim in candidate['product_claims']):
+            if not _safe_epistemic_clause(sentence) and not (candidate['asks_question'] and sentence == candidate['question']['text']):
+                return False, 'PRODUCT_CLAIM_REQUIRED', []
+    return True, None, grounded
 
 
 def _fact_number_values(fact):
@@ -948,13 +1036,15 @@ def _sentences(text):
     return [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", text) if part.strip()]
 
 
-def _unsupported_personal_sentence(text, claims, question):
+def _unsupported_personal_sentence(text, claims, question, product_claims=()):
     for sentence in _sentences(text):
         if _SAFE_AI_DISCLOSURE_RE.fullmatch(norm(sentence)):
             continue
         remainder = sentence
         for claim in claims:
             remainder = remainder.replace(claim["text"], " ")
+        for claim in product_claims:
+            remainder = remainder.replace(claim['text'], ' ')
         if question:
             remainder = remainder.replace(question, " ")
         remainder = _clean_clause(remainder)
@@ -965,7 +1055,7 @@ def _unsupported_personal_sentence(text, claims, question):
     return False
 
 
-def _make_manifest(candidate, context, facts, memories, messages, ids):
+def _make_manifest(candidate, context, facts, memories, messages, ids, product_facts=None):
     evidence_fact_ids = set(ids["fact_ids"])
     for memory_id in ids["memory_ids"]:
         evidence_fact_ids.update(memories[memory_id].get("fact_ids", []))
@@ -993,6 +1083,12 @@ def _make_manifest(candidate, context, facts, memories, messages, ids):
         "memory_ids": sorted(ids["memory_ids"]), "memories": memory_rows,
         "message_ids": sorted(ids["message_ids"]), "messages": message_rows,
     }
+    if candidate.get('product_claims'):
+        by_id = product_facts or {}
+        manifest['product_fact_ids'] = sorted({claim['product_fact_id'] for claim in candidate['product_claims']})
+        manifest['product_facts'] = [{'id': fact_id, 'type': by_id[fact_id].get('type'),
+            'checksum': _digest_or_none(by_id[fact_id])} for fact_id in manifest['product_fact_ids']
+            if fact_id in by_id]
     manifest["digest"] = generation_digest(manifest)
     return manifest
 
@@ -1000,12 +1096,16 @@ def _make_manifest(candidate, context, facts, memories, messages, ids):
 def validate_generated_reply(candidate, snapshot, *, messages=(), allowed_memory_ids=(),
                              allowed_question=None, revoked_ids=(),
                              allow_fictional_fixture=False, channel=None,
+                             product_facts=None, product_verified_at=None, now=None,
                              _max_text_length=600) -> dict:
     """Validate a generated reply against approved facts and current turn evidence.
 
     ``REVIEW`` retains a short candidate string for the operator draft queue. It
     is never interchangeable with ``OK``; callers must gate sending on status.
     """
+    if isinstance(candidate, dict):
+        candidate = copy.deepcopy(candidate)
+        candidate.setdefault('product_claims', [])
     text = _validate_shape(candidate, max_text_length=_max_text_length)
     if text is None:
         return _review("INVALID_CANDIDATE", candidate)
@@ -1041,6 +1141,11 @@ def validate_generated_reply(candidate, snapshot, *, messages=(), allowed_memory
     if any(fact_id not in facts_by_id for claim in candidate["claims"]
            for fact_id in claim["fact_ids"]):
         return _review("FACT_NOT_ALLOWED", candidate)
+    product_by_id = {fact.get('id'): fact for fact in product_facts or () if isinstance(fact, dict)}
+    product_ok, product_error, product_grounding = _product_claims_valid(
+        candidate, product_facts, now or datetime.now().astimezone(), product_verified_at)
+    if not product_ok:
+        return _review(product_error, candidate)
     authored_post, authored_post_error = _persona_authored_post(snapshot, context, facts_by_id)
     if authored_post_error:
         return _review(authored_post_error, candidate)
@@ -1183,8 +1288,9 @@ def validate_generated_reply(candidate, snapshot, *, messages=(), allowed_memory
     if effective_channel == "public" and _CONTACT_TERM_RE.search(normalized_text) \
             and _CONTACT_ASK_RE.search(normalized_text):
         return _review("PUBLIC_CONTACT_SOLICITATION", candidate)
-    if _unsupported_personal_sentence(text, candidate["claims"], question_text):
+    if _unsupported_personal_sentence(text, candidate["claims"], question_text, candidate['product_claims']):
         return _review("UNSUPPORTED_PERSONAL_DETAIL", candidate)
+    grounding_messages = list(used_messages) + [{'text': item['text']} for item in product_grounding]
 
     # A text mention can be copied from another message without becoming a
     # persona fact. Only IDs actually cited above contribute to this manifest.
@@ -1193,18 +1299,17 @@ def validate_generated_reply(candidate, snapshot, *, messages=(), allowed_memory
     used_messages_by_id = {item["message_id"]: item for item in used_messages}
     overall_soft_reason = _soft_fabrication_reason(
         text, used_predicates, list(used_facts_by_id.values()),
-        list(used_memories_by_id.values()), list(used_messages_by_id.values()))
+        list(used_memories_by_id.values()), grounding_messages)
     if overall_soft_reason:
         return _review(overall_soft_reason, candidate)
     if not _all_specific_details_grounded(text, list(used_facts_by_id.values()),
-                                          list(used_memories_by_id.values()),
-                                          list(used_messages_by_id.values())):
+                                          list(used_memories_by_id.values()), grounding_messages):
         return _review("UNSUPPORTED_SPECIFIC_DETAIL", candidate)
     # Exact top-level evidence unions prevent hidden, unreferenced sources.
     ids = {"fact_ids": claim_fact_ids, "memory_ids": claim_memory_ids,
            "message_ids": claim_message_ids}
     manifest = _make_manifest(candidate, context, facts_by_id, memory_by_id,
-                              message_by_id, ids)
+                              message_by_id, ids, product_by_id)
     return {"status": "OK", "text": text,
             "fact_ids": sorted(claim_fact_ids), "memory_ids": sorted(claim_memory_ids),
             "reason": None, "manifest": manifest}

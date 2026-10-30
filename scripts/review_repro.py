@@ -604,7 +604,7 @@ def p_r15_pg_not_implemented():
     has_adapter = issubclass(PostgresStore, Store)
     compose = open(os.path.join(ROOT, "compose.yaml")).read()
     migrations = sorted(glob.glob(os.path.join(ROOT, "migrations", "postgresql", "[0-9][0-9][0-9]_*.sql")))
-    wired = "META_DATABASE_URL" in compose
+    wired = all(name in compose for name in ("MAT_INTENT_DATABASE_URL", "SANDBOX_DATABASE_URL"))
     bug = not has_adapter or not wired or len(migrations) < LATEST_VERSION
     return bug, f"PostgresStore={has_adapter} compose_url={wired} migrations={len(migrations)}/{LATEST_VERSION} (live DB is a separate integration gate)"
 

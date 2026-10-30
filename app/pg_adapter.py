@@ -10,7 +10,7 @@ from pathlib import Path
 from .state import Store
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations" / "postgresql"
-LATEST_VERSION = 13
+LATEST_VERSION = 14
 
 
 def _adapt_sql(sql):
@@ -60,10 +60,6 @@ class _Connection:
                 "AND c.table_name=%s ORDER BY ordinal_position", (pragma.group(1).lower(),))
         else:
             adapted = _adapt_sql(sql)
-            # Inbox claims use row locking so concurrent service workers skip each other's row.
-            if ("FROM meta_inbox" in adapted and "status='PENDING'" in adapted
-                    and re.search(r"LIMIT\s+%s\s*$", adapted, re.I)):
-                adapted += " FOR UPDATE SKIP LOCKED"
             cur = self.raw.execute(adapted, params)
         self.last_rowcount = cur.rowcount
         return cur

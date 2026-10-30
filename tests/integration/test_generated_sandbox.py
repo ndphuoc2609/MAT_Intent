@@ -137,9 +137,16 @@ class GeneratedSandboxTests(unittest.TestCase):
                 'usage': {'prompt_tokens': 10, 'completion_tokens': 12},
                 'cost_usd_est': 0.001, 'cost_unknown': False, 'model_effective': 'fixture/luna'}
 
+        def plan(text, *, next_action='answer'):
+            return tool('plan', {'intents': [{'kind': 'share_need', 'subject': 'customer',
+                'normalized': text, 'evidence': text, 'context_source': 'current_comment',
+                'certainty': 'explicit'}], 'priority_order': [0], 'unresolved': [],
+                'objective': 'Trả lời đúng điều khách đang nói', 'next_action': next_action,
+                'question': None, 'handoff_reason': None})
+
         def final(text, reply_text, *, asks=False, question_text=None):
             reply = {'reply_text': reply_text, 'fact_ids': [], 'memory_ids': [], 'claims': [],
-                'asks_question': asks, 'question': {'kind': 'conversation', 'field': None,
+                'product_claims': [], 'fact_proposals': [], 'asks_question': asks, 'question': {'kind': 'conversation', 'field': None,
                     'text': question_text} if asks else None}
             semantic = persona_semantic(text)
             semantic['operations'][0].update(request_ref=None, source_message_id=None)
@@ -155,7 +162,7 @@ class GeneratedSandboxTests(unittest.TestCase):
             {'predicate': 'usage_need', 'value': 'cuối tuần hay đi xa',
              'evidence_excerpt': 'cuối tuần hay đi xa', 'subject': 'customer',
              'certainty': 'explicit'}]}
-        first_calls = [tool('record_customer_facts', facts),
+        first_calls = [plan(first_text), tool('record_customer_facts', facts),
                        final(first_text, question, asks=True, question_text=question)]
         seen_contexts = []
 
@@ -174,6 +181,8 @@ class GeneratedSandboxTests(unittest.TestCase):
         def second_model(context, transcript, _schema, _timeout, **_kwargs):
             seen_contexts.append(context)
             if not transcript:
+                return plan(second_text)
+            if transcript[-1].get('tool_result', {}).get('status') == 'ACCEPTED':
                 return tool('retrieve', {'kind': 'product_facts', 'topic': None, 'query': None,
                     'keys': ['list_price'], 'entities': {'vehicle': 'Creta', 'location': None, 'people': []},
                     'time_start': None, 'time_end': None, 'variant': None})
@@ -189,6 +198,97 @@ class GeneratedSandboxTests(unittest.TestCase):
                          ['customer', 'assistant'])
         self.assertEqual(seen_contexts[0]['history'][0]['text'], first_text)
         self.assertEqual(seen_contexts[0]['history'][1]['text'], question)
+
+    def test_multi_intent_interest_answers_persona_first_without_handoff(self):
+        from app.customer_facts import list_customer_facts
+
+        conversation = self.conversation
+        conversation['model_led'] = True
+        conversation['engine'].model_led_conversation = True
+        text = 'Bác đi xe màu gì thế? Em cũng đang cân nhắc con này cho gia đình.'
+        post_text = 'Mình đang chia sẻ trải nghiệm với Hyundai Creta.'
+        conversation['post']['text'] = post_text
+        conversation['post']['vehicles'] = ['Creta']
+        conversation['postcard'].update(text=post_text, vehicles=['Creta'])
+        conversation['postcard']['persona_authored_post']['text'] = post_text
+        expected_question = 'Nhà mình thường đi mấy người ạ?'
+        plan = {'intents': [
+            {'kind': 'persona_question', 'subject': 'persona', 'normalized': 'màu xe persona',
+             'evidence': 'Bác đi xe màu gì thế?', 'context_source': 'current_comment', 'certainty': 'explicit'},
+            {'kind': 'buying_interest', 'subject': 'customer', 'normalized': 'đang cân nhắc Creta cho gia đình',
+             'evidence': 'Em cũng đang cân nhắc con này cho gia đình.', 'context_source': 'post', 'certainty': 'explicit'},
+            {'kind': 'share_need', 'subject': 'customer', 'normalized': 'đi xe cho gia đình',
+             'evidence': 'cho gia đình', 'context_source': 'current_comment', 'certainty': 'explicit'}],
+            'priority_order': [0, 1, 2], 'unresolved': [],
+            'objective': 'Trả lời màu xe trước, ghi nhận nhu cầu gia đình và tiếp nối tự nhiên',
+            'next_action': 'ask', 'question': expected_question, 'handoff_reason': None}
+
+        def tool(action, payload):
+            return {'ok': True, 'message': {'schema_version': 'conversation_tools_v1',
+                'message': {'action': action, 'payload': payload}}, 'attempts': 1,
+                'usage': {'prompt_tokens': 10, 'completion_tokens': 12},
+                'cost_usd_est': 0.001, 'cost_unknown': False, 'model_effective': 'fixture/luna'}
+
+        peer = {'speaker_intent': 'buying_interest', 'address_term': 'bác',
+            'persona_topic': 'vehicle_current', 'asks_persona_question': True,
+            'claims': [{'predicate': 'usage_need', 'value': 'cho gia đình',
+                'evidence_excerpt': 'cho gia đình'}], 'evidence_excerpt': text}
+        semantic = {'schema_version': '2', 'sentiment': 'NEU', 'sarcasm': 'absent',
+            'scope': 'in_scope', 'requests': [{'topic': 'buy', 'desired_outcome': 'considering',
+                'polarity': 'positive'}], 'operations': [{'op': 'START_REQUEST',
+                'evidence_excerpt': text, 'request_ref': 'topic:buy', 'topic': 'buy',
+                'request': None, 'slot': None, 'source_message_id': None}],
+            'uncertainties': [], 'intent_labels': ['buy'], 'category': 'sales',
+            'tags': ['multi_intent']}
+        reply_text = 'Xe mình màu trắng. ' + expected_question
+        final = {'schema_version': 'persona_turn_v1', 'semantic': semantic,
+            'reply': {'reply_text': reply_text, 'fact_ids': ['new1'], 'memory_ids': [],
+                'claims': [{'text': 'Xe mình màu trắng.', 'subject': 'persona', 'predicate': 'gen.car',
+                    'fact_ids': ['new1'], 'memory_ids': [], 'message_ids': []}],
+                'product_claims': [], 'fact_proposals': [{'proposal_id': 'new1',
+                    'namespace': 'car', 'slug': 'color', 'value': 'Trắng', 'precision': 'exact'}],
+                'asks_question': True, 'question': {'kind': 'conversation', 'field': None,
+                    'text': expected_question}},
+            'diagnostics': None, 'peer_interpretation': peer}
+
+        def provider(_context, transcript, _schema, _timeout, **_kwargs):
+            if not transcript:
+                return tool('plan', plan)
+            action = transcript[-2]['message']['action']
+            if action == 'plan':
+                return tool('retrieve', {'kind': 'persona_facts', 'topic': 'vehicle_current',
+                    'query': None, 'keys': ['vehicle.current.color'],
+                    'entities': {'vehicle': 'Creta', 'location': None, 'people': []},
+                    'time_start': None, 'time_end': None, 'variant': None})
+            if action == 'retrieve':
+                self.assertEqual(transcript[-1]['tool_result']['status'], 'NOT_FOUND')
+                return tool('record_customer_facts', {'facts': [
+                    {'predicate': 'usage_need', 'value': 'cho gia đình',
+                     'evidence_excerpt': 'cho gia đình', 'subject': 'customer', 'certainty': 'explicit'},
+                    {'predicate': 'interested_vehicle', 'value': 'Creta',
+                     'evidence_excerpt': 'con này', 'subject': 'customer', 'certainty': 'inferred'}]})
+            self.assertEqual(action, 'record_customer_facts')
+            self.assertEqual(transcript[-1]['tool_result']['status'], 'RECORDED')
+            return tool('final', final)
+
+        with patch('app.adapters.luna.call_luna_tool', side_effect=provider):
+            turn = self.app.turn(conversation, {'text': text})['turn']
+
+        self.assertEqual(turn.get('generation_validation'), 'OK', turn)
+        self.assertEqual(turn['response_text'], reply_text)
+        self.assertTrue(turn['outbound_permission'])
+        self.assertIn('AUTO_REPLY', turn['routing'])
+        self.assertNotIn('HANDOFF_DRAFT_ONLY', turn['routing'])
+        self.assertEqual(turn['semantic']['intent_labels'], ['buy'])
+        facts = list_customer_facts(conversation['engine'].persona_store,
+            self.app.event(conversation, text, turn['comment_id']))
+        self.assertEqual({(row['predicate'], row['value'], row['certainty']) for row in facts}, {
+            ('usage_need', 'cho gia đình', 'explicit'),
+            ('interested_vehicle', 'Creta', 'inferred')})
+        generated = conversation['engine'].persona_store.list_generated(
+            conversation['post']['persona_id'])
+        self.assertEqual([(row['fact_key'], row['value_text'], row['status']) for row in generated],
+            [('gen.car.color', 'Trắng', 'ACTIVE')])
 
     def test_story_claim_allows_grounded_paraphrase_and_rejects_changed_place(self):
         from app.persona_stories import StoryStore
@@ -207,6 +307,16 @@ class GeneratedSandboxTests(unittest.TestCase):
         self.assertEqual(accepted['status'], 'ACCEPTED', accepted)
         memory = accepted['memory']
         memory_id = memory['memory_id']
+
+        retrieved = StoryStore(repo).retrieve(snapshot, topic='chuyến đi',
+            query='Mình đi Đà Lạt bằng Creta')
+        self.assertEqual(retrieved['status'], 'FOUND')
+        retrieved['memories'][0]['already_told_to_customer'] = True
+        metadata_candidate = {'memory_ids': [memory_id], 'claims': [{
+            'predicate': 'gen.memory', 'text': memory['event'], 'memory_ids': [memory_id]}]}
+        _, _, metadata_error = engine._attach_cited_stories(snapshot,
+            {'stories': retrieved['memories']}, metadata_candidate)
+        self.assertIsNone(metadata_error)
 
         def attach(text):
             candidate = {'memory_ids': [memory_id], 'claims': [{
@@ -455,7 +565,7 @@ class GeneratedSandboxTests(unittest.TestCase):
             (persona['id'],)).fetchall()
         self.assertEqual([row[0] for row in facts], ['DISCARDED'])
 
-    def test_generated_post_validation_failure_discards_pending_facts(self):
+    def test_generated_post_content_is_not_validated_and_proposals_activate(self):
         post_text = 'Cuối tuần mình hay đi Đà Lạt.'
         candidate = {'post_text': post_text, 'fact_ids': ['new1'], 'memory_ids': [],
             'claims': [{'text': post_text, 'subject': 'persona', 'predicate': 'gen.trip',
@@ -474,15 +584,18 @@ class GeneratedSandboxTests(unittest.TestCase):
         persona = next(p for p in self.app.personas() if p.get('slug') == 'nam_creta')
         with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-only-key'}), \
              patch('sandbox.server.call_luna', side_effect=call):
-            with self.assertRaisesRegex(ValueError, 'chưa vượt qua kiểm tra'):
-                self.app.create({'actor_id': 'post-validation-failure', 'persona_id': persona['id']})
+            created = self.app.create({'actor_id': 'post-validation-disabled', 'persona_id': persona['id']})
+        self.assertTrue(created['id'])
+        post = self.app.conversations[created['id']]['post']
+        self.assertEqual(post['text'], post_text)
+        self.assertEqual(post['generation']['generation_validation']['status'], 'SKIPPED')
 
         facts = self.app.persona_repository().conn.execute(
             "SELECT status FROM persona_generated_facts WHERE persona_id=? AND source_ref LIKE 'luna_generated_post:%'",
             (persona['id'],)).fetchall()
-        self.assertEqual([row[0] for row in facts], ['DISCARDED'])
+        self.assertEqual([row[0] for row in facts], ['ACTIVE'])
 
-    def test_generated_post_validator_exception_discards_pending_facts(self):
+    def test_generated_post_does_not_call_reply_validator(self):
         post_text = 'Cuối tuần mình hay đi Đà Lạt.'
         candidate = {'post_text': post_text, 'fact_ids': ['new1'], 'memory_ids': [],
             'claims': [{'text': post_text, 'subject': 'persona', 'predicate': 'gen.trip',
@@ -501,14 +614,15 @@ class GeneratedSandboxTests(unittest.TestCase):
         persona = next(p for p in self.app.personas() if p.get('slug') == 'nam_creta')
         with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-only-key'}), \
              patch('sandbox.server.call_luna', side_effect=call), \
-             patch('app.persona_generation.validate_generated_post', side_effect=RuntimeError('validator failed')):
-            with self.assertRaisesRegex(RuntimeError, 'validator failed'):
-                self.app.create({'actor_id': 'post-validator-failure', 'persona_id': persona['id']})
+             patch('app.persona_generation.validate_generated_post', side_effect=RuntimeError('validator failed')) as validator:
+            created = self.app.create({'actor_id': 'post-validator-disabled', 'persona_id': persona['id']})
+        self.assertTrue(created['id'])
+        validator.assert_not_called()
 
         facts = self.app.persona_repository().conn.execute(
             "SELECT status FROM persona_generated_facts WHERE persona_id=? AND source_ref LIKE 'luna_generated_post:%'",
             (persona['id'],)).fetchall()
-        self.assertEqual([row[0] for row in facts], ['DISCARDED'])
+        self.assertEqual([row[0] for row in facts], ['ACTIVE'])
 
     def test_generated_post_audit_failure_discards_pending_facts(self):
         from app.state import Store

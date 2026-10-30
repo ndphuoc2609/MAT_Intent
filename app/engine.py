@@ -872,7 +872,7 @@ class Engine(PersonaGenerationRuntime):
     def process(self, event, postcard, semantic, now_dt=None, trusted_context_texts=None,
                 trusted_source_ids=None, expected_state_token=None,
                 trusted_context_messages=None, attempt_token=None, attempt_result_callback=None,
-                reply_candidate=None, generation_context=None, peer_signals=None):
+                reply_candidate=None, generation_context=None, peer_signals=None, conversation_plan=None):
         peer_signals = validated_peer_signals(peer_signals, event.get('text', ''))
         if (postcard.get('persona_binding') and isinstance(semantic, dict)
                 and semantic.get('scope') == 'in_scope' and semantic.get('sarcasm') == 'absent'
@@ -898,6 +898,8 @@ class Engine(PersonaGenerationRuntime):
                       sends=[], state_changes=[], response_plan=None, response_text=None,
                       errors=[], audit=[], semantic=None, semantic_version=None,
                       intent_labels=[], category=None, tags=[], state_after=None)
+        if isinstance(conversation_plan, dict):
+            result['conversation_plan'] = conversation_plan
         with self.store.lock:
             self.store.conn.execute("BEGIN IMMEDIATE")
             trace_before = None
@@ -1056,6 +1058,17 @@ class Engine(PersonaGenerationRuntime):
                     result["routing"].append(pref_err)
                     self.store.audit(event["comment_id"], "review", result, now_iso)
                     commit_attempt(); return result
+                if self.model_led_conversation and isinstance(generation_context, dict):
+                    explicit_handoff = (isinstance(conversation_plan, dict)
+                        and conversation_plan.get('next_action') == 'handoff'
+                        and any(item.get('kind') == 'handoff' and item.get('subject') == 'customer'
+                            and item.get('certainty') == 'explicit'
+                            and item.get('evidence') in event.get('text', '')
+                            for item in conversation_plan.get('intents', []) if isinstance(item, dict)))
+                    # In model-led turns, product/interest intents go through the model's scoped tools.
+                    # Keep explicit stop/cancel and verified human handoff on the existing safety path.
+                    main_ops = [op for op in main_ops if op.get('op') == 'CANCEL_REQUEST'
+                        or (op.get('op') in ('REQUEST_HUMAN', 'REPORT_COMPLAINT') and explicit_handoff)]
                 # Opt-out gates trên blocks HIỆU LỰC: blocks hiện tại trừ các
                 # kênh mà lượt này xin mở lại. Nhờ vậy "allow_all khi đang bị
                 # chặn" vẫn qua gate được, nhưng "allow_call khi đang bị chặn
@@ -1222,7 +1235,18 @@ class Engine(PersonaGenerationRuntime):
                     result['routing'].append('SOCIAL_ACK')
                 if not touched:
                     self.store.conn.execute("RELEASE SAVEPOINT business")
-                    if "SOCIAL_ACK" in result["routing"]:
+                    if ("SOCIAL_ACK" in result["routing"] or
+                            (self.model_led_conversation and isinstance(generation_context, dict))):
+                        if (self.model_led_conversation and isinstance(conversation_plan, dict)
+                                and conversation_plan.get('next_action') == 'stop'):
+                            self._apply_peer_plan(event, peer_plan_from_signals(peer_signals, event['text'],
+                                self.store.peer_state(event), self.store.lead_profile(event), [], model_led=True)
+                                if peer_signals else dict(lead_updates=[], supersede=[], next_state=self.store.peer_state(event)),
+                                None, now_iso)
+                            result['routing'].append('MODEL_STOPPED')
+                            self.store.audit(event['comment_id'], 'model_stopped',
+                                {'conversation_plan': conversation_plan}, now_iso)
+                            commit_attempt(); return result
                         peer_plan = None
                         snapshot = None
                         if postcard.get('persona_binding') and self.persona_store:
