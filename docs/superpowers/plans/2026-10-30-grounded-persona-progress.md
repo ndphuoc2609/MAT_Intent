@@ -31,3 +31,7 @@ Branch: `codex/grounded-persona-20261030`. Existing dirty workspace state is pre
 - Human blind scoring was not run; the datasets are synthetic. Internal consistency checks do not establish generated stories are true. No Meta sends were performed.
 
 See `docs/demo/grounded-generation-implementation-2026-10-30.md` for measured transcripts, detailed routing and limitations.
+
+## Follow-up: post generation and database description
+
+Imported category, role, perspective and sample_quote into the bound release context for posts and replies, with revision detection. Empty post needs now receives allowed facts; post prompt clarifies citation predicates and the structured-output repair is bounded to one attempt. Current verification: 608 unit and 92 integration tests pass; two live synthetic persona post checks pass, and restarted sandbox API returns HTTP 201 with validation OK. The earlier A/B measurements have not been repeated for this follow-up.

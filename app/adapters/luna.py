@@ -121,6 +121,8 @@ PERSONA_TURN_SYSTEM = SYSTEM_V2.replace(
     "CHỈ trả JSON đúng schema v2, không giải thích thêm.",
     "CHỈ trả JSON đúng schema persona_turn_v1; trường semantic tuân theo schema v2.") + """
 Bạn phân tích comment và đề xuất một lời đáp persona trong cùng một JSON persona_turn_v1.
+persona_description cung cấp vai trò, nhóm persona, góc nhìn và sample_quote để định hướng giọng nói;
+sample_quote không phải bằng chứng về trải nghiệm cá nhân, vẫn phải dẫn fact cho claim.
 Giữ nguyên semantic v2 ở trường semantic; không dùng câu trả lời được sinh ra làm evidence.
 Tôn trọng peer_state đã xác minh: follow_up=stopped thì không tiếp tục hỏi mua. Đây là trạng thái engine, không phải lời khách mới.
 Trả lời đúng nhu cầu hiện tại; không nhắc lại xe đang đi hoặc dữ kiện persona khác nếu không liên quan.
@@ -190,6 +192,9 @@ vào trường semantic của output. Không diễn giải lại ý định khá
 
 PERSONA_GENERATED_POST_SYSTEM = """CHỈ trả JSON đúng schema persona_post_v1, không giải thích thêm.
 Viết một bài Facebook ngắn tự nhiên dưới vai người tạo bài; đây là nội dung persona sẽ đăng.
+Viết tối đa hai câu ngắn. Ưu tiên fact có sẵn, không thêm lời bình chung, câu phủ định hoặc cảm xúc thiếu nguồn.
+persona_description mô tả nhóm người, vai trò, góc nhìn và câu mẫu về giọng nói; dùng để chọn giọng và chủ đề.
+Không lấy sample_quote làm bằng chứng về trải nghiệm hay dữ kiện cá nhân; claim phải dẫn facts hoặc proposal.
 Chỉ dùng facts, memories và voice_guide được cấp. Nếu muốn thêm chi tiết đời sống mới, chỉ được
 đưa chi tiết đó vào fact_proposals và dẫn proposal_id tương ứng trong claims[].fact_ids; không
 đưa chi tiết mới vào post_text nếu không có proposal. Không tạo giá, ưu đãi, tồn kho, thông số,
@@ -486,7 +491,7 @@ def _permitted_persona_context(value):
     if not isinstance(value, dict):
         return {"facts": [], "memories": [], "voice": {}, "voice_guide": {}}
     result = {key: value[key] for key in ("facts", "memories", "voice", "voice_guide", "peer_state",
-        "fixture_only", "source_kind", "needs", "gaps", "phase_one_analysis",
+        "fixture_only", "source_kind", "needs", "gaps", "phase_one_analysis", "persona_description",
         "persona_authored_post", "persona_authored_post_fact_ids") if key in value}
     for key in ("facts", "memories"):
         if isinstance(result.get(key), list):

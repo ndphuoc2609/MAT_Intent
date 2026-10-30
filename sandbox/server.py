@@ -208,6 +208,7 @@ class Sandbox:
             (fact.get("key") or fact.get("canonical_key", "")).startswith(f"gen.{topic}.")
             or (fact.get("key") or fact.get("canonical_key")) in topic_keys for fact in selected))
         context = {"persona_uuid": persona_id, "release_id": release_id,
+            "persona_description": snapshot.get('release', {}).get('style', {}).get('persona_description', {}),
             "fixture_only": snapshot.get("fixture_only", False),
             "source_kind": snapshot["persona"].get("source_kind"), "facts": selected,
             "needs": needs, "gaps": gaps,

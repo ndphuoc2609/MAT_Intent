@@ -348,8 +348,16 @@ def seed_database_persona(store, persona, approved_by="sandbox-snapshot-importer
                 values[key] = None
     tone = persona.get("tone")
     tone = tone.strip()[:80] if isinstance(tone, str) else "neutral"
+    description = {}
+    for field in ('category', 'role', 'perspective', 'sample_quote'):
+        value = persona.get(field)
+        if value is not None:
+            if not isinstance(value, str) or len(value) > 3000 or '\x00' in value:
+                raise ValueError(f'invalid persona {field}')
+            if value.strip():
+                description[field] = value.strip()
     identity = hashlib.sha256(str(source_id).strip().encode()).hexdigest()
-    source_digest = hashlib.sha256(json.dumps([name.strip(), values, tone], sort_keys=True,
+    source_digest = hashlib.sha256(json.dumps([name.strip(), values, tone, description], sort_keys=True,
         ensure_ascii=False).encode()).hexdigest()
     slug = "db_persona_" + identity[:32]
     existing = store.conn.execute("SELECT persona_id,status FROM personas WHERE slug=?", (slug,)).fetchone()
@@ -366,7 +374,8 @@ def seed_database_persona(store, persona, approved_by="sandbox-snapshot-importer
         store.approve_persona(pid, approved_by)
     source_ref = f"content_ai_fac.public.personas:{str(source_id).strip()}"
     release = store.create_release(pid, style={"tone": tone, "data_origin": "database_snapshot",
-                                               "source_digest": source_digest})
+                                               "source_digest": source_digest,
+                                               "persona_description": description})
     facts = (("identity", "identity.name", name.strip()),
              ("occupation", "occupation.title", values["occupation"]),
              ("vehicle", "vehicle.current.model", values["car_owned"]))
