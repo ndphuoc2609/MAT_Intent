@@ -25,12 +25,33 @@ def model_result(sem=None, attempts=1, cost=0.0001, **extra):
 
 
 class SandboxHTTPTests(unittest.TestCase):
+    def test_persona_post_uses_bound_facts_without_vehicle_selection(self):
+        personas = [{'id': 'tram-post', 'name': 'Bảo Trâm Tiktoker',
+                     'car_owned': 'VinFast VF3 vàng nóc trắng', 'occupation': 'Content Creator'}]
+        with patch('sandbox.server.Sandbox.personas', return_value=personas), \
+             patch('sandbox.server.Sandbox.generate_post', return_value='Chuyện đi làm bằng VF3') as generate:
+            state = self.conversation(post_id=None, persona_id='tram-post')
+            self.assertEqual(state['post']['vehicles'], ['VinFast VF3 vàng nóc trắng'])
+            self.assertNotIn('Hyundai', state['post']['title'])
+            snapshot = generate.call_args.args[1]
+            self.assertIn('VinFast VF3 vàng nóc trắng', [f['value'] for f in snapshot['facts']])
+            self.assertEqual(snapshot['release']['id'], state['post']['release_id'])
+            self.assertEqual(state['post']['text'], 'Chuyện đi làm bằng VF3')
+
+    def test_persona_without_car_has_no_default_vehicle_in_post(self):
+        with patch('sandbox.server.Sandbox.personas', return_value=[{'id':'no-car','name':'An'}]), \
+             patch('sandbox.server.Sandbox.generate_post', return_value='Chia sẻ của An'):
+            state = self.conversation(post_id=None, persona_id='no-car')
+            self.assertEqual(state['post']['vehicles'], [])
+
     def setUp(self):
         from sandbox.server import Sandbox
         self.tmp = tempfile.TemporaryDirectory()
         self.ledger = str(Path(self.tmp.name) / "budget.jsonl")
         self.http = SimpleNamespace(app=Sandbox(ledger_path=self.ledger,
             persona_db_path=str(Path(self.tmp.name) / "personas.sqlite3")))
+        if "jev" in self._testMethodName:
+            self.http.app.jev_shadow_enabled = True
         self.network = patch("urllib.request.OpenerDirector.open", side_effect=AssertionError("network forbidden"))
         self.network.start()
 
@@ -65,8 +86,18 @@ class SandboxHTTPTests(unittest.TestCase):
     def conversation(self, **fields):
         payload = dict(post_id="creta", actor_id="customer-1")
         payload.update(fields)
+        if payload.get("persona_id"):
+            # All non-fixture personas in these contracts are synthetic test rows.
+            # This marker is intentionally not evidence of real-person consent.
+            payload.setdefault("persona_use_consent", True)
+            payload.setdefault("persona_consent_ref", "sandbox-evaluation-test-only")
         status, state = self.request("POST", "/api/conversations", payload)
         self.assertEqual(status, 201, state)
+        # These contract tests exercise the pre-generation semantic path; the dedicated
+        # generated-sandbox integration tests cover the default draft workflow.
+        if payload.get("persona_id"):
+            self.http.app.conversations[state["id"]]["generation_mode"] = "legacy"
+            state["generation_mode"] = "legacy"
         return state
 
     def turn(self, state, text="giá bao nhiêu"):
@@ -327,15 +358,16 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertIn("uncapped", health["budget_warning"].lower())
 
     def test_persona_selection_generates_post_for_chat_context(self):
-        personas = [{"id": "advisor", "name": "Tư vấn viên"}]
+        personas = [{"id": "advisor", "name": "Tư vấn viên", "car_owned": "Creta"}]
         with patch("sandbox.server.Sandbox.personas", return_value=personas), \
              patch("sandbox.server.Sandbox.generate_post", return_value="Bài viết về Creta"):
             status, result = self.request("GET", "/api/personas")
             self.assertEqual(status, 200)
             self.assertTrue(any(item["id"] == "advisor" for item in result["personas"]))
-            self.assertIn("Creta", result["vehicles"])
+            self.assertNotIn("vehicles", result)
             state = self.conversation(post_id=None, persona_id="advisor", vehicle="Creta")
-        self.assertEqual(state["post"]["persona_id"], "advisor")
+        binding = self.http.app.persona_store.get_binding_snapshot(state['page_id'], state['post']['id'])
+        self.assertEqual(state["post"]["persona_id"], binding['persona_uuid'])
         self.assertEqual(state["post"]["vehicles"], ["Creta"])
         self.assertIn("Creta", state["post"]["text"])
 
@@ -370,7 +402,9 @@ class SandboxHTTPTests(unittest.TestCase):
             "uncertainties": []}
         with patch("sandbox.server.call_luna", return_value=model_result(first_semantic)):
             _, first = self.turn(state, first_text)
-        self.assertEqual(first["turn"]["response_text"], "Mình ở Hà Nội.")
+        self.assertTrue(first["turn"]["response_text"].startswith("Mình ở Hà Nội."))
+        # A question about Nam is answered; it is not turned into a sales question.
+        self.assertEqual(first["turn"]["response_text"].count('?'), 0)
         self.assertTrue(first["turn"]["response_plan"]["fictional_fixture"])
         root_record = self.http.app.persona_store.root_analysis(
             state["page_id"], state["post"]["id"], state["thread_id"])
@@ -393,7 +427,65 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertEqual(root["text"], first_text)
         self.assertEqual(root["actor_id"], "customer-1")
         self.assertEqual(root["semantic"], first["turn"]["semantic"])
-        self.assertEqual(second["turn"]["response_text"], "Mình đang đi Hyundai Creta.", second["turn"])
+        self.assertTrue(second["turn"]["response_text"].startswith("Mình đang đi Hyundai Creta."), second["turn"])
+
+    def test_fixture_demo_two_actors_persona_sample_price_and_handoff(self):
+        _, personas = self.request("GET", "/api/personas")
+        fixture = next(p for p in personas["personas"] if p["slug"] == "nam_creta")
+        with patch('sandbox.server.Sandbox.generate_post', return_value='Cùng trao đổi về Hyundai Creta.'):
+            state = self.conversation(post_id=None, persona_id=fixture["id"])
+        captured = []
+        def model(_post, text, **kwargs):
+            captured.append(json.loads(kwargs["context"]))
+            base = {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent", "scope": "in_scope",
+                    "requests": [{"topic": "social", "desired_outcome": "ack", "polarity": "positive"}],
+                    "operations": [{"op": "SOCIAL_ACK", "evidence_excerpt": text}], "uncertainties": []}
+            if text.startswith("Giá niêm yết"):
+                base["requests"] = [{"topic": "price", "desired_outcome": "price", "polarity": "positive"}]
+                base["operations"] = [
+                    {"op": "START_REQUEST", "request_ref": "topic:price", "evidence_excerpt": "Giá",
+                     "slot": {"kind": "vehicle", "value": "Creta", "explicit": True, "evidence_excerpt": "Creta"}},
+                    {"op": "UPDATE_SLOT", "request_ref": "topic:price", "evidence_excerpt": "bản cao",
+                     "slot": {"kind": "variant", "value": "Cao cấp", "explicit": True, "evidence_excerpt": "bản cao"}},
+                    {"op": "UPDATE_SLOT", "request_ref": "topic:price", "evidence_excerpt": "Giá niêm yết",
+                     "slot": {"kind": "price_kind", "value": "list", "explicit": True, "evidence_excerpt": "Giá niêm yết"}}]
+            elif text.startswith("Tôi muốn mua"):
+                base["requests"] = [{"topic": "buy", "desired_outcome": "buy_intent", "polarity": "positive"}]
+                base["operations"] = [{"op": "START_REQUEST", "request_ref": "topic:buy", "evidence_excerpt": "mua",
+                    "slot": {"kind": "vehicle", "value": "Creta", "explicit": True, "evidence_excerpt": "Creta"}}]
+            elif text.startswith("Xe bị hỏng"):
+                base["requests"] = [{"topic": "complaint", "desired_outcome": "complaint", "polarity": "negative"}]
+                base["operations"] = [{"op": "REPORT_COMPLAINT", "request_ref": "topic:complaint", "evidence_excerpt": "hỏng điều hòa"}]
+            return model_result(base, attempts=0)
+        turns = [
+            ("customer-1", "Bạn ở đâu vậy?", "Hà Nội"),
+            ("customer-1", "Bạn đang đi xe gì?", "Hyundai Creta"),
+            ("customer-1", "Bạn mua xe khi nào?", "3/2024"),
+            ("customer-1", "Bạn mua xe trả góp không?", "35%"),
+            ("customer-1", "Xe của bạn mua bao giờ?", "3/2024"),
+            ("customer-2", "Bạn ở quận nào?", "Cầu Giấy"),
+            ("customer-2", "Bạn mua xe ở đại lý nào?", "chưa có thông tin xác nhận"),
+            ("customer-2", "Giá niêm yết Creta bản cao bao nhiêu?", "chưa có dữ liệu xác nhận"),
+            ("customer-1", "Tôi muốn mua Creta", None),
+            ("customer-2", "Xe bị hỏng điều hòa", None),
+        ]
+        results = []
+        with patch("sandbox.server.call_luna", side_effect=model), patch.object(self.http.app, "start_jev_shadow", return_value=None):
+            for actor, text, expected in turns:
+                status, state = self.request("POST", f"/api/conversations/{state['id']}/turn", {"text": text, "actor_id": actor})
+                self.assertEqual(status, 200, state)
+                turn = state["turn"]
+                results.append(turn)
+                if expected:
+                    self.assertIn(expected, turn["response_text"] or "", turn)
+        self.assertNotIn("Bạn mua xe khi nào?", json.dumps(captured[5], ensure_ascii=False))
+        self.assertTrue(results[0]["response_plan"]["fact_ids"])
+        self.assertFalse(state["sample_facts"])
+        self.assertNotIn("SAMPLE", results[7]["response_text"] or "")
+        self.assertFalse(results[7]["response_plan"].get("facts_used"))
+        self.assertIn("HANDOFF_DRAFT_ONLY", results[9]["routing"])
+        self.assertFalse(results[9]["sends"])
+        self.assertTrue(any(e["purpose"] == "handoff_draft" for e in results[9]["effects"]))
 
     def test_persona_tone_changes_wording_without_changing_intent_or_pending(self):
         personas = [{"id": "warm", "name": "An", "tone": "thân thiện"},
@@ -462,52 +554,291 @@ class SandboxHTTPTests(unittest.TestCase):
             self.assertEqual(result["personas"][0]["id"], "201")
             state = self.conversation(post_id=None, persona_id="201", vehicle="Tucson")
             self.assertEqual(state["post"]["text"], "Bài viết dài về Tucson")
-            self.assertEqual(generate.call_args.args, (personas[0], "Tucson"))
-            self.assertEqual(set(generate.call_args.kwargs), {"_metrics"})
+            self.assertEqual(generate.call_args.args[0], personas[0])
+            self.assertEqual(generate.call_args.args[1]['release']['id'], state['post']['release_id'])
+            self.assertEqual(state['post']['vehicles'], [])
+            self.assertEqual(state['post']['persona_origin'], 'database_snapshot')
+            self.assertEqual(set(generate.call_args.kwargs), {"_metrics", "owner_id"})
+
+    def test_database_persona_can_start_without_consent_fields(self):
+        personas = [{"id": "db-direct", "name": "Synthetic DB person"}]
+        with patch("sandbox.server.Sandbox.personas", return_value=personas), \
+             patch("sandbox.server.Sandbox.generate_post", return_value="Bài viết"):
+            status, result = self.request("POST", "/api/conversations",
+                {"actor_id": "customer-1", "persona_id": "db-direct"})
+        self.assertEqual(status, 201, result)
+        self.assertEqual(result['post']['persona_origin'], 'database_snapshot')
+
+    def test_database_persona_source_id_stays_server_side_and_snapshot_is_not_reimported(self):
+        import psycopg
+        source_id = 'upstream-private-person-731'
+        source = {"id": source_id, "name": "Synthetic DB person", "occupation": "Giáo viên",
+                  "car_owned": "Hyundai Tucson", "tone": "warm", "category": "user"}
+        with patch.dict(os.environ, {"DB_Host": "db.example", "DB_Username": "sandbox",
+                                    "DB_Password": "unused"}), \
+             patch("psycopg.connect") as connect, \
+             patch.object(self.http.app, "generate_post", return_value="Bài viết demo"):
+            connect.return_value.__enter__.return_value.execute.return_value = [source]
+            status, listed = self.request("GET", "/api/personas")
+            self.assertEqual(status, 200, listed)
+            selected = next(persona for persona in listed["personas"]
+                            if persona["name"] == source["name"])
+            self.assertNotEqual(selected["id"], source_id)
+            self.assertNotIn(source_id, json.dumps(listed))
+            state = self.http.app.create({"actor_id": "customer-1", "persona_id": selected["id"]})
+            self.assertNotIn(source_id, json.dumps(state))
+            binding = self.http.app.persona_store.get_binding_snapshot(
+                state["page_id"], state["post"]["id"])
+            self.assertEqual({fact["key"] for fact in binding["facts"]},
+                             {"identity.name", "occupation.title", "vehicle.current.model"})
+            options = self.http.app.personas()
+            self.assertEqual(sum(persona["name"] == source["name"] for persona in options), 1)
+
+    def test_database_persona_consent_attestation_is_not_added_to_model_prompt(self):
+        personas = [{"id": "db-prompt-scope", "name": "Synthetic DB person"}]
+        captured = []
+
+        def luna(*args, **kwargs):
+            captured.append(kwargs)
+            return model_result()
+
+        with patch("sandbox.server.Sandbox.personas", return_value=personas), \
+             patch("sandbox.server.Sandbox.generate_post", return_value="Synthetic database persona post."), \
+             patch("sandbox.server.call_luna", side_effect=luna):
+            state = self.conversation(post_id=None, persona_id="db-prompt-scope")
+            status, result = self.turn(state, "giá bao nhiêu")
+
+        self.assertEqual(status, 200, result)
+        self.assertTrue(captured)
+        self.assertNotIn("sandbox-evaluation-test-only", captured[0]["context"])
+        self.assertNotIn("sandbox-evaluation-test-only", str(captured[0].get("persona_context", "")))
+
+    def test_database_persona_uses_own_demo_facts_and_peer_flow(self):
+        persona = {"id": "21", "name": "Coach Tuấn Gym", "car_owned": "Ford Ranger XLS",
+                   "occupation": "Huấn luyện viên thể hình", "tone": "thân thiện"}
+        def luna(_post, text, **kwargs):
+            social = {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent", "scope": "in_scope",
+                "requests": [{"topic": "social", "desired_outcome": "ack", "polarity": "positive"}],
+                "operations": [{"op": "SOCIAL_ACK", "evidence_excerpt": text}], "uncertainties": []}
+            if kwargs.get('persona_phase') == 'analysis':
+                topic, key, intent = None, None, 'social'
+                asks = False
+                if 'đi bằng xe gì' in text:
+                    topic, key, asks = 'vehicle_current', 'vehicle.current.model', True
+                elif 'mua ở đâu' in text:
+                    topic, key, asks = 'purchase_finance', 'purchase.dealer', True
+                elif 'cũng tính mua' in text:
+                    intent = 'buying_interest'
+                peer = {"speaker_intent": intent, "address_term": None,
+                    "persona_topic": topic, "asks_persona_question": asks,
+                    "claims": [], "evidence_excerpt": text}
+                return model_result(social, peer_signals=peer,
+                    needs={"topics": [topic] if topic else [], "keys": [key] if key else []})
+            if text.startswith('chào'):
+                candidate = {"reply_text": "Chào bạn!", "fact_ids": [], "memory_ids": [],
+                    "claims": [], "asks_question": False, "question": None, "fact_proposals": []}
+            elif 'đi bằng xe gì' in text:
+                fact = next(fact for fact in kwargs['persona_context']['facts']
+                            if fact['key'] == 'vehicle.current.model')
+                reply = 'Mình đang đi Ford Ranger XLS.'
+                candidate = {"reply_text": reply, "fact_ids": [fact['fact_id']], "memory_ids": [],
+                    "claims": [{"text": reply, "subject": "persona", "predicate": fact['key'],
+                        "fact_ids": [fact['fact_id']], "memory_ids": [], "message_ids": []}],
+                    "asks_question": False, "question": None, "fact_proposals": []}
+            elif 'cũng tính mua' in text:
+                question = 'Bạn đang nghiêng về mẫu xe nào?'
+                candidate = {"reply_text": question, "fact_ids": [], "memory_ids": [], "claims": [],
+                    "asks_question": True, "question": {"kind": "lead", "field": "interested_vehicle",
+                        "text": question}, "fact_proposals": []}
+            else:
+                return model_result(social, reply_candidate=None)
+            return model_result(social, reply_candidate=candidate)
+        with patch("sandbox.server.Sandbox.personas", return_value=[persona]), \
+             patch("sandbox.server.Sandbox.generate_post", return_value="Mình tập gym và chia sẻ chuyện xe."), \
+             patch("sandbox.server.call_luna", side_effect=luna):
+            state = self.conversation(post_id=None, persona_id="21", vehicle="Creta")
+            self.http.app.conversations[state['id']]['generation_mode'] = 'generated'
+            self.assertFalse(state['post']['persona_fixture_only'])
+            self.assertFalse(state['sample_facts'])
+            _, response = self.turn(state, 'chào bác')
+            self.assertTrue(response['turn']['outbound_permission'], response['turn'])
+            self.assertNotIn('Nam', response['turn']['response_text'] or '')
+            _, response = self.turn(state, 'tập gym bác đi bằng xe gì')
+            self.assertIn('Ford Ranger XLS', response['turn']['response_text'] or '')
+            self.assertNotIn('Hyundai Creta', response['turn']['response_text'] or '')
+            _, response = self.turn(state, 'xe đó bác mua ở đâu')
+            self.assertFalse(response['turn']['outbound_permission'])
+            self.assertNotIn('đại lý', response['turn']['response_text'] or '')
+            self.assertEqual(response['pending'], [])
+            _, response = self.turn(state, 'tôi cũng tính mua')
+            self.assertTrue(response['turn']['outbound_permission'], response['turn'])
+            self.assertEqual(response['pending'][0]['expected_slot'], 'interested_vehicle')
+
+    def test_database_persona_mixed_purchase_and_opinion_uses_own_facts(self):
+        persona = {'id': 'tram-test', 'name': 'Bảo Trâm Tiktoker',
+                   'car_owned': 'VinFast VF3 vàng nóc trắng', 'occupation': 'Content Creator'}
+        def luna(_post, text, **kwargs):
+            social = {'schema_version': '1', 'sentiment': 'NEU', 'sarcasm': 'absent', 'scope': 'in_scope',
+                'requests': [{'topic': 'social', 'desired_outcome': 'ack', 'polarity': 'positive'}],
+                'operations': [{'op': 'SOCIAL_ACK', 'evidence_excerpt': text}], 'uncertainties': []}
+            if kwargs.get('persona_phase') == 'analysis':
+                claims = []
+                topic, asks = None, False
+                if text.startswith('cũng tính mua'):
+                    claims = [{'predicate': 'interested_vehicle', 'value': 'Creta',
+                               'evidence_excerpt': 'cũng tính mua creta'}]
+                    intent = 'buying_interest'
+                else:
+                    intent, topic, asks = 'buying_interest', 'vehicle_current', True
+                peer = {'speaker_intent': intent, 'address_term': None, 'persona_topic': topic,
+                    'asks_persona_question': asks, 'claims': claims, 'evidence_excerpt': text}
+                needs = {'topics': ['vehicle_current'], 'keys': ['vehicle.current.model']} if asks else {'topics': [], 'keys': []}
+                return model_result(social, peer_signals=peer, needs=needs)
+            if text.startswith('cũng tính mua'):
+                reply = 'Ừ, bạn cứ cân nhắc thêm nhé.'
+                return model_result(social, reply_candidate={'reply_text': reply, 'fact_ids': [],
+                    'memory_ids': [], 'claims': [], 'asks_question': False, 'question': None,
+                    'fact_proposals': []})
+            fact = next(fact for fact in kwargs['persona_context']['facts']
+                        if fact['key'] == 'vehicle.current.model')
+            reply = 'Mình đang đi VinFast VF3 vàng nóc trắng.'
+            return model_result(social, reply_candidate={'reply_text': reply, 'fact_ids': [fact['fact_id']],
+                'memory_ids': [], 'claims': [{'text': reply, 'subject': 'persona', 'predicate': fact['key'],
+                    'fact_ids': [fact['fact_id']], 'memory_ids': [], 'message_ids': []}],
+                'asks_question': False, 'question': None, 'fact_proposals': []})
+        with patch('sandbox.server.Sandbox.personas', return_value=[persona]), \
+             patch('sandbox.server.Sandbox.generate_post', return_value='Bài viết demo'), \
+             patch('sandbox.server.call_luna', side_effect=luna):
+            state = self.conversation(post_id=None, persona_id='tram-test', vehicle='Creta')
+            self.http.app.conversations[state['id']]['generation_mode'] = 'generated'
+            _, result = self.turn(state, 'cũng tính mua creta nè chị')
+            self.assertNotIn('đang đi xe đó rồi hay', result['turn']['response_text'] or '')
+            self.assertEqual(result['lead_profile']['interested_vehicle']['value'], 'Creta')
+            _, result = self.turn(state, 'tính mua nè, bạn đi thấy sao')
+            reply = result['turn']['response_text'] or ''
+            self.assertTrue(result['turn']['outbound_permission'], result['turn'])
+            self.assertIn('VinFast VF3', reply)
+            self.assertNotIn('Mình đang đi Creta', reply)
+            self.assertTrue(result['turn']['response_plan']['fact_ids'])
+            self.assertFalse(result['pending'])
+
+    def test_database_persona_occupation_question_can_survive_model_scope_misclassification(self):
+        persona = {"id": "8", "name": "Thầy Tuấn", "occupation": "Giảng viên Đại học Bách Khoa"}
+        text = 'anh làm nghề gì'
+        semantic = {"schema_version": "1", "sentiment": "NEU", "sarcasm": "absent", "scope": "out_of_scope",
+                    "requests": [], "operations": [{"op": "UNRESOLVED", "reason": "off topic", "evidence_excerpt": text}],
+                    "uncertainties": []}
+        analyses = 0
+        def luna(_post, comment, **kwargs):
+            nonlocal analyses
+            if kwargs.get('persona_phase') == 'analysis':
+                analyses += 1
+                current = dict(semantic)
+                if analyses > 1:
+                    current['sarcasm'] = 'uncertain'
+                return model_result(current, needs={'topics': ['occupation'], 'keys': ['occupation.title']})
+            fact = next(fact for fact in kwargs['persona_context']['facts']
+                        if fact['key'] == 'occupation.title')
+            reply = 'Mình là Giảng viên Đại học Bách Khoa.'
+            return model_result(reply_candidate={'reply_text': reply, 'fact_ids': [fact['fact_id']],
+                'memory_ids': [], 'claims': [{'text': reply, 'subject': 'persona',
+                    'predicate': 'occupation.title', 'fact_ids': [fact['fact_id']],
+                    'memory_ids': [], 'message_ids': []}], 'asks_question': False,
+                'question': None, 'fact_proposals': []})
+        with patch("sandbox.server.Sandbox.personas", return_value=[persona]), \
+             patch("sandbox.server.Sandbox.generate_post", return_value="Bài viết demo"), \
+             patch("sandbox.server.call_luna", side_effect=luna):
+            state = self.conversation(post_id=None, persona_id="8", vehicle="Creta")
+            self.http.app.conversations[state['id']]['generation_mode'] = 'generated'
+            _, result = self.turn(state, text)
+            self.assertIn('Giảng viên Đại học Bách Khoa', result['turn']['response_text'] or '', result['turn'])
+            _, result = self.turn(state, text)
+            self.assertFalse(result['turn'].get('outbound_permission'))
+
+    def test_database_persona_without_vehicle_does_not_invent_one(self):
+        persona = {'id': '99', 'name': 'Nhân vật mẫu', 'car_owned': 'chưa có xe'}
+        text = 'bác đi xe gì'
+        semantic = {'schema_version': '1', 'sentiment': 'NEU', 'sarcasm': 'absent', 'scope': 'in_scope',
+                    'requests': [{'topic': 'social', 'desired_outcome': 'question', 'polarity': 'unknown'}],
+                    'operations': [{'op': 'SOCIAL_ACK', 'evidence_excerpt': text}], 'uncertainties': []}
+        with patch('sandbox.server.Sandbox.personas', return_value=[persona]), \
+             patch('sandbox.server.Sandbox.generate_post', return_value='Bài viết demo'), \
+             patch('sandbox.server.call_luna', return_value=model_result(semantic)):
+            state = self.conversation(post_id=None, persona_id='99', vehicle='Creta')
+            _, result = self.turn(state, text)
+            self.assertNotIn('Mình đang đi', result['turn']['response_text'] or '')
+            self.assertNotIn('Creta', result['turn']['response_text'] or '')
 
     def test_generated_post_uses_persona_and_records_model_cost(self):
-        content = "Bài viết về Tucson. " * 20
-        response = io.BytesIO(json.dumps({"model": "provider/effective-model",
-                                          "choices": [{"message": {"content": content}}],
-                                          "usage": {"cost": 0.01, "prompt_tokens": 15,
-                                                    "completion_tokens": 30, "total_tokens": 45}}).encode())
-        sent = {}
-        def open_request(request, timeout):
-            sent["payload"] = json.loads(request.data)
-            return response
-        opener = SimpleNamespace(open=open_request)
+        repository = self.http.app.persona_repository()
+        from app.persona_fixture import seed_nam_creta
+        persona_id, release_id = seed_nam_creta(repository)
+        snapshot = repository.get_release_snapshot(persona_id, release_id)
+        vehicle = next(fact for fact in snapshot['facts'] if fact['key'] == 'vehicle.current.model')
+        post_text = "Mình đang đi Hyundai Creta."
+        candidate = {'post_text': post_text, 'fact_ids': [vehicle['fact_id']], 'claims': [
+            {'text': post_text, 'subject': 'persona', 'predicate': vehicle['key'],
+             'fact_ids': [vehicle['fact_id']], 'memory_ids': [], 'message_ids': []}],
+            'fact_proposals': []}
+        calls = []
+        def call(_post, _text, **kwargs):
+            calls.append(kwargs)
+            return {'ok': True,
+                'needs': {'topics': ['vehicle_current'], 'keys': ['vehicle.current.model']}
+                    if kwargs.get('persona_phase') == 'analysis' else None,
+                'post_candidate': candidate if kwargs.get('persona_phase') == 'post' else None,
+                'attempts': 1, 'usage': {'prompt_tokens': 15, 'completion_tokens': 30, 'total_tokens': 45},
+                'cost_usd_est': 0.01, 'cost_unknown': False, 'model_effective': 'provider/effective-model'}
         metrics = {}
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), \
-             patch("sandbox.server.urllib.request.build_opener", return_value=opener):
-            text = self.http.app.generate_post({"name": "An", "tone": "chân thành"}, "Tucson", _metrics=metrics)
-        self.assertEqual(text, content.strip())
-        self.assertEqual(sent["payload"]["max_tokens"], 600)
-        self.assertIn("100-180 từ", sent["payload"]["messages"][0]["content"])
-        self.assertEqual(metrics["usage"], {"prompt_tokens": 15, "completion_tokens": 30, "total_tokens": 45})
+             patch("sandbox.server.call_luna", side_effect=call):
+            text = self.http.app.generate_post({"name": "Nam", "tone": "warm"}, snapshot, _metrics=metrics)
+        self.assertEqual(text, post_text)
+        self.assertEqual([call['persona_phase'] for call in calls], ['analysis', 'post'])
+        self.assertIsNone(calls[0]['persona_context'])
+        self.assertIn(vehicle['fact_id'], {fact['fact_id'] for fact in calls[1]['persona_context']['facts']})
+        self.assertEqual(metrics["attempts"], 2)
+        self.assertEqual(metrics["usage"], {"prompt_tokens": 30, "completion_tokens": 60, "total_tokens": 90})
         self.assertEqual(metrics["model"], "provider/effective-model")
-        self.assertEqual(metrics["cost_usd_est"], 0.01)
+        self.assertEqual(metrics["cost_usd_est"], 0.02)
         self.assertGreaterEqual(metrics["generation_latency_ms"], metrics["model_latency_ms"])
         records = [json.loads(line) for line in Path(self.ledger).read_text().splitlines()]
-        self.assertTrue(any(row.get("kind") == "post" and row.get("cost_usd_est") == 0.01 and
+        self.assertEqual({row.get('kind') for row in records}, {'post_analysis', 'post'})
+        self.assertTrue(all(row.get("cost_usd_est") == 0.01 and
                             row.get("model") == "provider/effective-model" for row in records))
 
     def test_post_generation_model_falls_back_to_requested_model(self):
         from sandbox.server import MODEL
-        content = "Bài viết về Tucson. " * 20
-        response = io.BytesIO(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
+        repository = self.http.app.persona_repository()
+        from app.persona_fixture import seed_nam_creta
+        persona_id, release_id = seed_nam_creta(repository)
+        snapshot = repository.get_release_snapshot(persona_id, release_id)
+        vehicle = next(fact for fact in snapshot['facts'] if fact['key'] == 'vehicle.current.model')
+        text = 'Mình đang đi Hyundai Creta.'
+        candidate = {'post_text': text, 'fact_ids': [vehicle['fact_id']], 'claims': [
+            {'text': text, 'subject': 'persona', 'predicate': vehicle['key'],
+             'fact_ids': [vehicle['fact_id']], 'memory_ids': [], 'message_ids': []}], 'fact_proposals': []}
+        def call(_post, _text, **kwargs):
+            return {'ok': True, 'needs': {'topics': [], 'keys': []} if kwargs.get('persona_phase') == 'analysis' else None,
+                    'post_candidate': candidate if kwargs.get('persona_phase') == 'post' else None,
+                    'attempts': 1, 'usage': {}, 'cost_usd_est': 0.0, 'cost_unknown': False}
         metrics = {}
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), \
-             patch("sandbox.server.urllib.request.build_opener",
-                   return_value=SimpleNamespace(open=lambda request, timeout: response)):
-            self.http.app.generate_post({"name": "An"}, "Tucson", _metrics=metrics)
+             patch("sandbox.server.call_luna", side_effect=call):
+            self.http.app.generate_post({"name": "Nam"}, snapshot, _metrics=metrics)
         self.assertEqual(metrics["model"], MODEL)
 
     def test_sandbox_page_starts_with_persona_and_comment_inputs(self):
         page = (Path(__file__).resolve().parents[2] / "sandbox/static/index.html").read_text()
         self.assertIn('id="persona-select"', page)
-        self.assertIn('id="vehicle-select"', page)
+        self.assertNotIn('id="persona-use-consent"', page)
+        self.assertNotIn('id="review-drafts"', page)
+        self.assertNotIn('id="vehicle-select"', page)
         self.assertIn('id="turn-text"', page)
         self.assertNotIn('id="post-text"', page)
+        script = (Path(__file__).resolve().parents[2] / "sandbox/static/app.js").read_text()
+        self.assertIn('Fact fixture không phải xác nhận của người thật.', script)
+        self.assertNotIn('fact.source_ref', script)
 
     def test_valid_model_flow_uses_post_evidence_and_retains_pending(self):
         state = self.conversation()

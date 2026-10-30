@@ -1,0 +1,247 @@
+[
+  {
+    "text": "Bác mua xe ở đâu cầu giấy",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response_text": "Cái này mình không rõ bác ơi.\n\nBác đang tìm đại lý ở khu vực nào?",
+    "pending": [
+      {
+        "id": "q_fe3b56fc",
+        "request_id": "b46de988-70a",
+        "actor_id": "demo-peer-acceptance",
+        "qtype": "open",
+        "expected_slot": "interested_vehicle",
+        "options": [],
+        "proposition": "interested_vehicle",
+        "issued_at": "2026-10-29T04:46:09.145292+00:00",
+        "expires_at": "2026-10-30T04:46:09.145292+00:00",
+        "version": 1,
+        "status": "OPEN",
+        "basis_version": 2,
+        "basis_slots": {}
+      }
+    ],
+    "lead_profile": {
+      "interested_vehicle": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-1",
+        "updated_at": "2026-10-29T04:46:09.145292+00:00",
+        "status": "ASKED"
+      }
+    },
+    "errors": []
+  },
+  {
+    "text": "Bác đi màu gì",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response_text": "Phần này mình không rõ đâu bác.\n\nBác thích màu xe nào?",
+    "pending": [
+      {
+        "id": "q_fe3b56fc",
+        "request_id": "b46de988-70a",
+        "actor_id": "demo-peer-acceptance",
+        "qtype": "open",
+        "expected_slot": "interested_vehicle",
+        "options": [],
+        "proposition": "interested_vehicle",
+        "issued_at": "2026-10-29T04:46:09.145292+00:00",
+        "expires_at": "2026-10-30T04:46:09.145292+00:00",
+        "version": 1,
+        "status": "OPEN",
+        "basis_version": 2,
+        "basis_slots": {}
+      }
+    ],
+    "lead_profile": {
+      "interested_vehicle": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-1",
+        "updated_at": "2026-10-29T04:46:09.145292+00:00",
+        "status": "ASKED"
+      }
+    },
+    "errors": []
+  },
+  {
+    "text": "Toi cũng tính mua",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response_text": "Bạn cũng đang tính mua xe à, mình cùng trao đổi nhé.\n\nBạn đang nghiêng về mẫu xe nào?",
+    "pending": [
+      {
+        "id": "q_fe3b56fc",
+        "request_id": "b46de988-70a",
+        "actor_id": "demo-peer-acceptance",
+        "qtype": "open",
+        "expected_slot": "interested_vehicle",
+        "options": [],
+        "proposition": "interested_vehicle",
+        "issued_at": "2026-10-29T04:46:09.145292+00:00",
+        "expires_at": "2026-10-30T04:46:09.145292+00:00",
+        "version": 1,
+        "status": "OPEN",
+        "basis_version": 2,
+        "basis_slots": {}
+      }
+    ],
+    "lead_profile": {
+      "interested_vehicle": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-1",
+        "updated_at": "2026-10-29T04:46:09.145292+00:00",
+        "status": "ASKED"
+      }
+    },
+    "errors": []
+  },
+  {
+    "text": "Creta",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response_text": "Mình hiểu ý bạn rồi.\n\nBạn tính khoảng khi nào sẽ mua xe?",
+    "pending": [
+      {
+        "id": "q_6df1ff5b",
+        "request_id": "df898706-3b9",
+        "actor_id": "demo-peer-acceptance",
+        "qtype": "open",
+        "expected_slot": "purchase_timeline",
+        "options": [],
+        "proposition": "purchase_timeline",
+        "issued_at": "2026-10-29T04:46:28.257065+00:00",
+        "expires_at": "2026-10-30T04:46:28.257065+00:00",
+        "version": 1,
+        "status": "OPEN",
+        "basis_version": 2,
+        "basis_slots": {}
+      }
+    ],
+    "lead_profile": {
+      "interested_vehicle": {
+        "value": "Creta",
+        "evidence": "Creta",
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-4",
+        "updated_at": "2026-10-29T04:46:28.257065+00:00",
+        "status": "ANSWERED"
+      },
+      "purchase_timeline": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-4",
+        "updated_at": "2026-10-29T04:46:28.257065+00:00",
+        "status": "ASKED"
+      }
+    },
+    "errors": []
+  },
+  {
+    "text": "tháng sau",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response_text": "Mình hiểu ý bạn rồi.\n\nBạn đang cân nhắc trả thẳng hay trả góp?",
+    "pending": [
+      {
+        "id": "q_fff55392",
+        "request_id": "9ef18b5b-8f0",
+        "actor_id": "demo-peer-acceptance",
+        "qtype": "open",
+        "expected_slot": "finance_intent",
+        "options": [],
+        "proposition": "finance_intent",
+        "issued_at": "2026-10-29T04:46:36.978475+00:00",
+        "expires_at": "2026-10-30T04:46:36.978475+00:00",
+        "version": 1,
+        "status": "OPEN",
+        "basis_version": 2,
+        "basis_slots": {}
+      }
+    ],
+    "lead_profile": {
+      "finance_intent": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-5",
+        "updated_at": "2026-10-29T04:46:36.978475+00:00",
+        "status": "ASKED"
+      },
+      "interested_vehicle": {
+        "value": "Creta",
+        "evidence": "Creta",
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-4",
+        "updated_at": "2026-10-29T04:46:28.257065+00:00",
+        "status": "ANSWERED"
+      },
+      "purchase_timeline": {
+        "value": "tháng sau",
+        "evidence": "tháng sau",
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-5",
+        "updated_at": "2026-10-29T04:46:36.978475+00:00",
+        "status": "ANSWERED"
+      }
+    },
+    "errors": []
+  },
+  {
+    "text": "Cho mình đặt cọc Creta",
+    "routing": [
+      "HANDOFF",
+      "HANDOFF_DRAFT_ONLY"
+    ],
+    "response_text": "Khoản cọc với giá chốt thì bạn nên hỏi thẳng đại lý cho chắc, mình chỉ chia sẻ góc nhìn người dùng thôi.",
+    "pending": [
+      {
+        "id": "q_fff55392",
+        "request_id": "9ef18b5b-8f0",
+        "actor_id": "demo-peer-acceptance",
+        "qtype": "open",
+        "expected_slot": "finance_intent",
+        "options": [],
+        "proposition": "finance_intent",
+        "issued_at": "2026-10-29T04:46:36.978475+00:00",
+        "expires_at": "2026-10-30T04:46:36.978475+00:00",
+        "version": 1,
+        "status": "OPEN",
+        "basis_version": 2,
+        "basis_slots": {}
+      }
+    ],
+    "lead_profile": {
+      "finance_intent": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-5",
+        "updated_at": "2026-10-29T04:46:36.978475+00:00",
+        "status": "ASKED"
+      },
+      "interested_vehicle": {
+        "value": "Creta",
+        "evidence": "Creta",
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-4",
+        "updated_at": "2026-10-29T04:46:28.257065+00:00",
+        "status": "ANSWERED"
+      },
+      "purchase_timeline": {
+        "value": "tháng sau",
+        "evidence": "tháng sau",
+        "source_message_id": "e072b475aec94799b2e7346cebfad037-5",
+        "updated_at": "2026-10-29T04:46:36.978475+00:00",
+        "status": "ANSWERED"
+      }
+    },
+    "errors": []
+  }
+]

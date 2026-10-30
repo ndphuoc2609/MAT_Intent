@@ -126,15 +126,21 @@
                 "properties": {
                   "kind": {
                     "enum": [
+                      "budget",
                       "color",
                       "compare_vehicle",
+                      "current_vehicle",
                       "datetime",
                       "dealer",
                       "down_payment",
                       "down_payment_unit",
+                      "finance_intent",
+                      "interested_vehicle",
                       "location",
                       "price_kind",
+                      "purchase_timeline",
                       "service_topic",
+                      "usage_need",
                       "variant",
                       "vehicle"
                     ]
@@ -329,15 +335,21 @@
                 "properties": {
                   "kind": {
                     "enum": [
+                      "budget",
                       "color",
                       "compare_vehicle",
+                      "current_vehicle",
                       "datetime",
                       "dealer",
                       "down_payment",
                       "down_payment_unit",
+                      "finance_intent",
+                      "interested_vehicle",
                       "location",
                       "price_kind",
+                      "purchase_timeline",
                       "service_topic",
+                      "usage_need",
                       "variant",
                       "vehicle"
                     ]
@@ -522,15 +534,21 @@
                 "properties": {
                   "kind": {
                     "enum": [
+                      "budget",
                       "color",
                       "compare_vehicle",
+                      "current_vehicle",
                       "datetime",
                       "dealer",
                       "down_payment",
                       "down_payment_unit",
+                      "finance_intent",
+                      "interested_vehicle",
                       "location",
                       "price_kind",
+                      "purchase_timeline",
                       "service_topic",
+                      "usage_need",
                       "variant",
                       "vehicle"
                     ]

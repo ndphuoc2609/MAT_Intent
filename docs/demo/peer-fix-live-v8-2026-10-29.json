@@ -1,0 +1,30 @@
+[
+  {
+    "case": "proxy",
+    "text": "Anh tôi tính mua Creta",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "À, bạn đang hỏi giúp người nhà à.",
+    "pending": [],
+    "lead": {},
+    "attempts": 1,
+    "cost": 0.000309235,
+    "errors": []
+  },
+  {
+    "case": "proxy",
+    "text": "Tôi chỉ hỏi hộ thôi",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Ừ, mình cùng bạn tìm hiểu để tham khảo nhé.",
+    "pending": [],
+    "lead": {},
+    "attempts": 1,
+    "cost": 0.000274485,
+    "errors": []
+  }
+]

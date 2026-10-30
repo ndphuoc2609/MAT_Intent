@@ -1,0 +1,279 @@
+[
+  {
+    "case": "correction",
+    "text": "Mình cũng tính mua Creta",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Bạn cũng đang tính mua xe à, mình cùng trao đổi nhé.\n\nBạn tính khoảng khi nào sẽ mua xe?",
+    "pending": [
+      "purchase_timeline"
+    ],
+    "lead": {
+      "interested_vehicle": {
+        "value": "Creta",
+        "evidence": "Mình cũng tính mua Creta",
+        "source_message_id": "49a6b2688d304dc9aba1bff938313366-1",
+        "updated_at": "2026-10-29T06:34:01.046356+00:00",
+        "status": "ANSWERED"
+      },
+      "purchase_timeline": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "49a6b2688d304dc9aba1bff938313366-1",
+        "updated_at": "2026-10-29T06:34:01.046356+00:00",
+        "status": "ASKED"
+      }
+    },
+    "attempts": 1,
+    "cost": 0.000266735,
+    "errors": []
+  },
+  {
+    "case": "correction",
+    "text": "Không phải tôi mua, tôi hỏi hộ anh tôi",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Ừ bạn, mình hiểu nhầm rồi, xin lỗi nhé.",
+    "pending": [],
+    "lead": {
+      "interested_vehicle": {
+        "value": null,
+        "evidence": "Không phải tôi mua, tôi hỏi hộ anh tôi",
+        "source_message_id": "49a6b2688d304dc9aba1bff938313366-2",
+        "updated_at": "2026-10-29T06:34:09.530173+00:00",
+        "status": "DECLINED"
+      },
+      "purchase_timeline": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "49a6b2688d304dc9aba1bff938313366-1",
+        "updated_at": "2026-10-29T06:34:01.046356+00:00",
+        "status": "ASKED"
+      }
+    },
+    "attempts": 1,
+    "cost": 0.00051036,
+    "errors": []
+  },
+  {
+    "case": "decline",
+    "text": "Tôi cũng tính mua xe",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Hay đó bạn, mua xe cũng nên cân nhắc kỹ.\n\nBạn đang nghiêng về mẫu xe nào?",
+    "pending": [
+      "interested_vehicle"
+    ],
+    "lead": {
+      "interested_vehicle": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "68117e173fa7447eb62c4230a18f4184-1",
+        "updated_at": "2026-10-29T06:34:16.403664+00:00",
+        "status": "ASKED"
+      }
+    },
+    "attempts": 1,
+    "cost": 0.000266235,
+    "errors": []
+  },
+  {
+    "case": "decline",
+    "text": "không cần đâu, đừng hỏi nữa",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Được bạn, vậy mình dừng ở đây nhé.",
+    "pending": [],
+    "lead": {
+      "interested_vehicle": {
+        "value": null,
+        "evidence": "không cần đâu, đừng hỏi nữa",
+        "source_message_id": "68117e173fa7447eb62c4230a18f4184-2",
+        "updated_at": "2026-10-29T06:34:22.406015+00:00",
+        "status": "DECLINED"
+      }
+    },
+    "attempts": 1,
+    "cost": 0.000380985,
+    "errors": []
+  },
+  {
+    "case": "address",
+    "text": "Chào bác, tôi có xe rồi",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Vậy là bác đã có xe rồi nhỉ.",
+    "pending": [],
+    "lead": {},
+    "attempts": 1,
+    "cost": 0.00035886,
+    "errors": []
+  },
+  {
+    "case": "proxy",
+    "text": "Anh tôi tính mua Creta",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "À, bạn đang hỏi giúp người nhà à.",
+    "pending": [],
+    "lead": {},
+    "attempts": 1,
+    "cost": 0.000342235,
+    "errors": []
+  },
+  {
+    "case": "proxy",
+    "text": "Tôi chỉ hỏi hộ thôi",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "À, bạn đang hỏi giúp người nhà à.",
+    "pending": [],
+    "lead": {},
+    "attempts": 1,
+    "cost": 0.000316735,
+    "errors": []
+  },
+  {
+    "case": "purchase",
+    "text": "Bác ơi, tôi cũng tính mua xe",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Hay đó bác, mua xe cũng nên cân nhắc kỹ.\n\nBác đang nghiêng về mẫu xe nào?",
+    "pending": [
+      "interested_vehicle"
+    ],
+    "lead": {
+      "interested_vehicle": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "1fcf9da7ac6d4306b8ccc9d995ef66df-1",
+        "updated_at": "2026-10-29T06:34:48.598180+00:00",
+        "status": "ASKED"
+      }
+    },
+    "attempts": 1,
+    "cost": 0.00027361,
+    "errors": []
+  },
+  {
+    "case": "purchase",
+    "text": "Creta",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Mình cùng tìm hiểu mẫu xe đó nhé bác.\n\nBác tính khoảng khi nào sẽ mua xe?",
+    "pending": [
+      "purchase_timeline"
+    ],
+    "lead": {
+      "interested_vehicle": {
+        "value": "Creta",
+        "evidence": "Creta",
+        "source_message_id": "1fcf9da7ac6d4306b8ccc9d995ef66df-2",
+        "updated_at": "2026-10-29T06:34:55.456192+00:00",
+        "status": "ANSWERED"
+      },
+      "purchase_timeline": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "1fcf9da7ac6d4306b8ccc9d995ef66df-2",
+        "updated_at": "2026-10-29T06:34:55.456192+00:00",
+        "status": "ASKED"
+      }
+    },
+    "attempts": 1,
+    "cost": 0.00046261,
+    "errors": []
+  },
+  {
+    "case": "purchase",
+    "text": "tháng sau",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Vậy mình còn thời gian tìm hiểu trước khi quyết định nhỉ bác.\n\nBác đang cân nhắc trả thẳng hay trả góp?",
+    "pending": [
+      "finance_intent"
+    ],
+    "lead": {
+      "finance_intent": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "1fcf9da7ac6d4306b8ccc9d995ef66df-3",
+        "updated_at": "2026-10-29T06:35:05.211775+00:00",
+        "status": "ASKED"
+      },
+      "interested_vehicle": {
+        "value": "Creta",
+        "evidence": "Creta",
+        "source_message_id": "1fcf9da7ac6d4306b8ccc9d995ef66df-2",
+        "updated_at": "2026-10-29T06:34:55.456192+00:00",
+        "status": "ANSWERED"
+      },
+      "purchase_timeline": {
+        "value": "tháng sau",
+        "evidence": "tháng sau",
+        "source_message_id": "1fcf9da7ac6d4306b8ccc9d995ef66df-3",
+        "updated_at": "2026-10-29T06:35:05.211775+00:00",
+        "status": "ANSWERED"
+      }
+    },
+    "attempts": 1,
+    "cost": 0.000624235,
+    "errors": []
+  },
+  {
+    "case": "purchase",
+    "text": "trả góp",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Phần thanh toán thì bác cứ cân nhắc theo tình hình của mình nhé.",
+    "pending": [],
+    "lead": {
+      "finance_intent": {
+        "value": "trả góp",
+        "evidence": "trả góp",
+        "source_message_id": "1fcf9da7ac6d4306b8ccc9d995ef66df-4",
+        "updated_at": "2026-10-29T06:35:12.766979+00:00",
+        "status": "ANSWERED"
+      },
+      "interested_vehicle": {
+        "value": "Creta",
+        "evidence": "Creta",
+        "source_message_id": "1fcf9da7ac6d4306b8ccc9d995ef66df-2",
+        "updated_at": "2026-10-29T06:34:55.456192+00:00",
+        "status": "ANSWERED"
+      },
+      "purchase_timeline": {
+        "value": "tháng sau",
+        "evidence": "tháng sau",
+        "source_message_id": "1fcf9da7ac6d4306b8ccc9d995ef66df-3",
+        "updated_at": "2026-10-29T06:35:05.211775+00:00",
+        "status": "ANSWERED"
+      }
+    },
+    "attempts": 1,
+    "cost": 0.00050786,
+    "errors": []
+  }
+]

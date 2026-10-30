@@ -11,6 +11,7 @@ from typing import Callable
 from .normalize import norm
 
 SCHEMA_VERSION = "persona_query_v1"
+ADDRESS = r"(?:ban|bac|chu|co|chi|anh|ad)"
 
 # The registry is intentionally the only source of keys accepted from a parser.
 KEY_REGISTRY = {
@@ -18,12 +19,12 @@ KEY_REGISTRY = {
     "family": frozenset({"family.members", "family.children"}),
     "occupation": frozenset({"occupation.title", "occupation.industry"}),
     "residence": frozenset({"location.base.province", "location.base.district"}),
-    "vehicle_current": frozenset({"vehicle.current.model", "vehicle.current.year", "vehicle.current.trim"}),
+    "vehicle_current": frozenset({"vehicle.current.model", "vehicle.current.year", "vehicle.current.trim", "vehicle.current.first_car", "vehicle.current.mileage_km", "vehicle.current.color", "vehicle.current.usage_started_at"}),
     "vehicle_past": frozenset({"vehicle.history.model", "vehicle.history.ownership"}),
     "vehicle_experience": frozenset({"vehicle.experience.type", "vehicle.experience.model"}),
-    "purchase_finance": frozenset({"purchase.dealer", "purchase.year", "purchase.finance_method"}),
+    "purchase_finance": frozenset({"purchase.dealer", "purchase.year", "purchase.date", "purchase.finance_method", "purchase.down_payment_percent", "purchase.loan_term_years"}),
     "maintenance": frozenset({"vehicle.maintenance.type", "vehicle.maintenance.location"}),
-    "travel_story": frozenset({"story.travel.destination", "story.travel.vehicle"}),
+    "travel_story": frozenset({"story.travel.destination", "story.travel.vehicle", "travel.commute", "travel.weekend.destination"}),
     "preference": frozenset({"preference.vehicle.color", "preference.vehicle.type"}),
     "opinion": frozenset({"opinion.vehicle.topic", "opinion.vehicle.stance"}),
     "location_compare": frozenset({"location.compare.from", "location.compare.to"}),
@@ -52,6 +53,7 @@ def _pattern(text: str, patterns: tuple[str, ...]) -> bool:
 def _deterministic(text: str):
     """Return an exact high-confidence match, or None when no rule applies."""
     value = norm(text)
+    value = re.sub(r"\b(?:bac|chu|chi|anh|ad)\b", "ban", value)
     # Ask-before-negation: a negative/correction must not be interpreted as
     # permission to retrieve the personal fact being denied or withdrawn.
     if _pattern(value, (r"\b(khong|ko|chua|dung)\b.{0,45}\b(hoi|can|muon|biet)\b",
@@ -59,6 +61,18 @@ def _deterministic(text: str):
         return _result()
 
     rules = (
+        ("vehicle_current", ("vehicle.current.model",),
+         (r"\bban (?:dang )?(?:di|chay|lai) con (?:gi|nao)\b",
+          r"\bxe (?:cua )?ban (?:dang )?(?:di|chay|lai) (?:la )?xe (?:gi|nao)\b")),
+        ("vehicle_current", ("vehicle.current.usage_started_at",),
+         (rf"\b{ADDRESS}\s+(?:dang\s+)?(?:chay|di|dung|lai|xai)\b.{{0,20}}\b(?:bao lau|may nam|may thang|bao nhieu nam|bao nhieu thang)\b",)),
+        ("vehicle_current", ("vehicle.current.color",),
+         (rf"\b{ADDRESS}\s+(?:dang\s+)?(?:di|chay)\s+(?:xe\s+)?mau\s+(?:gi|nao)\b",)),
+        ("vehicle_current", ("vehicle.current.model",),
+         (rf"\b{ADDRESS}\s+(?:dang\s+)?(?:di|lai|chay|su dung)\s+(?:bang\s+)?xe\s+(?:gi|nao)\b",)),
+        ("purchase_finance", ("purchase.dealer",),
+         (rf"\b{ADDRESS}\s+mua\s+(?:xe|creta|tucson)\s+o\s+(?:dau|dai ly nao)\b",
+          rf"\bxe\s+(?:do|nay)\s+{ADDRESS}\s+mua\s+o\s+(?:dau|dai ly nao)\b")),
         ("identity", ("identity.age_years",),
          (r"\bban\s+(?:nam\s+)?(?:bao nhieu tuoi|may tuoi)\b",
           r"\btuoi cua ban\b", r"\bban\s+bao nhieu tuoi roi\b")),
@@ -70,17 +84,24 @@ def _deterministic(text: str):
         ("family", ("family.children",),
          (r"\bban co con chua\b", r"\bban co may dua con\b")),
         ("occupation", ("occupation.title",),
-         (r"\bban lam nghe gi\b", r"\bcong viec cua ban la gi\b",
+         (rf"\b{ADDRESS} lam nghe gi\b", r"\bcong viec cua ban la gi\b",
           r"\bban lam gi\b")),
         ("residence", ("location.base.province",),
-         (r"\bban (?:dang )?(?:song|o|cu tru) o dau\b", r"\bban o dau vay\b")),
+         (r"\bban (?:dang )?(?:song|o|cu tru) o dau\b", r"\bban o dau vay\b", r"\b(?:anh|ban) (?:o|song) dau\b", r"\bnha (?:ban|anh) o dau\b")),
         ("residence", ("location.base.province",),
          (r"\bban (?:dang )?(?:song|o) o tinh nao\b", r"\bban o tinh nao\b")),
         ("residence", ("location.base.district",),
-         (r"\bban (?:dang )?(?:song|o) o quan nao\b", r"\bban o quan nao\b")),
+         (r"\bban (?:dang )?(?:song|o) o quan nao\b", r"\bban o (?:quan|khu) nao\b", r"\b(?:ban|anh) song o khu nao\b")),
         ("vehicle_past", ("vehicle.history.model",),
          (r"\btruoc day ban (?:da )?(?:tung )?(?:di|lai|chay|su dung) xe gi\b",
           r"\bxe truoc day cua ban la xe gi\b")),
+        ("vehicle_current", ("vehicle.current.trim",),
+         (r"\b(?:xe|creta) (?:cua )?(?:ban|anh) (?:la )?ban (?:gi|nao)\b", r"\b(?:ban|anh) (?:di|chay|mua) ban (?:gi|nao)\b")),
+        ("vehicle_current", ("vehicle.current.first_car",),
+         (r"\b(?:xe|creta) (?:cua )?(?:ban|anh).{0,20}\b(?:dau doi|dau tien)\b",
+          r"\b(?:xe dau doi|xe dau tien) cua (?:ban|anh)\b")),
+        ("vehicle_current", ("vehicle.current.mileage_km",),
+         (r"\b(?:xe|creta).{0,30}(?:bao nhieu|may).{0,12}(?:km|cay|ki lo)\b", r"\b(?:ban|anh).{0,30}(?:di|chay).{0,12}(?:bao nhieu|may).{0,12}(?:km|cay)\b")),
         ("vehicle_current", ("vehicle.current.model",),
          (r"\b(?:hien(?: nay)? )?ban (?:dang )?(?:di|lai|chay|su dung) xe gi\b",
           r"\bxe hien tai cua ban la xe gi\b", r"\bban dang di xe nao\b")),
@@ -90,10 +111,23 @@ def _deterministic(text: str):
          (r"\bban mua xe o (?:dai ly nao|dau)\b",
           r"\bban mua (?:creta|tucson|xe) o dai ly nao\b")),
         ("purchase_finance", ("purchase.year",),
-         (r"\bban mua xe nam nao\b", r"\bban mua xe khi nao\b")),
+         (r"\b(?:ban|anh) mua (?:xe|creta) nam nao\b",)),
+        ("purchase_finance", ("purchase.date",),
+         (r"\b(?:ban|anh) mua (?:xe|creta) (?:khi nao|luc nao|bao gio|thang may)\b",
+          r"\bxe (?:cua )?(?:ban|anh) mua (?:khi nao|bao gio)\b")),
         ("purchase_finance", ("purchase.finance_method",),
-         (r"\bban mua xe (?:tra gop|tra thang) khong\b",
-          r"\bban mua xe bang cach nao\b")),
+         (r"\b(?:ban|anh) mua (?:xe|creta) tra (?:gop|thang) khong\b",
+          r"\b(?:ban|anh).{0,25}mua xe bang cach nao\b")),
+        ("purchase_finance", ("purchase.down_payment_percent",),
+         (r"\b(?:ban|anh).{0,25}tra truoc.{0,15}(?:bao nhieu|may phan tram|nhieu)\b",)),
+        ("purchase_finance", ("purchase.loan_term_years",),
+         (r"\b(?:ban|anh).{0,30}(?:tra gop|gop).{0,15}(?:may nam|bao lau)\b",)),
+        ("purchase_finance", ("purchase.down_payment_percent", "purchase.loan_term_years"),
+         (r"\b(?:ban|anh).{0,30}(?:mua|tra).{0,10}tra gop\b", r"\b(?:ban|anh).{0,25}mua xe bang cach nao\b")),
+        ("travel_story", ("travel.commute",),
+         (r"\b(?:ban|anh).{0,20}di lam.{0,20}(?:tuyen|duong|o dau|the nao)\b",)),
+        ("travel_story", ("travel.weekend.destination",),
+         (r"\b(?:ban|anh).{0,20}cuoi tuan.{0,15}(?:ve|di) dau\b", r"\bcuoi tuan (?:ban|anh).{0,10}(?:ve|di) dau\b")),
         ("maintenance", ("vehicle.maintenance.type",),
          (r"\bban bao duong xe nhu the nao\b", r"\bban bao duong xe o dau\b")),
         ("travel_story", ("story.travel.destination",),
@@ -103,7 +137,10 @@ def _deterministic(text: str):
         ("preference", ("preference.vehicle.type",),
          (r"\bban thich dong xe nao\b", r"\bban thich kieu xe nao\b")),
         ("opinion", ("opinion.vehicle.topic", "opinion.vehicle.stance"),
-         (r"\bquan diem cua ban ve (?:xe|creta|tucson)\b",
+         (rf"\b{ADDRESS}\s+(?:di|chay|dung)(?:\s+xe)?\s+(?:thay|cam thay)\s+(?:sao|the nao|nhu nao)\b",
+          rf"\b{ADDRESS}\s+(?:danh gia|nhan xet|cam nhan).{{0,35}}\b(?:xe|creta|tucson)\b",
+          rf"\b{ADDRESS}\s+thay\s+(?:xe|creta|tucson).{{0,25}}\b(?:the nao|nhu nao|ra sao)\b",
+          r"\bquan diem cua ban ve (?:xe|creta|tucson)\b",
           r"\bban nghi gi ve (?:xe|creta|tucson)\b")),
         ("location_compare", ("location.compare.from", "location.compare.to"),
          (r"\bban thay song o dau tot hon\b", r"\bban so sanh khu vuc nao\b")),
@@ -186,3 +223,25 @@ def parse_persona_query(text: str, message_id: str, actor_id: str, *,
                            excerpt=excerpt, clarify=clarify)
         return _result("unknown", clarify=True)
     return _result()
+
+
+def parse_persona_questions(text, message_id, actor_id, *, semantic=None):
+    """Split explicit personal questions; keep evidence tied to the original text."""
+    primary = parse_persona_query(text, message_id, actor_id, semantic=semantic)
+    if not isinstance(text, str) or not text.strip() or len(text) > 10_000 or not _semantic_allows_persona(semantic):
+        return [primary]
+    questions = []
+    for clause in re.split(r"[,;?？]|\s+(?:và|còn|va)\s+", text):
+        clause = clause.strip()
+        if not clause:
+            continue
+        # An omitted subject is inherited only inside the same question, not from another turn.
+        expanded = clause
+        if questions and re.match(r"^(?:làm nghề|mua xe|trả trước|góp mấy|đi xe|ở đâu|lam nghe|mua xe|tra truoc|gop may|di xe|o dau)\b", clause, re.I):
+            expanded = "Bạn " + clause
+        query = parse_persona_query(expanded, message_id, actor_id, semantic=semantic)
+        if query['topic'] != 'none':
+            query['evidence_excerpt'] = clause
+            if not any(q['canonical_keys'] == query['canonical_keys'] and q['topic'] == query['topic'] for q in questions):
+                questions.append(query)
+    return questions or [primary]

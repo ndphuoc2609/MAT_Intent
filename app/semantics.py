@@ -26,7 +26,7 @@ MAX_NUMERIC_SLOT = 1_000_000_000_000
 # Field lạ, kiểu sai, slot kind lạ đều bị reject (không âm thầm drop).
 SLOT_KINDS = {"vehicle", "variant", "color", "location", "price_kind", "datetime",
               "down_payment", "down_payment_unit", "dealer", "service_topic",
-              "compare_vehicle"}
+              "compare_vehicle", "current_vehicle", "interested_vehicle", "purchase_timeline", "budget", "usage_need", "finance_intent"}
 CONTACT_SCOPES = ("call", "public_reply", "inbox", "all",
                   "allow_call", "allow_public_reply", "allow_inbox", "allow_all")
 _BASE_FIELDS = {"evidence_excerpt", "source_message_id"}
@@ -284,7 +284,16 @@ def semantic_model_json_schema(version="1", *, include_provenance=False):
         if isinstance(out.get("type"), list):
             types = out.pop("type")
             base = out
-            out = {"anyOf": [{"type": kind, **base} for kind in types]}
+            branches = []
+            for kind in types:
+                branch = {"type": kind, **base}
+                if "enum" in branch:
+                    if kind == "null":
+                        branch["enum"] = [value for value in branch["enum"] if value is None]
+                    else:
+                        branch["enum"] = [value for value in branch["enum"] if value is not None]
+                branches.append(branch)
+            out = {"anyOf": branches}
         return out
 
     return walk(semantic_json_schema(version))
@@ -549,6 +558,10 @@ def validate_semantic(sem, event_text: str, context_texts: list[str]) -> list[st
                                   "source_message_id", "source_request_id", "source_actor_id", "source_state_token"):
                         errs.append(f"operations[{i}] slot has disallowed field {sk!r}")
                 kind = slot.get("kind")
+                if kind in ('current_vehicle','interested_vehicle','purchase_timeline','budget','usage_need','finance_intent'):
+                    excerpt = slot.get('evidence_excerpt') or op.get('evidence_excerpt')
+                    if slot.get('explicit') is False or not isinstance(excerpt, str) or not excerpt.strip() or excerpt not in event_text:
+                        errs.append(f'operations[{i}] lead evidence must come from current customer text')
                 if not isinstance(kind, str) or kind not in SLOT_KINDS:
                     errs.append(f"operations[{i}] unknown slot kind {slot.get('kind')!r}")
                 if "value" in slot and (type(slot["value"]) not in (str, int, float, dict)

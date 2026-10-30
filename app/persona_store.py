@@ -6,12 +6,36 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 SQLITE_MIGRATION = Path(__file__).resolve().parents[1] / "migrations" / "sqlite" / "005_persona.sql"
+SQLITE_MIGRATIONS = (
+    (5, SQLITE_MIGRATION),
+    (6, SQLITE_MIGRATION.with_name("006_persona_integrity.sql")),
+    (7, SQLITE_MIGRATION.with_name("007_lead_drafts.sql")),
+    (8, SQLITE_MIGRATION.with_name("008_peer_conversation_state.sql")),
+    (9, SQLITE_MIGRATION.with_name("009_persona_generation.sql")),
+    (10, SQLITE_MIGRATION.with_name("010_generated_facts.sql")),
+    (11, SQLITE_MIGRATION.with_name("011_persona_memory_reservations.sql")),
+)
 SOURCE_KINDS = {"fictional_fixture", "user_provided", "official_source", "document", "other"}
+
+
+class _MemoryReservationConflict(Exception):
+    pass
 TELLABILITY = {"public", "ask_only", "never"}
+MEMORY_PRIVACY = {"public", "private", "sensitive"}
+MEMORY_APPROVALS = {"draft", "approved", "fixture", "rejected"}
+VOICE_GUIDE_KEYS = {
+    "approval", "privacy", "consent_ref", "provenance", "data_origin", "tone",
+    "habits", "speaker_habits", "reactions", "interests", "boundaries",
+    "few_shots", "human_approved_example_target",
+}
+VOICE_EXAMPLE_KEYS = {
+    "example_id", "topic", "customer_text", "reply_text", "fact_ids",
+    "approval", "privacy", "consent_ref", "provenance", "source_kind", "source_ref",
+}
 
 
 def _id(value=None):
@@ -25,7 +49,7 @@ def migrate_sqlite(conn: sqlite3.Connection):
     """Apply the additive, versioned persona schema to an explicitly supplied DB."""
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
-    for version, path in ((5, SQLITE_MIGRATION), (6, SQLITE_MIGRATION.with_name("006_persona_integrity.sql"))):
+    for version, path in SQLITE_MIGRATIONS:
         if conn.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone():
             continue
         try:
@@ -73,6 +97,12 @@ class PersonaStore:
     @staticmethod
     def _json(value):
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _has_memory_schema(self):
+        if self.sqlite:
+            return bool(self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='persona_memories'").fetchone())
+        return bool(self.conn.execute("SELECT to_regclass('persona_memories')").fetchone()[0])
 
     def create_persona(self, slug, display_name, *, source_kind, persona_id=None):
         if source_kind not in SOURCE_KINDS or not slug.strip() or not display_name.strip():
@@ -247,7 +277,106 @@ class PersonaStore:
         self.conn.commit()
         return hid
 
+    @staticmethod
+    def _memory_digest(memory):
+        fields = ("memory_id", "persona_uuid", "release_id", "topic", "occurred_at", "precision",
+                  "source_ref", "source_kind", "approval", "privacy", "tellable", "fact_ids",
+                  "approved_summary", "consent_ref")
+        content = {key: memory[key] for key in fields}
+        return hashlib.sha256(PersonaStore._json(content).encode()).hexdigest()
+
+    def add_memory(self, release_id, *, topic, occurred_at=None, precision, source_ref, source_kind,
+                   approval, privacy, tellable, fact_ids=(), approved_summary, consent_ref=None,
+                   memory_id=None):
+        """Add one fact-supported memory to a draft release."""
+        if not self._has_memory_schema():
+            raise ValueError("persona memory schema is not migrated; apply migration 9")
+        if (not isinstance(topic, str) or not topic.strip() or
+                not isinstance(precision, str) or not precision.strip() or
+                not isinstance(source_ref, str) or not source_ref.strip() or
+                not isinstance(approved_summary, str) or not approved_summary.strip()):
+            raise ValueError("memory requires topic, precision, source_ref and approved_summary")
+        from .persona_query import KEY_REGISTRY
+        if topic not in KEY_REGISTRY or topic in {"none", "unknown"}:
+            raise ValueError("memory topic must match a registered persona topic")
+        if source_kind not in SOURCE_KINDS or approval not in MEMORY_APPROVALS:
+            raise ValueError("invalid memory source_kind or approval")
+        if privacy not in MEMORY_PRIVACY or tellable not in TELLABILITY:
+            raise ValueError("invalid memory privacy or tellable value")
+        if occurred_at is not None:
+            if not isinstance(occurred_at, str):
+                raise ValueError("occurred_at must be an ISO date or datetime")
+            try:
+                datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError("occurred_at must be an ISO date or datetime") from None
+        if not isinstance(fact_ids, (list, tuple)) or not fact_ids:
+            raise ValueError("memory must cite at least one release fact")
+        normalized_fact_ids = [_id(fact_id) for fact_id in fact_ids]
+        if len(set(normalized_fact_ids)) != len(normalized_fact_ids):
+            raise ValueError("memory fact_ids must be unique")
+
+        release = self.conn.execute(
+            "SELECT r.persona_id,r.status,p.source_kind,p.status FROM persona_releases r "
+            "JOIN personas p ON p.persona_id=r.persona_id WHERE r.release_id=?", (release_id,)
+        ).fetchone()
+        if not release:
+            raise ValueError("unknown release")
+        if release[1] != "DRAFT":
+            raise ValueError("published release is immutable")
+        persona_id, persona_source, persona_status = release[0], release[2], release[3]
+        fixture = persona_source == "fictional_fixture"
+        if fixture:
+            if source_kind != "fictional_fixture" or approval != "fixture":
+                raise ValueError("fictional fixture memories must remain fixture-labeled")
+        else:
+            if source_kind == "fictional_fixture" or approval == "fixture":
+                raise ValueError("fictional fixture memory cannot enter a production release")
+            if approval == "approved":
+                if persona_status != "APPROVED":
+                    raise ValueError("approved memory requires an approved persona")
+                if not isinstance(consent_ref, str) or not consent_ref.strip():
+                    raise ValueError("approved production memory requires consent_ref")
+
+        fact_rows = self.conn.execute(
+            "SELECT f.fact_id,f.tellable,a.decision FROM release_facts rf "
+            "JOIN persona_facts f ON f.fact_id=rf.fact_id "
+            "JOIN persona_fact_approvals a ON a.approval_id=rf.approval_id "
+            "WHERE rf.persona_id=? AND rf.release_id=?", (persona_id, release_id)
+        ).fetchall()
+        facts = {row[0]: row for row in fact_rows}
+        expected_approval = "fixture" if fixture else "approved"
+        if any(fid not in facts or facts[fid][2] != expected_approval for fid in normalized_fact_ids):
+            raise ValueError("memory facts must be approved facts in the same release")
+        if approval == "approved" and privacy == "public" and tellable == "public":
+            if any(facts[fid][1] != "public" for fid in normalized_fact_ids):
+                raise ValueError("public memory requires public supporting facts")
+        if any(self.conn.execute("SELECT 1 FROM persona_revocations WHERE fact_id=?", (fid,)).fetchone()
+               for fid in normalized_fact_ids):
+            raise ValueError("memory cannot cite a revoked fact")
+
+        memory = {
+            "memory_id": _id(memory_id), "persona_uuid": persona_id, "release_id": release_id,
+            "topic": topic.strip(), "occurred_at": occurred_at, "precision": precision.strip(),
+            "source_ref": source_ref.strip(), "source_kind": source_kind, "approval": approval,
+            "privacy": privacy, "tellable": tellable, "fact_ids": normalized_fact_ids,
+            "approved_summary": approved_summary.strip(),
+            "consent_ref": consent_ref.strip() if isinstance(consent_ref, str) and consent_ref.strip() else None,
+        }
+        memory["checksum"] = self._memory_digest(memory)
+        self.conn.execute(
+            "INSERT INTO persona_memories(memory_id,persona_id,release_id,topic,occurred_at,precision,source_ref,source_kind,approval,privacy,tellable,fact_ids,approved_summary,consent_ref,checksum) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (memory["memory_id"], memory["persona_uuid"], release_id, memory["topic"], occurred_at,
+             memory["precision"], memory["source_ref"], source_kind, approval, privacy, tellable,
+             self._json(normalized_fact_ids), memory["approved_summary"], memory["consent_ref"], memory["checksum"]))
+        self.conn.commit()
+        return memory["memory_id"]
+
     def publish_release(self, release_id, approved_by):
+        if not isinstance(approved_by, str) or not approved_by.strip():
+            raise ValueError("release approval requires reviewer identity")
+        approved_by = approved_by.strip()
         with self._atomic():
             release = self.conn.execute("SELECT persona_id,status,style FROM persona_releases WHERE release_id=?",
                                         (release_id,)).fetchone()
@@ -287,10 +416,119 @@ class PersonaStore:
                     self._validate_claims(row[1], json.loads(row[2]), json.loads(row[3]), included, fact_sources)
             if persona[0] != "fictional_fixture" and persona[1] != "APPROVED":
                 raise ValueError("persona must be approved before release publication")
+            fact_details = {row[0]: row for row in fact_rows}
+            memory_rows = self.conn.execute(
+                    "SELECT memory_id,source_kind,approval,privacy,tellable,fact_ids,consent_ref "
+                    "FROM persona_memories WHERE release_id=?", (release_id,)).fetchall() if self._has_memory_schema() else []
+            for row in memory_rows:
+                if row[2] != expected_approval:
+                    raise ValueError(f"memory {row[0]} is not {expected_approval}")
+                memory_fact_ids = json.loads(row[5])
+                if not memory_fact_ids or not set(memory_fact_ids).issubset(included):
+                    raise ValueError(f"memory {row[0]} requires facts from the same release")
+                if row[1] == "fictional_fixture" and not fixture_only:
+                    raise ValueError(f"memory {row[0]} is fixture-only")
+                if not fixture_only and (not row[6] or not row[6].strip()):
+                    raise ValueError(f"approved memory {row[0]} requires consent_ref")
+                if row[3] == "public" and row[4] == "public" and any(
+                        fact_details[fid][6] != "public" for fid in memory_fact_ids):
+                    raise ValueError(f"public memory {row[0]} requires public supporting facts")
+            public_fact_ids = {row[0] for row in fact_rows if row[6] == "public"}
+            self._validate_voice_guide(json.loads(release[2] or "{}"), expected_approval,
+                                       public_fact_ids)
             checksum = self._checksum(release_id)
             status = "FIXTURE" if fixture_only else "PUBLISHED"
             self.conn.execute("UPDATE persona_releases SET status=?,checksum=?,approved_by=?,published_at=CURRENT_TIMESTAMP WHERE release_id=? AND status='DRAFT'",
                               (status, checksum, approved_by, release_id))
+
+    @staticmethod
+    def _validate_voice_guide(style, expected_approval, public_fact_ids):
+        if not isinstance(style, dict):
+            raise ValueError("release style must be an object")
+        if "voice_guide" not in style:
+            return
+        guide = style["voice_guide"]
+        if not isinstance(guide, dict):
+            raise ValueError("voice guide must be an object")
+        unsupported = set(guide) - VOICE_GUIDE_KEYS
+        if unsupported:
+            raise ValueError("voice guide contains unsupported fields")
+        if (guide.get("approval") != expected_approval or guide.get("privacy") != "public" or
+                expected_approval == "approved" and
+                (not isinstance(guide.get("consent_ref"), str) or not guide["consent_ref"].strip())):
+            requirement = ("approval=approved, privacy=public and consent_ref" if expected_approval == "approved"
+                           else "approval=fixture and privacy=public")
+            raise ValueError(f"voice guide requires {requirement}")
+        if expected_approval == "fixture" and guide.get("consent_ref") not in (None, ""):
+            raise ValueError("fixture voice guide cannot claim production consent")
+        if "provenance" in guide and (not isinstance(guide["provenance"], str) or
+                                        not guide["provenance"].strip()):
+            raise ValueError("voice guide provenance must be nonempty text")
+        if "data_origin" in guide and (not isinstance(guide["data_origin"], str) or
+                                         not guide["data_origin"].strip()):
+            raise ValueError("voice guide data_origin must be nonempty text")
+        if "consent_ref" in guide and guide["consent_ref"] is not None and not isinstance(guide["consent_ref"], str):
+            raise ValueError("voice guide consent_ref must be text or null")
+        if "tone" in guide and (not isinstance(guide["tone"], str) or len(guide["tone"]) > 200):
+            raise ValueError("voice guide tone must be short text")
+        for key in ("habits", "speaker_habits", "reactions", "interests", "boundaries"):
+            value = guide.get(key)
+            if value is not None and (not isinstance(value, list) or len(value) > 50 or
+                    any(not isinstance(item, str) or not item.strip() or len(item) > 600 for item in value)):
+                raise ValueError(f"voice guide {key} must be a list of short text")
+        target = guide.get("human_approved_example_target")
+        if target is not None and (not isinstance(target, dict) or
+                set(target) != {"minimum", "maximum", "collected", "status"} or
+                any(type(target.get(key)) is not int or target[key] < 0
+                    for key in ("minimum", "maximum", "collected")) or
+                not isinstance(target.get("status"), str) or not target["status"].strip()):
+            raise ValueError("voice guide human_approved_example_target is invalid")
+
+        examples = guide.get("few_shots")
+        if not isinstance(examples, list) or not 10 <= len(examples) <= 20:
+            raise ValueError("voice guide requires 10 to 20 few_shots")
+        seen_ids = set()
+        for example in examples:
+            if not isinstance(example, dict):
+                raise ValueError("voice example must be an object")
+            if set(example) - VOICE_EXAMPLE_KEYS:
+                raise ValueError("voice example contains unsupported fields")
+            if not all(isinstance(example.get(key), str) and example[key].strip()
+                       for key in ("example_id", "topic", "customer_text", "reply_text")):
+                raise ValueError("voice example requires id, topic, customer_text and reply_text")
+            if (example["example_id"] in seen_ids or len(example["example_id"]) > 200 or
+                    len(example["topic"]) > 200 or len(example["customer_text"]) > 20_000 or
+                    len(example["reply_text"]) > 600):
+                raise ValueError("voice example fields are duplicated or too long")
+            seen_ids.add(example["example_id"])
+            if (example.get("approval") != expected_approval or example.get("privacy") != "public" or
+                    expected_approval == "approved" and
+                    (not isinstance(example.get("consent_ref"), str) or not example["consent_ref"].strip())):
+                requirement = ("approval=approved, privacy=public and consent_ref" if expected_approval == "approved"
+                               else "approval=fixture and privacy=public")
+                raise ValueError(f"voice example requires {requirement}")
+            if expected_approval == "fixture" and example.get("consent_ref") not in (None, ""):
+                raise ValueError("fixture voice example cannot claim production consent")
+            if "provenance" in example and (not isinstance(example["provenance"], str) or
+                                             not example["provenance"].strip()):
+                raise ValueError("voice example provenance must be nonempty text")
+            if "source_ref" in example and (not isinstance(example["source_ref"], str) or
+                                              not example["source_ref"].strip()):
+                raise ValueError("voice example source_ref must be nonempty text")
+            if "consent_ref" in example and example["consent_ref"] is not None and not isinstance(example["consent_ref"], str):
+                raise ValueError("voice example consent_ref must be text or null")
+            if "source_kind" in example and (not isinstance(example["source_kind"], str) or
+                                               example["source_kind"] not in SOURCE_KINDS):
+                raise ValueError("voice example source_kind is invalid")
+            if expected_approval == "approved" and example.get("source_kind") == "fictional_fixture":
+                raise ValueError("fixture voice example cannot enter a production release")
+            fact_ids = example.get("fact_ids")
+            if not isinstance(fact_ids, list) or len(fact_ids) > 30 or \
+                    any(not isinstance(fact_id, str) or not fact_id for fact_id in fact_ids) or \
+                    len(fact_ids) != len(set(fact_ids)):
+                raise ValueError("voice example fact_ids must be a unique list")
+            if not set(fact_ids).issubset(public_fact_ids):
+                raise ValueError("voice example references a fact outside the public release")
 
     @staticmethod
     def _validate_claims(body, required_fact_ids, claims, included, fact_sources):
@@ -351,6 +589,200 @@ class PersonaStore:
                           (fact_id, reason, revoked_by))
         self.conn.commit()
 
+    # -- details Luna invented during a conversation; never part of an approved release --
+    def _has_generated_schema(self):
+        if self.sqlite:
+            return bool(self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='persona_generated_facts'").fetchone())
+        return bool(self.conn.execute("SELECT to_regclass('persona_generated_facts')").fetchone()[0])
+
+    _GEN_COLUMNS = ("gen_fact_id", "fact_key", "value_text", "precision", "source_ref",
+                    "created_comment_id", "status")
+
+    def generated_rows(self, persona_id, comment_id=None):
+        """ACTIVE facts for everyone, plus PENDING ones created by this one comment."""
+        rows = self.conn.execute(
+            "SELECT gen_fact_id,fact_key,value_text,precision,source_ref,created_comment_id,status "
+            "FROM persona_generated_facts WHERE persona_id=? AND "
+            "(status='ACTIVE' OR (status='PENDING' AND created_comment_id=?)) "
+            "ORDER BY created_at, gen_fact_id LIMIT 300", (persona_id, comment_id or "")).fetchall()
+        return [dict(zip(self._GEN_COLUMNS, row)) for row in rows]
+
+    def attach_generated(self, snapshot, comment_id=None):
+        """Return the snapshot with generated facts appended; the stored release is untouched."""
+        if not isinstance(snapshot, dict) or not self._has_generated_schema():
+            return snapshot
+        from .persona_fact_policy import as_snapshot_fact
+        persona_id, release_id = snapshot["persona_uuid"], snapshot["release_id"]
+        rows = self.generated_rows(persona_id, comment_id)
+        if not rows:
+            return snapshot
+        return {**snapshot, "facts": list(snapshot["facts"]) +
+                [as_snapshot_fact(row, persona_id, release_id) for row in rows]}
+
+    def live_generated_keys(self, persona_id):
+        return {row[0] for row in self.conn.execute(
+            "SELECT fact_key FROM persona_generated_facts WHERE persona_id=? AND status IN ('PENDING','ACTIVE')",
+            (persona_id,)).fetchall()}
+
+    def generated_created_today(self, persona_id, day):
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM persona_generated_facts WHERE persona_id=? AND created_at>=? AND status<>'DISCARDED'",
+            (persona_id, day)).fetchone()[0]
+
+    def purge_generated(self, persona_id, now_iso, ttl_minutes):
+        """Drop PENDING rows nobody sent: they must not block a key forever."""
+        now = datetime.fromisoformat(now_iso)
+        with self._atomic():
+            for gen_id, created in self.conn.execute(
+                    "SELECT gen_fact_id,created_at FROM persona_generated_facts WHERE persona_id=? AND status='PENDING'",
+                    (persona_id,)).fetchall():
+                try:
+                    age = (now - datetime.fromisoformat(created)).total_seconds() / 60
+                except (TypeError, ValueError):
+                    age = ttl_minutes + 1
+                if age > ttl_minutes:
+                    self.conn.execute("UPDATE persona_generated_facts SET status='DISCARDED',updated_at=? WHERE gen_fact_id=?",
+                                      (now_iso, gen_id))
+
+    def propose_generated(self, persona_id, key, value, precision, source_ref, comment_id, now_iso):
+        if not self._has_generated_schema():
+            raise ValueError("generated fact schema is not migrated; apply migration 10")
+        gen_id = _id()
+        with self._atomic():
+            self.conn.execute(
+                "INSERT INTO persona_generated_facts(gen_fact_id,persona_id,fact_key,value_text,precision,source_ref,"
+                "created_comment_id,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'PENDING',?,?)",
+                (gen_id, persona_id, key, value, precision, source_ref, comment_id, now_iso, now_iso))
+        return gen_id
+
+    def activate_generated(self, comment_id, ids, now_iso):
+        for gen_id in ids or ():
+            self.conn.execute(
+                "UPDATE persona_generated_facts SET status='ACTIVE',updated_at=? "
+                "WHERE gen_fact_id=? AND created_comment_id=? AND status='PENDING'", (now_iso, gen_id, comment_id))
+
+    def discard_generated(self, comment_id, now_iso, keep_ids=()):
+        keep = set(keep_ids or ())
+        for (gen_id,) in self.conn.execute(
+                "SELECT gen_fact_id FROM persona_generated_facts WHERE created_comment_id=? AND status='PENDING'",
+                (comment_id,)).fetchall():
+            if gen_id not in keep:
+                self.conn.execute("UPDATE persona_generated_facts SET status='DISCARDED',updated_at=? WHERE gen_fact_id=?",
+                                  (now_iso, gen_id))
+
+    def revoke_generated(self, gen_fact_id, reason, revoked_by, now_iso=None):
+        if not isinstance(reason, str) or not reason.strip() or not isinstance(revoked_by, str) or not revoked_by.strip():
+            raise ValueError("revocation requires reason and actor")
+        now_iso = now_iso or datetime.now().astimezone().isoformat()
+        with self._atomic():
+            cur = self.conn.execute(
+                "UPDATE persona_generated_facts SET status='REVOKED',revoke_reason=?,revoked_by=?,updated_at=? "
+                "WHERE gen_fact_id=? AND status IN ('PENDING','ACTIVE')", (reason.strip(), revoked_by.strip(), now_iso, gen_fact_id))
+        return cur.rowcount == 1
+
+    def list_generated(self, persona_id, limit=100):
+        rows = self.conn.execute(
+            "SELECT gen_fact_id,fact_key,value_text,precision,source_ref,created_comment_id,status,created_at "
+            "FROM persona_generated_facts WHERE persona_id=? AND status IN ('PENDING','ACTIVE','REVOKED') "
+            "ORDER BY created_at DESC LIMIT ?", (persona_id, limit)).fetchall()
+        return [dict(zip(self._GEN_COLUMNS + ("created_at",), row)) for row in rows]
+
+    def reserved_memory_ids(self, scope):
+        return [row[0] for row in self.conn.execute(
+            "SELECT memory_id FROM persona_memory_reservations WHERE status IN ('RESERVED','SENDING') "
+            "AND page_id=? AND post_id=? "
+            "AND thread_root_id=? AND actor_id=? ORDER BY memory_id",
+            tuple(scope[key] for key in ("page_id", "post_id", "thread_root_id", "actor_id"))).fetchall()]
+
+    def reserve_memory_delivery(self, scope, memory_ids, dedupe_key, turn_ordinal, now_iso):
+        """Claim one story for an in-flight send; delivery history is written only on SENT."""
+        memory_ids = sorted(set(memory_ids or ()))
+        if not memory_ids:
+            return True
+        if len(memory_ids) != 1:
+            return False
+        memory_id = memory_ids[0]
+        scope_values = tuple(scope[key] for key in ("page_id", "post_id", "thread_root_id", "actor_id"))
+        try:
+            with self._atomic():
+                if self.conn.execute(
+                        "SELECT 1 FROM persona_memory_revocations WHERE memory_id=? LIMIT 1",
+                        (memory_id,)).fetchone():
+                    raise _MemoryReservationConflict()
+                delivered = self.conn.execute(
+                    "SELECT MAX(turn_ordinal) FROM persona_memory_deliveries WHERE page_id=? AND post_id=? "
+                    "AND thread_root_id=? AND actor_id=? AND memory_ids<>'[]'", scope_values).fetchone()[0]
+                if delivered is not None and turn_ordinal - delivered < 5:
+                    raise _MemoryReservationConflict()
+                row = self.conn.execute(
+                    "SELECT dedupe_key,memory_id FROM persona_memory_reservations WHERE page_id=? AND post_id=? "
+                    "AND thread_root_id=? AND actor_id=?", scope_values).fetchone()
+                if row:
+                    if row[0] != dedupe_key or row[1] != memory_id:
+                        raise _MemoryReservationConflict()
+                    return True
+                self.conn.execute(
+                    "INSERT INTO persona_memory_reservations(dedupe_key,page_id,post_id,thread_root_id,"
+                    "actor_id,memory_id,turn_ordinal,reserved_at,status) VALUES (?,?,?,?,?,?,?,?, 'RESERVED')",
+                    (dedupe_key, *scope_values, memory_id, turn_ordinal, now_iso))
+        except _MemoryReservationConflict:
+            return False
+        except Exception:
+            # A concurrent worker can win the unique conversation reservation after our SELECT.
+            row = self.conn.execute(
+                "SELECT dedupe_key,memory_id FROM persona_memory_reservations WHERE page_id=? AND post_id=? "
+                "AND thread_root_id=? AND actor_id=?", scope_values).fetchone()
+            if row and (row[0] != dedupe_key or row[1] != memory_id):
+                return False
+            raise
+        return True
+
+    def start_memory_delivery(self, dedupe_key):
+        """Linearize revocation against send: only RESERVED can transition to SENDING."""
+        with self._atomic():
+            row = self.conn.execute(
+                "SELECT memory_id,status FROM persona_memory_reservations WHERE dedupe_key=?",
+                (dedupe_key,)).fetchone()
+            if not row:
+                return False
+            if row[1] == "SENDING":
+                return True
+            if self.conn.execute(
+                    "SELECT 1 FROM persona_memory_revocations WHERE memory_id=? LIMIT 1", (row[0],)).fetchone():
+                return False
+            cur = self.conn.execute(
+                "UPDATE persona_memory_reservations SET status='SENDING' WHERE dedupe_key=? AND status='RESERVED'",
+                (dedupe_key,))
+        return cur.rowcount == 1
+
+    def release_memory_reservation(self, dedupe_key):
+        return self.conn.execute("DELETE FROM persona_memory_reservations WHERE dedupe_key=?",
+                                 (dedupe_key,)).rowcount
+
+    def revoke_memory(self, memory_id, reviewer, reason):
+        if not self._has_memory_schema():
+            raise ValueError("persona memory schema is not migrated; apply migration 9")
+        if not isinstance(reason, str) or not reason.strip() or not isinstance(reviewer, str) or not reviewer.strip():
+            raise ValueError("memory revocation requires reason and reviewer")
+        if not self.conn.execute("SELECT 1 FROM persona_memories WHERE memory_id=?", (memory_id,)).fetchone():
+            raise ValueError("unknown memory")
+        with self._atomic():
+            self.conn.execute(
+                "INSERT INTO persona_memory_revocations(memory_id,reason,revoked_by) VALUES (?,?,?)",
+                (memory_id, reason.strip(), reviewer.strip()))
+            self.conn.execute(
+                "DELETE FROM persona_memory_reservations WHERE memory_id=? AND status='RESERVED'", (memory_id,))
+        return memory_id
+
+    def revoked_memory_ids(self, persona_id, release_id):
+        if not self._has_memory_schema():
+            return []
+        return [row[0] for row in self.conn.execute(
+            "SELECT DISTINCT rv.memory_id FROM persona_memory_revocations rv "
+            "JOIN persona_memories m ON m.memory_id=rv.memory_id "
+            "WHERE m.persona_id=? AND m.release_id=? ORDER BY rv.memory_id", (persona_id, release_id))]
+
     def revocation_epoch(self):
         return self.conn.execute("SELECT COALESCE(MAX(seq),0) FROM persona_revocations").fetchone()[0]
 
@@ -391,8 +823,20 @@ class PersonaStore:
             "SELECT hook_id,text,purpose,required_fact_ids,claims,max_per_conversation,approval "
             "FROM persona_hooks WHERE release_id=? ORDER BY hook_id", (release_id,))
         hooks = [self._dict_row(hook_cur, row) for row in hook_cur.fetchall()]
-        return {"release_id": release[0], "persona_id": release[1], "style": json.loads(release[2]),
-                "facts": facts, "utterances": utterances, "hooks": hooks}
+        memories = []
+        if self._has_memory_schema():
+            memory_cur = self.conn.execute(
+                "SELECT memory_id,persona_id,release_id,topic,occurred_at,precision,source_ref,source_kind,approval,privacy,tellable,fact_ids,approved_summary,consent_ref,checksum "
+                "FROM persona_memories WHERE release_id=? ORDER BY memory_id", (release_id,))
+            memories = [self._dict_row(memory_cur, row) for row in memory_cur.fetchall()]
+        for memory in memories:
+            memory["persona_uuid"] = memory.pop("persona_id")
+            memory["fact_ids"] = json.loads(memory["fact_ids"])
+        content = {"release_id": release[0], "persona_id": release[1], "style": json.loads(release[2]),
+                   "facts": facts, "utterances": utterances, "hooks": hooks}
+        if memories:
+            content["memories"] = memories
+        return content
 
     def _checksum(self, release_id):
         return hashlib.sha256(self._json(self._release_content(release_id)).encode()).hexdigest()
@@ -408,6 +852,7 @@ class PersonaStore:
             "FROM persona_releases r JOIN personas p ON p.persona_id=r.persona_id "
             "WHERE r.release_id=? AND r.persona_id=?", (release_id, persona_id)).fetchone()
         expected_status = "FIXTURE" if row and row[6] == "fictional_fixture" else "PUBLISHED"
+        expected_approval = "fixture" if expected_status == "FIXTURE" else "approved"
         if not row or row[0] != expected_status or not row[1] or row[1] != self._checksum(release_id):
             raise ValueError("release is missing, unpublished, or checksum verification failed")
         if on_date is None: on_date = date.today()
@@ -416,7 +861,7 @@ class PersonaStore:
         payload = self._release_content(release_id)
         facts = []
         for fact in payload["facts"]:
-            if fact["decision"] != expected_status.lower() or fact["tellable"] != "public":
+            if fact["decision"] != expected_approval or fact["tellable"] != "public":
                 continue
             if include and fact["canonical_key"] not in include:
                 continue
@@ -446,11 +891,23 @@ class PersonaStore:
                           "tellable": fact["tellable"], "source_ref": fact["source_ref"],
                           "source_kind": fact["source_kind"], "approval": fact["decision"]})
         utterances = [{**u, "required_fact_ids": json.loads(u["required_fact_ids"]), "claims": json.loads(u["claims"])}
-                      for u in payload["utterances"] if u["approval"] == expected_status.lower() and
+                      for u in payload["utterances"] if u["approval"] == expected_approval and
                       set(json.loads(u["required_fact_ids"])).issubset({f["fact_id"] for f in facts})]
         hooks = [{**h, "required_fact_ids": json.loads(h["required_fact_ids"]), "claims": json.loads(h["claims"])}
-                 for h in payload["hooks"] if h["approval"] == expected_status.lower() and
+                 for h in payload["hooks"] if h["approval"] == expected_approval and
                  set(json.loads(h["required_fact_ids"])).issubset({f["fact_id"] for f in facts})]
+        included = {f["fact_id"] for f in facts}
+        revoked_memory_ids = self.revoked_memory_ids(persona_id, release_id)
+        memories = []
+        for memory in payload.get("memories", []):
+            if memory["approval"] != expected_approval or memory["memory_id"] in revoked_memory_ids:
+                continue
+            if memory["checksum"] != self._memory_digest(memory):
+                raise ValueError("memory checksum verification failed")
+            if not set(memory["fact_ids"]).issubset(included):
+                continue
+            memory = dict(memory)
+            memories.append(memory)
         return {"persona": {"id": persona_id, "slug": row[4], "display_name": row[5],
                             "source_kind": row[6], "status": row[7]},
                 "release": {"id": release_id, "status": row[0], "checksum": row[1],
@@ -458,9 +915,10 @@ class PersonaStore:
                             "approved_by": row[2],
                             "published_at": row[3], "style": payload["style"]},
                 "fixture_only": row[0] == "FIXTURE", "facts": facts,
-                "utterances": utterances, "hooks": hooks,
+                "utterances": utterances, "hooks": hooks, "memories": memories,
                 "revocation_epoch": self.revocation_epoch(),
-                "revoked_fact_ids": self.revoked_fact_ids(persona_id, release_id)}
+                "revoked_fact_ids": self.revoked_fact_ids(persona_id, release_id),
+                "revoked_memory_ids": revoked_memory_ids}
 
     release_snapshot = get_release_snapshot
 
@@ -486,11 +944,21 @@ class PersonaStore:
             }
             utterance["checksum"] = utterance_checksum(utterance)
             utterances.append(utterance)
+        # Hooks share utterance validation and the release-bound dispatch check.
+        for hook in snapshot['hooks']:
+            item = dict(utterance_id=hook['hook_id'], persona_uuid=binding['persona_id'],
+                release_id=release_id, text=hook['text'], purpose='answer_persona',
+                topic=hook['purpose'], required_fact_ids=hook['required_fact_ids'],
+                claims=hook['claims'], approval=hook['approval'],
+                source_kind=snapshot['persona']['source_kind'], hook=True)
+            item['checksum'] = utterance_checksum(item)
+            utterances.append(item)
         return {
             **binding, "persona_uuid": binding["persona_id"], "release_id": release_id,
             "approved": snapshot["release"]["approved"],
             "source_kind": snapshot["persona"]["source_kind"],
             "fixture_only": snapshot["fixture_only"], "snapshot": snapshot,
+            "memories": snapshot["memories"], "revoked_memory_ids": snapshot["revoked_memory_ids"],
             "facts": [{**f, "persona_uuid": binding["persona_id"], "release_id": release_id,
                        "canonical_key": f["key"]} for f in snapshot["facts"]],
             "utterances": utterances,

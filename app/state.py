@@ -27,6 +27,28 @@ CREATE TABLE IF NOT EXISTS contact_blocks(page_id TEXT, actor_id TEXT, channel T
 CREATE TABLE IF NOT EXISTS handoffs(request_id TEXT PRIMARY KEY, owner TEXT, reason TEXT,
   lock_version INTEGER, acquired_at TEXT, released_at TEXT, overdue INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS lead_draft_fields(
+ page_id TEXT NOT NULL, actor_id TEXT NOT NULL, post_id TEXT NOT NULL,
+ field TEXT NOT NULL, value TEXT, evidence TEXT, source_message_id TEXT,
+ updated_at TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('ASKED','ANSWERED','DECLINED')),
+ PRIMARY KEY(page_id,actor_id,post_id,field));
+CREATE TABLE IF NOT EXISTS peer_conversation_state(
+ page_id TEXT NOT NULL, post_id TEXT NOT NULL, thread_root_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+ payload TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL,
+ PRIMARY KEY(page_id,post_id,thread_root_id,actor_id));
+CREATE TABLE IF NOT EXISTS generated_reply_drafts(
+ draft_id TEXT PRIMARY KEY, page_id TEXT NOT NULL, post_id TEXT NOT NULL,
+ thread_root_id TEXT NOT NULL, actor_id TEXT NOT NULL, comment_id TEXT NOT NULL,
+ payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING', reviewer TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(page_id,comment_id));
+CREATE TABLE IF NOT EXISTS persona_generation_turns(
+ page_id TEXT NOT NULL, post_id TEXT NOT NULL, thread_root_id TEXT NOT NULL,
+ actor_id TEXT NOT NULL, comment_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+ PRIMARY KEY(page_id,post_id,thread_root_id,actor_id,comment_id));
+CREATE TABLE IF NOT EXISTS persona_memory_deliveries(
+ dedupe_key TEXT PRIMARY KEY, page_id TEXT NOT NULL, post_id TEXT NOT NULL,
+ thread_root_id TEXT NOT NULL, actor_id TEXT NOT NULL, turn_ordinal INTEGER NOT NULL,
+ memory_ids TEXT NOT NULL, created_at TEXT NOT NULL);
 """
 
 
@@ -85,6 +107,35 @@ class Store:
     def lock_scope(self, event):
         """SQLite already serializes this connection's transaction."""
         return None
+    def lead_profile(self, event):
+        rows = self.conn.execute('SELECT field,value,evidence,source_message_id,updated_at,status FROM lead_draft_fields WHERE page_id=? AND actor_id=? AND post_id=?',
+            (event['page_id'], event['actor_id'], event['post_id'])).fetchall()
+        return {r[0]: dict(zip(('value','evidence','source_message_id','updated_at','status'), r[1:])) for r in rows}
+
+    @staticmethod
+    def _peer_key(event):
+        return (event['page_id'], event.get('post_id') or '', event.get('thread_root_id') or '', event['actor_id'])
+
+    def peer_state(self, event):
+        """What this person has said about themselves (address term, ownership, buying intent)."""
+        row = self.conn.execute('SELECT payload FROM peer_conversation_state WHERE page_id=? AND post_id=? AND thread_root_id=? AND actor_id=?',
+                                self._peer_key(event)).fetchone()
+        try:
+            value = json.loads(row[0]) if row else {}
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def save_peer_state(self, event, state, now):
+        self.conn.execute('INSERT INTO peer_conversation_state(page_id,post_id,thread_root_id,actor_id,payload,version,updated_at) VALUES (?,?,?,?,?,1,?) '
+                          'ON CONFLICT(page_id,post_id,thread_root_id,actor_id) DO UPDATE SET payload=excluded.payload,'
+                          'version=peer_conversation_state.version+1,updated_at=excluded.updated_at',
+                          self._peer_key(event) + (json.dumps(state, ensure_ascii=False, sort_keys=True), now))
+
+    def save_lead_field(self, event, field, value, status, now):
+        self.conn.execute('INSERT INTO lead_draft_fields(page_id,actor_id,post_id,field,value,evidence,source_message_id,updated_at,status) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(page_id,actor_id,post_id,field) DO UPDATE SET value=excluded.value,evidence=excluded.evidence,source_message_id=excluded.source_message_id,updated_at=excluded.updated_at,status=excluded.status',
+            (event['page_id'], event['actor_id'], event['post_id'], field, value,
+             event['text'] if status != 'ASKED' else None, event['comment_id'], now, status))
     def assert_intent_lease(self, event_id, attempt_token):
         lock_clause = " FOR UPDATE" if hasattr(self.conn, "raw") else ""
         row = self.conn.execute(
@@ -266,13 +317,20 @@ class Store:
             "WHERE dedupe_key=? AND status='INTENDED'",
             (now_iso, worker_id, dedupe_key))
         return cur.rowcount == 1
-    def reclaim_outbox(self, dedupe_key, worker_id=None, now_iso=None):
+    def reclaim_outbox(self, dedupe_key, worker_id=None, now_iso=None, expected_claimed_at=None):
         """Reclaim một row CLAIMED đã hết lease (drain recovery): chỉ
-        CLAIMED -> CLAIMED (đổi owner/lease) mới thành công."""
-        cur = self.conn.execute(
-            "UPDATE outbox SET claimed_at=?, claimed_by=? "
-            "WHERE dedupe_key=? AND status='CLAIMED'",
-            (now_iso, worker_id, dedupe_key))
+        CLAIMED -> CLAIMED (đổi owner/lease) mới thành công. Compare-and-swap
+        trên lease đã đọc để hai recovery worker không cùng gửi một intent."""
+        if expected_claimed_at is None:
+            cur = self.conn.execute(
+                "UPDATE outbox SET claimed_at=?, claimed_by=? "
+                "WHERE dedupe_key=? AND status='CLAIMED' AND claimed_at IS NULL",
+                (now_iso, worker_id, dedupe_key))
+        else:
+            cur = self.conn.execute(
+                "UPDATE outbox SET claimed_at=?, claimed_by=? "
+                "WHERE dedupe_key=? AND status='CLAIMED' AND claimed_at=?",
+                (now_iso, worker_id, dedupe_key, expected_claimed_at))
         return cur.rowcount == 1
     # -- proposal rejections (A2): đề xuất đã bị từ chối thì không đề xuất lại
     # y hệt; fingerprint = slot values của request lúc bị từ chối.
