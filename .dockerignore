@@ -1,5 +1,15 @@
 # Không đưa vào image: cache, DB runtime, file tạm, ZIP cũ.
 __pycache__
+graphify-out/
+.superpowers/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
 *.pyc
 *.db
 *.receiver

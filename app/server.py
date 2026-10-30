@@ -1,19 +1,20 @@
-"""API/event harness (stdlib http.server, không FastAPI để chạy offline không cần pip).
+"""API/event harness backed by the configured PostgreSQL database.
 POST /event  {event, postcard, semantic} -> process result
 GET  /ledger -> fake ledger
 GET  /health -> ok
-Chạy: python3 -m app.server  (port 8765, DB runs/sandbox.db)
+Chạy: MAT_INTENT_DATABASE_URL=<PostgreSQL URL> python3 -m app.server
 """
 from __future__ import annotations
 import json, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from .harness import make_engine
 from .engine import WallClock
+from .pg_adapter import connect
 
-# R15: server dùng WallClock (giờ thật mỗi lần gọi). Clock đóng băng chỉ dùng
-# cho test; server cũ dùng Clock(datetime.now()) nên mọi now() bằng nhau.
-ENG = make_engine(db=os.environ.get("SANDBOX_DB_PATH", "./runs/sandbox.db"),
-                  clock=WallClock())
+database_url = os.environ.get("MAT_INTENT_DATABASE_URL") or os.environ.get("DB_NEON")
+if not database_url:
+    raise RuntimeError("MAT_INTENT_DATABASE_URL or DB_NEON is required")
+ENG = make_engine(store=connect(database_url), clock=WallClock())
 # A5: server restart phải drain intent tồn đọng (INTENDED/CLAIMED hết lease)
 # từ lần chạy trước thay vì để chúng kẹt cho tới khi có event trùng lặp.
 try:

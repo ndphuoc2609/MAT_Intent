@@ -345,19 +345,21 @@ def parse_persona_analysis(envelope: Any, *, current_text="", evidence_texts=Non
             envelope.get("peer_interpretation"), current_text) else None}
 
 
-def parse_persona_post(envelope: Any, *, persona_predicates=None, supplied_fact_ids=None):
+def parse_persona_post(envelope: Any, *, persona_predicates=None, supplied_fact_ids=None,
+                       return_reason=False):
     """Return a post only when its claims and new-fact references are internally complete."""
+    invalid = lambda reason: (None, reason) if return_reason else None
     if (not isinstance(envelope, dict) or envelope.get("schema_version") != "persona_post_v1" or
             set(envelope) != {"schema_version", "post_text", "fact_ids", "claims", "fact_proposals"}):
-        return None
+        return invalid("POST_ENVELOPE_SHAPE")
     text = envelope["post_text"]
     facts, claims, proposals = envelope["fact_ids"], envelope["claims"], envelope["fact_proposals"]
     if not isinstance(text, str) or not text.strip() or len(text) > 3000:
-        return None
+        return invalid("POST_TEXT_INVALID")
     if not _unique_strings(facts) or not isinstance(claims, list) or not claims or len(claims) > 40:
-        return None
+        return invalid("POST_CLAIMS_INVALID")
     if not isinstance(proposals, list) or len(proposals) > 2:
-        return None
+        return invalid("POST_PROPOSALS_INVALID")
     proposal_ids, proposal_by_id = set(), {}
     slug_pattern = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
     for proposal in proposals:
@@ -371,11 +373,11 @@ def parse_persona_post(envelope: Any, *, persona_predicates=None, supplied_fact_
                 not isinstance(proposal["value"], str) or not proposal["value"].strip() or
                 len(proposal["value"]) > 160 or
                 proposal["precision"] not in ("exact", "approximate", "month", "year", "none")):
-            return None
+            return invalid("POST_PROPOSAL_SHAPE")
         proposal_ids.add(proposal["proposal_id"])
         proposal_by_id[proposal["proposal_id"]] = proposal
     if len(proposal_ids) != len(proposals):
-        return None
+        return invalid("POST_PROPOSAL_DUPLICATE")
     allowed_predicates = set(persona_predicates or PERSONA_PREDICATES) | {
         f"gen.{namespace}" for namespace in NAMESPACES}
     referenced_facts = set()
@@ -388,19 +390,20 @@ def parse_persona_post(envelope: Any, *, persona_predicates=None, supplied_fact_
                 len(claim["text"]) > 600 or claim["text"] not in text or
                 not _unique_strings(claim["fact_ids"]) or not _unique_strings(claim["memory_ids"]) or
                 not _unique_strings(claim["message_ids"])):
-            return None
+            return invalid("POST_CLAIM_SHAPE")
         if any(claim["predicate"] != f"gen.{proposal_by_id[proposal_id]['namespace']}"
                for proposal_id in set(claim["fact_ids"]) & proposal_ids):
-            return None
+            return invalid("POST_PROPOSAL_PREDICATE_MISMATCH")
         referenced_facts.update(claim["fact_ids"])
     if set(facts) != referenced_facts:
-        return None
+        return invalid("POST_CLAIM_FACT_IDS_MISMATCH")
     if not proposal_ids <= referenced_facts:
-        return None
+        return invalid("POST_PROPOSAL_UNREFERENCED")
     supplied = set(supplied_fact_ids or ())
     if not (set(facts) - proposal_ids) <= supplied:
-        return None
+        return invalid("POST_FACT_NOT_SUPPLIED")
     if any(fact_id in PROPOSAL_IDS and fact_id not in proposal_ids for fact_id in facts):
-        return None
-    return {"post_text": text, "fact_ids": copy.deepcopy(facts),
-            "claims": copy.deepcopy(claims), "fact_proposals": copy.deepcopy(proposals)}
+        return invalid("POST_UNKNOWN_PROPOSAL_ID")
+    result = {"post_text": text, "fact_ids": copy.deepcopy(facts),
+              "claims": copy.deepcopy(claims), "fact_proposals": copy.deepcopy(proposals)}
+    return (result, None) if return_reason else result

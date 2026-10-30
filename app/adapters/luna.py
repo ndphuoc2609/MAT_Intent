@@ -163,8 +163,6 @@ diagnostics.intent_confidence là tự đánh giá chưa hiệu chuẩn, không 
 """
 
 PERSONA_GENERATED_REPLY_SYSTEM = PERSONA_TURN_SYSTEM.replace(
-    "Nếu không có câu hỏi làm rõ hữu ích, giữ câu trả lời ngắn và để engine đưa bản nháp cho người duyệt.",
-    "Nếu không có câu hỏi làm rõ hữu ích, giữ câu trả lời ngắn hoặc dùng fallback an toàn.").replace(
     "Không\ntự bịa cảm xúc, sở thích hay trải nghiệm cá nhân mới.",
     "Không tự thêm chi tiết cá nhân ngoài proposal đã khai báo.") + """
 Mọi chi tiết đời sống mới chỉ được tạo trong reply.fact_proposals; không kể trong reply_text nếu không có proposal
@@ -340,7 +338,8 @@ def call_luna(post: str, comment: str, parent: str = "", context: str = "",
         # không đạt contract (runner không thể chặn retry nó không thấy).
         if budget_guard is not None and not budget_guard():
             known_cost = last_failure_unbilled and not unknown_failed_attempt
-            return dict(ok=False, error="budget guard denied before HTTP attempt",
+            return dict(ok=False, error_code="BUDGET_EXHAUSTED",
+                        error="budget guard denied before HTTP attempt",
                         attempts=attempts, cost_usd_est=0.0 if known_cost else None,
                         cost_unknown=not known_cost)
         attempts = attempt + 1
@@ -423,12 +422,13 @@ def call_luna(post: str, comment: str, parent: str = "", context: str = "",
                         parts = parse_persona_analysis(parsed, current_text=comment,
                             evidence_texts=_persona_evidence_texts(context_obj))
                     elif persona_phase == "post":
-                        post_candidate = parse_persona_post(parsed,
+                        post_candidate, post_error = parse_persona_post(parsed,
                             persona_predicates=supplied_keys - {None} if isinstance(persona_context, dict) else None,
-                            supplied_fact_ids=supplied_fact_ids if isinstance(persona_context, dict) else set())
+                            supplied_fact_ids=supplied_fact_ids if isinstance(persona_context, dict) else set(),
+                            return_reason=True)
                         if post_candidate is None:
                             return _model_output_failure("MODEL_PERSONA_POST_SHAPE",
-                                "model persona post did not contain complete supported claims", finish_reason=finish_reason, **common)
+                                post_error, finish_reason=finish_reason, **common)
                         result = dict(ok=True, post_candidate=post_candidate,
                             fact_proposals=post_candidate["fact_proposals"], raw_text=content, usage=usage,
                             cost_usd_est=cost, cost_unknown=cost_unknown,
@@ -512,3 +512,65 @@ def _persona_evidence_texts(context):
     prior = context.get("prior_customer_turns") if isinstance(context.get("prior_customer_turns"), list) else []
     texts.extend(value for value in prior if isinstance(value, str))
     return texts
+
+
+def call_luna_tool(context, transcript, schema, timeout, *, budget_guard, model=MODEL, max_tokens=1800):
+    """One budget-guarded HTTP attempt for the structured conversation tool loop."""
+    if not callable(budget_guard) or budget_guard() is not True:
+        return {'ok': False, 'error_code': 'BUDGET_EXHAUSTED', 'attempts': 0,
+                'cost_usd_est': 0.0, 'cost_unknown': False, 'usage': {}}
+    api_key = os.environ.get('OPENROUTER_API_KEY', '').strip()
+    if not api_key:
+        return {'ok': False, 'error_code': 'MODEL_NOT_CONFIGURED', 'attempts': 0,
+                'cost_usd_est': 0.0, 'cost_unknown': False, 'usage': {}}
+    if not isinstance(context, dict) or not isinstance(transcript, list) or not isinstance(schema, dict):
+        return {'ok': False, 'error_code': 'MODEL_INPUT_INVALID', 'attempts': 0,
+                'cost_usd_est': 0.0, 'cost_unknown': False, 'usage': {}}
+    instruction = ("Bạn trả JSON conversation_tools_v1 đúng schema. Đọc bình luận và ngữ cảnh, "
+        "gọi retrieve để lấy thông tin trước khi viết. Chỉ đề xuất ký ức sau khi truy xuất NOT_FOUND; "
+        "không tự tạo dữ kiện sản phẩm hay thông tin nhạy cảm. Dữ kiện khách cần evidence nguyên văn "
+        "đúng người nói; lưu fact trước khi dùng. Tôn trọng opt-out, không ép mua hoặc hỏi lại dữ kiện "
+        "đã có. Trả lời đúng câu hỏi trước; tối đa một câu hỏi có ý nghĩa. Ký ức mới phải được chấp nhận "
+        "và trích memory_id trước khi kể. Khi được hỏi về AI, trả lời minh bạch. "
+        "Final phải gồm semantic v2 và persona_turn_v1 với claims có nguồn; dùng abstain khi không đủ dữ liệu.")
+    body = {'model': model, 'messages': [{'role': 'system', 'content': instruction},
+        {'role': 'user', 'content': json.dumps({'context': context, 'exchanges': transcript},
+                                               ensure_ascii=False, separators=(',', ':'))}],
+        'max_tokens': max_tokens, 'response_format': {'type': 'json_schema',
+            'json_schema': {'name': 'conversation_tools_v1', 'strict': True, 'schema': schema}},
+        'provider': {'require_parameters': True}}
+    request = urllib.request.Request('https://openrouter.ai/api/v1/chat/completions',
+        data=json.dumps(body).encode('utf-8'), method='POST',
+        headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'})
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout) as response:
+            output = json.load(response)
+    except Exception:
+        return {'ok': False, 'error_code': 'MODEL_TRANSPORT_ERROR', 'attempts': 1,
+                'cost_usd_est': None, 'cost_unknown': True, 'usage': {}}
+    if not isinstance(output, dict):
+        return {'ok': False, 'error_code': 'MODEL_RESPONSE_SHAPE', 'attempts': 1,
+                'cost_usd_est': None, 'cost_unknown': True, 'usage': {}}
+    usage = output.get('usage') if isinstance(output.get('usage'), dict) else {}
+    cost = usage.get('cost', output.get('cost'))
+    known = type(cost) in (int, float) and math.isfinite(cost) and cost >= 0
+    result = {'ok': False, 'attempts': 1, 'cost_usd_est': float(cost) if known else None,
+              'cost_unknown': not known, 'usage': usage, 'model_effective': output.get('model', model)}
+    choices = output.get('choices')
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        result['error_code'] = 'MODEL_RESPONSE_SHAPE'; return result
+    choice = choices[0]
+    message = choice.get('message')
+    if not isinstance(message, dict) or message.get('refusal') or choice.get('finish_reason') in ('refusal', 'content_filter'):
+        result['error_code'] = 'MODEL_REFUSAL'; return result
+    if choice.get('finish_reason') == 'length':
+        result['error_code'] = 'MODEL_OUTPUT_TRUNCATED'; return result
+    try:
+        content = message.get('content')
+        if not isinstance(content, str): raise ValueError('non-string content')
+        parsed = parse_json_strict(content)
+        if not isinstance(parsed, dict): raise ValueError('non-object output')
+    except (TypeError, ValueError, RecursionError):
+        result['error_code'] = 'MODEL_OUTPUT_INVALID_JSON'; return result
+    result.update(ok=True, message=parsed)
+    return result

@@ -5,6 +5,26 @@ from app.lead_flow import (address, address_explicit, asks_usage_duration, extra
 from app.persona_query import parse_persona_query
 
 
+class PendingEvidenceTests(unittest.TestCase):
+    def test_unrelated_usage_does_not_answer_budget_question(self):
+        from app.persona_runtime import peer_plan_from_signals
+        pending = [{'pending_id': 'budget-question', 'expected_slot': 'budget'}]
+        signals = {'speaker_intent': 'social', 'address_term': None, 'asks_persona_question': False,
+                   'claims': [{'predicate': 'usage_need', 'value': 'đi xa', 'evidence_excerpt': 'đi xa'}]}
+        plan = peer_plan_from_signals(signals, 'Cuối tuần hay đi xa', {}, {}, pending)
+        self.assertEqual(plan['supersede'], [])
+        self.assertIn(('usage_need', 'đi xa', 'ANSWERED'), plan['lead_updates'])
+
+    def test_only_question_matching_answer_is_marked_answered(self):
+        from app.persona_runtime import peer_plan_from_signals
+        pending = [{'pending_id': 'budget-question', 'expected_slot': 'budget'},
+                   {'pending_id': 'usage-question', 'expected_slot': 'usage_need'}]
+        signals = {'speaker_intent': 'social', 'address_term': None, 'asks_persona_question': False,
+                   'claims': [{'predicate': 'usage_need', 'value': 'đi xa', 'evidence_excerpt': 'đi xa'}]}
+        plan = peer_plan_from_signals(signals, 'Cuối tuần hay đi xa', {}, {}, pending)
+        self.assertEqual(plan['supersede'], [(pending[1], 'ANSWERED')])
+
+
 class AddressTests(unittest.TestCase):
     def test_vocative_at_end_of_answer(self):
         self.assertEqual(address('Chắc năm nay bác ạ', 'bạn'), 'bác')

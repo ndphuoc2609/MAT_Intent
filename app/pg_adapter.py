@@ -10,7 +10,7 @@ from pathlib import Path
 from .state import Store
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations" / "postgresql"
-LATEST_VERSION = 11
+LATEST_VERSION = 13
 
 
 def _adapt_sql(sql):

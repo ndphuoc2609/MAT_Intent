@@ -155,7 +155,8 @@ class LunaOutputShapeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             app = Sandbox(ledger_path=os.path.join(temp_dir, "budget.jsonl"),
-                          dealer_db_path=os.path.join(temp_dir, "dealers.sqlite3"))
+                          dealer_db_path=os.path.join(temp_dir, "dealers.sqlite3"),
+                          persona_db_path=os.path.join(temp_dir, "personas.sqlite3"))
             state = app.create({"post_id": "creta", "actor_id": "actor-1"})
             conversation = app.conversations[state["id"]]
             engine = conversation["engine"]

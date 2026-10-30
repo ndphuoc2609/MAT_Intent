@@ -347,6 +347,7 @@ class TestOpenRouterCredentials(unittest.TestCase):
         self.assertEqual(result["attempts"], 1)
         self.assertEqual(len(requests), 1)
         self.assertIn("budget", result["error"])
+        self.assertEqual(result["error_code"], "BUDGET_EXHAUSTED")
         self.assertIsNone(result.get("cost_usd_est"))
         self.assertTrue(result.get("cost_unknown"))
 

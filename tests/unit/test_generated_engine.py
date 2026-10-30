@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from tests.unit.test_peer_conversation import ConversationBase
@@ -6,6 +7,139 @@ from tests.unit.test_persona_engine import _social_semantic
 
 
 class GeneratedEngineTests(ConversationBase):
+    def _stored_story_turn(self):
+        from app.persona_runtime import digest
+        from app.persona_stories import StoryStore
+        self.engine.model_led_conversation = True
+        self.engine.auto_send_generated = True
+        event, context, _ = self.proposal('Bạn kể về chuyến đi của bạn?')
+        snapshot = self.engine.persona_store.get_binding_snapshot('p', 'post')
+        vehicle = next(f['fact_id'] for f in snapshot['facts'] if f['key'] == 'vehicle.current.model')
+        repository = StoryStore(self.engine.persona_store)
+        proposal = dict(proposal_id='new1', idempotency_key=event['comment_id'],
+            persona_version=snapshot['release_id'], topic='chuyến đi', event='Mình đi Đà Lạt bằng Creta',
+            time_start='2025-04-01', time_end=None,
+            entities=dict(vehicle='Creta', location='Đà Lạt', people=[]), base_fact_ids=[vehicle],
+            new_details=[], relation=None)
+        accepted = repository.propose(snapshot, proposal)
+        self.assertEqual(accepted['status'], 'ACCEPTED', accepted)
+        story = accepted['memory']
+        context['stories'] = [story]
+        context['context_token'] = digest({k: v for k, v in context.items() if k != 'context_token'})
+        candidate = dict(reply_text=story['event'], fact_ids=[], memory_ids=[story['memory_id']],
+            claims=[dict(text=story['event'], subject='persona', predicate='gen.memory', fact_ids=[],
+                memory_ids=[story['memory_id']], message_ids=[])], asks_question=False, question=None)
+        signals = dict(speaker_intent='social', address_term=None, asks_persona_question=True,
+            persona_topic='travel_story', evidence_excerpt=event['text'], claims=[])
+        return event, context, candidate, signals, repository, snapshot, story
+
+    def test_stored_story_is_recorded_only_after_successful_send(self):
+        event, context, candidate, signals, repository, snapshot, story = self._stored_story_turn()
+        self.assertEqual(self.engine.store.conn.execute('SELECT count(*) FROM persona_story_deliveries').fetchone()[0], 0)
+        result = self.engine.process(event, self.post, _social_semantic(event['text']),
+            reply_candidate=candidate, generation_context=context, peer_signals=signals)
+        self.assertTrue(result['outbound_permission'], result)
+        self.assertEqual(self.engine.sender.sent[-1]['text'], story['event'])
+        self.assertEqual(self.engine.store.conn.execute('SELECT count(*) FROM persona_story_deliveries').fetchone()[0], 1)
+
+    def test_failed_send_keeps_story_but_never_marks_told(self):
+        event, context, candidate, signals, repository, snapshot, story = self._stored_story_turn()
+        with patch.object(self.engine.sender, 'send', return_value={'status': 'failed'}):
+            result = self.engine.process(event, self.post, _social_semantic(event['text']),
+                reply_candidate=candidate, generation_context=context, peer_signals=signals)
+        self.assertFalse(result['outbound_permission'], result)
+        self.assertIsNotNone(repository.get(snapshot, story['memory_id']))
+        self.assertEqual(self.engine.store.conn.execute('SELECT count(*) FROM persona_story_deliveries').fetchone()[0], 0)
+        self.assertEqual(self.engine.store.conn.execute('SELECT count(*) FROM persona_story_reservations').fetchone()[0], 0)
+
+    def test_revoked_stored_story_cannot_be_dispatched(self):
+        event, context, candidate, signals, repository, snapshot, story = self._stored_story_turn()
+        self.engine.auto_send_generated = False
+        result = self.engine.process(event, self.post, _social_semantic(event['text']),
+            reply_candidate=candidate, generation_context=context, peer_signals=signals)
+        row = self.engine.store.conn.execute('SELECT payload FROM generated_reply_drafts WHERE draft_id=?',
+                                             (result['draft_id'],)).fetchone()
+        data = __import__('json').loads(row[0])
+        payload = self.engine._generated_outbox_payload(event, result['draft_id'], data['candidate'],
+            context, data['validation'], data['peer_plan'])
+        self.assertTrue(repository.revoke(snapshot, story['memory_id'], 'thu hồi'))
+        status, _ = self.engine._dispatch(event, [], 'persona_reply', candidate['reply_text'],
+                                          self.engine.clock.now().isoformat(), payload)
+        self.assertEqual(status, 'BLOCKED')
+        self.assertFalse(self.engine.sender.sent)
+        self.assertEqual(self.engine.store.conn.execute('SELECT count(*) FROM persona_story_deliveries').fetchone()[0], 0)
+
+    def test_model_led_story_must_match_active_bound_store_at_validation(self):
+        from app.persona_runtime import digest
+        self.engine.model_led_conversation = True
+        event, context, _ = self.proposal('Bạn kể về chuyến đi của bạn?')
+        story = dict(memory_id='story-1', persona_uuid=context['persona_uuid'],
+            release_id=context['release_id'], topic='trip', event='Mình đi Đà Lạt bằng Creta.',
+            time_start='2025-04-01', time_end=None,
+            entities={'vehicle': 'Creta', 'location': 'Đà Lạt', 'people': []},
+            base_fact_ids=[], new_details=[], relation=None, label='fictional_generated', status='ACTIVE')
+        context['stories'] = [story]
+        context['context_token'] = digest({k: v for k, v in context.items() if k != 'context_token'})
+        text = story['event']
+        candidate = dict(reply_text=text, fact_ids=[], memory_ids=['story-1'], claims=[
+            dict(text=text, subject='persona', predicate='gen.memory', fact_ids=[],
+                 memory_ids=['story-1'], message_ids=[])], asks_question=False, question=None)
+        with patch('app.persona_stories.StoryStore.get', return_value=story):
+            result = self.engine._generated_reply(event, self.post, _social_semantic(event['text']),
+                                                  {}, candidate, context, None)
+        self.assertEqual(result['status'], 'OK', result)
+        self.assertEqual(result['memory_ids'], ['story-1'])
+        altered = dict(candidate, reply_text=text + ' Xe bị hỏng.', claims=[
+            dict(candidate['claims'][0], text=text + ' Xe bị hỏng.')])
+        with patch('app.persona_stories.StoryStore.get', return_value=story):
+            result = self.engine._generated_reply(event, self.post, _social_semantic(event['text']),
+                                                  {}, altered, context, None)
+        self.assertEqual(result['reason'], 'STORY_CLAIM_UNVERIFIED')
+        with patch('app.persona_stories.StoryStore.get', return_value=None):
+            result = self.engine._generated_reply(event, self.post, _social_semantic(event['text']),
+                                                  {}, candidate, context, None)
+        self.assertEqual(result['reason'], 'STORY_UNAVAILABLE_OR_CHANGED')
+
+    def test_model_led_plan_does_not_choose_fixed_sales_question(self):
+        from app.persona_runtime import peer_plan_from_signals
+        signals = dict(speaker_intent='buying_interest', address_term=None,
+            asks_persona_question=False, claims=[])
+        plan = peer_plan_from_signals(signals, 'Mình đang cân nhắc', {}, {}, [], model_led=True)
+        self.assertIsNone(plan['hook_field'])
+
+    def test_model_led_reply_accepts_relevant_grounded_additional_fact(self):
+        self.engine.model_led_conversation = True
+        event, _, _ = self.proposal('Bạn đang đi xe gì?')
+        context = self.engine.persona_generation_context(event, self.post,
+            {'topics': ['vehicle_current'], 'keys': ['vehicle.current.model', 'vehicle.current.trim']})
+        by_key = {f['key']: f['fact_id'] for f in context['facts']}
+        text = 'Mình đang đi Hyundai Creta, bản 1.5 Cao cấp.'
+        ids = [by_key['vehicle.current.model'], by_key['vehicle.current.trim']]
+        candidate = dict(reply_text=text, fact_ids=ids, memory_ids=[], claims=[
+            dict(text=text, subject='persona', predicate=key, fact_ids=ids, memory_ids=[], message_ids=[])
+            for key in ('vehicle.current.model', 'vehicle.current.trim')], asks_question=False, question=None)
+        result = self.engine._generated_reply(event, self.post, _social_semantic(event['text']), {}, candidate, context, None)
+        self.assertEqual(result['status'], 'OK', result)
+
+    def test_model_led_accepts_contextual_question_without_funnel(self):
+        self.engine.model_led_conversation = True
+        event, context, _ = self.proposal('Nhà mình năm người, cuối tuần hay đi xa.')
+        text = 'Những chuyến đi đó thường mang nhiều hành lý không?'
+        candidate = dict(reply_text=text, fact_ids=[], memory_ids=[], claims=[], asks_question=True,
+            question=dict(kind='conversation', field=None, text=text))
+        plan = dict(hook_field=None, next_state={'follow_up': None})
+        result = self.engine._generated_reply(event, self.post, _social_semantic(event['text']), plan, candidate, context, None)
+        self.assertEqual(result['status'], 'OK', result)
+
+    def test_model_led_does_not_send_canned_fallback_when_model_fails(self):
+        self.engine.model_led_conversation = True
+        self.engine.auto_send_generated = True
+        event, context, _ = self.proposal()
+        result = self.engine.process(event, self.post, _social_semantic(event['text']),
+            reply_candidate=None, generation_context=context)
+        self.assertFalse(result['outbound_permission'], result)
+        self.assertEqual(self.engine.sender.sent, [])
+
     def test_purging_expired_generated_fact_leaves_connection_ready_for_next_turn(self):
         event, _, _ = self.proposal()
         now = self.engine.clock.now()

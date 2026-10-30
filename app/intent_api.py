@@ -22,7 +22,7 @@ from .engine import Engine, WallClock
 from .facts import Facts
 from .pg_adapter import connect as connect_postgres
 from .semantics import upgrade_semantic
-from .state import EventPayloadConflict, FakeSender, IntentLeaseLost, Store
+from .state import EventPayloadConflict, FakeSender, IntentLeaseLost
 
 API_VERSION = "1"
 SCHEMA_VERSION = "2"
@@ -130,6 +130,8 @@ def _result_status(routing):
         return "WAIT"
     if any("STOP" in x or "CANCEL" in x for x in routes):
         return "STOP"
+    if 'GENERATED_DRAFT_READY' in routes:
+        return 'DRAFT'
     return "PROCESSED"
 
 
@@ -143,6 +145,9 @@ class IntentService:
         self.model = model or os.environ.get("INTENT_LUNA_MODEL", PINNED_MODEL)
         self.model_call = model_call or call_luna
         self.live_model = self.model_call is call_luna
+        self.model_led_enabled = os.environ.get('MAT_INTENT_MODEL_LED_ENABLED', 'false').lower() == 'true'
+        self.model_led_allowed_pages = frozenset(part.strip() for part in
+            os.environ.get('MAT_INTENT_MODEL_LED_ALLOWED_PAGES', '').split(',') if part.strip())
         self.budget_path = budget_path or os.environ.get("INTENT_BUDGET_LEDGER_PATH", "runs/budget_ledger.jsonl")
         self.model_timeout = _positive_env_int("INTENT_MODEL_TIMEOUT_SECONDS", 45)
         self.model_max_tokens = _positive_env_int("INTENT_MODEL_MAX_TOKENS", 1200)
@@ -185,6 +190,10 @@ class IntentService:
                     result TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     seq INTEGER PRIMARY KEY AUTOINCREMENT)""")
             self.engine = Engine(self.store, facts or Facts([]), FakeSender(), WallClock())
+            if self.model_led_enabled:
+                from .persona_store import PersonaStore
+                self.engine.persona_store = PersonaStore(self.store)
+                self.engine.model_led_conversation = True
         else:
             self.engine = None
 
@@ -395,7 +404,7 @@ class IntentService:
     def _base_result(event_id, status, semantic, engine_result, trace):
         routing = engine_result.get("routing") or []
         reason = trace.get("reason") or next((r for r in routing if r.startswith(("REVIEW", "HANDOFF", "WAIT", "STOP"))), None)
-        return {
+        response = {
             "api_version": API_VERSION, "event_id": event_id, "status": status,
             "semantic_version": SCHEMA_VERSION if semantic else None,
             "semantic": _json_value(semantic),
@@ -405,12 +414,19 @@ class IntentService:
             "state_after": _json_value(engine_result.get("state_after")),
             "trace": _json_value(trace), "idempotent_replay": False,
         }
+        if engine_result.get('response_kind') == 'generated_draft' and engine_result.get('generation_validation') == 'OK':
+            response['decision']['draft_text'] = engine_result.get('draft_text')
+            response['decision']['draft_id'] = engine_result.get('draft_id')
+        return response
 
     def process(self, raw_request):
         try:
             request = validate_request(raw_request)
         except ValueError as exc:
             return 422, {"api_version": API_VERSION, "status": "INVALID_REQUEST", "error": str(exc)}
+        if self.model_led_enabled and request['page_id'] not in self.model_led_allowed_pages:
+            return 403, {"api_version": API_VERSION, "event_id": request['event_id'],
+                         "status": "UNAUTHORIZED_SCOPE", "error": "page is not authorized for model-led processing"}
         if self.store is None or self.engine is None:
             return 503, {"api_version": API_VERSION, "status": "NOT_READY",
                          "reasons": self.readiness()["reasons"]}
@@ -471,6 +487,13 @@ class IntentService:
         }
         postcard = {"id": request["post"]["id"], "page_id": request["page_id"],
                     "text": request["post"]["text"], "vehicles": request["post"]["vehicles"]}
+        if self.model_led_enabled and event['page_id'] in self.model_led_allowed_pages:
+            try:
+                with self.store.lock:
+                    if self.engine.persona_store.get_binding_snapshot(event['page_id'], event['post_id']):
+                        postcard['persona_binding'] = True
+            except Exception:
+                pass  # The model-led call reports missing binding without invoking the provider.
         started = time.perf_counter()
         try:
             trusted_messages = self._persist_context_messages(request, event, attempt_token)
@@ -481,9 +504,34 @@ class IntentService:
             for inference_attempt in range(3):
                 snapshot = self._prepare_context(event, postcard, trusted_messages, attempt_token)
                 model_context = fmt_context(snapshot)
-                if inference_attempt == 0:
+                if inference_attempt == 0 and not self.model_led_enabled:
                     self._start_jev_shadow(request, event, model_context)
-                model_result = self._call_model(request, postcard, event, model_context)
+                generation_context = reply_candidate = peer_signals = None
+                if self.model_led_enabled:
+                    event['generation_mode'] = 'generated'
+                    outcome = self._call_model_led(request, postcard, event, snapshot, attempt_token)
+                    final = outcome.get('final') or {}
+                    generation_context = outcome.get('generation_context')
+                    reply_candidate = final.get('reply_candidate')
+                    peer_signals = final.get('peer_signals')
+                    model_trace = {'prompt_version': 'conversation_tools_v1',
+                        'attempts': outcome.get('attempts'), 'usage': outcome.get('usage', {}),
+                        'cost_usd': outcome.get('cost_usd_est'),
+                        'cost_unknown': outcome.get('cost_unknown', True),
+                        'tool_trace': outcome.get('trace', [])}
+                    if outcome.get('status') != 'FINAL' or not isinstance(generation_context, dict) or not isinstance(reply_candidate, dict):
+                        reason = outcome.get('reason') or 'INVALID_FINAL'
+                        response = self._base_result(request['event_id'], 'REVIEW', None,
+                            {'routing': ['REVIEW_MODEL_LED'], 'state_changes': [], 'state_after': None},
+                            {**model_trace, 'reason': reason})
+                        if not finish('REVIEW', response, reason):
+                            return lease_lost_response()
+                        return 200, response
+                    model_result = {'ok': True, 'semantic': final.get('semantic'),
+                        'model_requested': self.model, 'model_effective': self.model,
+                        'prompt_version': 'conversation_tools_v1', '_intent_trace': model_trace}
+                else:
+                    model_result = self._call_model(request, postcard, event, model_context)
                 model_trace = model_result.pop("_intent_trace", {})
                 if not model_result.get("ok"):
                     trace = {**model_trace, "pipeline_latency_ms": round((time.perf_counter() - started) * 1000, 3)}
@@ -542,7 +590,9 @@ class IntentService:
                                            request["parent"]["text"] if request.get("parent") else ""],
                     trusted_source_ids={request["post"]["id"]: {
                         "text": request["post"]["text"], "actor_id": request["page_id"], "role": "post",
-                        "vehicles": request["post"]["vehicles"]}})
+                        "vehicles": request["post"]["vehicles"]}},
+                    reply_candidate=reply_candidate, generation_context=generation_context,
+                    peer_signals=peer_signals)
                 if "REVIEW_STALE_CONTEXT" not in engine_result.get("routing", []):
                     break
                 if inference_attempt == 2:
@@ -685,6 +735,97 @@ class IntentService:
             trace["budget_blocked"] = True
         result["_intent_trace"] = trace
         return result
+
+    def _call_model_led(self, request, postcard, event, context, attempt_token):
+        """Use the shared tool loop with a durable budget and a fenced write guard."""
+        from .adapters.luna import call_luna_tool
+        from .model_led_pipeline import run_model_led
+        from scripts import budget_ledger
+        if event['page_id'] not in self.model_led_allowed_pages:
+            return {'status': 'ABSTAIN', 'reason': 'PAGE_NOT_AUTHORIZED'}
+        reservations = []
+        ledger_failures = []
+        event_hash = hashlib.sha256((request['page_id'] + '\x1f' + request['post']['id'] +
+            '\x1f' + request['thread_id'] + '\x1f' + request['current']['actor_id'] +
+            '\x1f' + request['event_id']).encode()).hexdigest()
+
+        def guard():
+            rid = f'intent-tool:{event_hash}:{uuid.uuid4().hex}'
+            allowed, _ = budget_ledger.reserve(self.budget_path, reservation_id=rid,
+                max_calls=self.budget_max_calls, max_cost=self.budget_max_cost,
+                reserve_cost_usd=self.budget_reserve, prior_calls=self.budget_prior_calls,
+                prior_cost=self.budget_prior_cost)
+            if allowed:
+                reservations.append(rid)
+            return allowed
+
+        def model(public_context, transcript, schema, timeout):
+            call_started = time.perf_counter()
+            try:
+                reply = call_luna_tool(public_context, transcript, schema, timeout,
+                    budget_guard=lambda: True, model=self.model, max_tokens=self.model_max_tokens)
+            except Exception:
+                reply = {'ok': False, 'error_code': 'MODEL_ERROR', 'attempts': 1,
+                         'cost_unknown': True, 'cost_usd_est': None, 'usage': {}}
+            if not isinstance(reply, dict) or type(reply.get('attempts')) is not int or reply['attempts'] < 0 \
+                    or (reply.get('ok') and reply['attempts'] == 0):
+                reply = {'ok': False, 'error_code': 'MODEL_ATTEMPTS_UNKNOWN', 'attempts': 1,
+                         'cost_unknown': True, 'cost_usd_est': None, 'usage': {}}
+            if reply['attempts'] > 1:
+                reply = {**reply, 'ok': False, 'error_code': 'MODEL_ATTEMPTS_UNGUARDED',
+                         'cost_unknown': True, 'cost_usd_est': None}
+            try:
+                attempts = reply.get('attempts', 0)
+                if attempts:
+                    cost = reply.get('cost_usd_est') if not reply.get('cost_unknown', True) else None
+                    budget_ledger.record(self.budget_path, run_id=f'intent-tool:{event_hash}:{uuid.uuid4().hex}',
+                        kind='call', attempts=attempts, cost_usd_est=cost,
+                        model=reply.get('model_effective', self.model),
+                        status=None if reply.get('ok') else 'failed')
+                    from scripts.model_trace import append
+                    usage = reply.get('usage') if isinstance(reply.get('usage'), dict) else {}
+                    append(self.trace_path, {'event_hash': event_hash, 'adapter': 'luna_tools',
+                        'model_requested': self.model, 'model_effective': reply.get('model_effective', self.model),
+                        'schema_version': 'conversation_tools_v1', 'prompt_version': 'conversation_tools_v1',
+                        'latency_ms': round((time.perf_counter() - call_started) * 1000, 3),
+                        'usage': {k: usage[k] for k in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+                                  if type(usage.get(k)) is int and usage[k] >= 0},
+                        'cost_usd': cost, 'cost_unknown': cost is None, 'attempts': attempts, 'shadow': False})
+                budget_ledger.settle_reservations(self.budget_path, reservations)
+                reservations.clear()
+            except Exception:
+                ledger_failures.append(True)
+                raise
+            return reply
+
+        def mutation_guard(operation):
+            with self.store.lock:
+                self.store.conn.execute('BEGIN IMMEDIATE')
+                try:
+                    self.store.assert_intent_lease(event['event_dedupe_key'], attempt_token)
+                    self.store.lock_scope(event)
+                    value = operation()
+                    self.store.assert_intent_lease(event['event_dedupe_key'], attempt_token)
+                    self.store.conn.commit()
+                    return value
+                except Exception:
+                    self.store.conn.rollback()
+                    raise
+
+        try:
+            with self.store.lock:
+                bound = self.engine.persona_store.get_binding_snapshot(event['page_id'], event['post_id'])
+        except Exception:
+            bound = None
+        if not bound:
+            return {'status': 'ABSTAIN', 'reason': 'BINDING_UNAVAILABLE'}
+        postcard['persona_binding'] = True
+        outcome = run_model_led(self.engine, event, postcard, context, model, guard,
+            mutation_guard=mutation_guard, timeout=self.model_timeout,
+            total_timeout=min(self.lease_seconds - 1, self.model_timeout * 3), max_rounds=6)
+        if ledger_failures:
+            raise BudgetLedgerWriteFailure()
+        return outcome
 
     def _start_jev_shadow(self, request, event, context):
         if not self.jev_shadow_enabled or not _JEV_SLOTS.acquire(blocking=False):

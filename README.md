@@ -5,7 +5,7 @@ see [docs/intent-api.md](docs/intent-api.md).
 
 The Compose stack contains two isolated services:
 
-- `sandbox` on `127.0.0.1:8766`: the interactive demo with a read-only dealer directory and simulated sends.
+- `sandbox` on `127.0.0.1:8766`: the interactive demo with simulated sends.
 - `meta-services` on `127.0.0.1:8767`: the Page Graph API connector, signed comment webhook, OpenRouter/Luna processing, persistent conversation state, and authenticated operator API.
 
 To test a Luna conversation, open `http://127.0.0.1:8766/`, choose a persona,
@@ -32,14 +32,9 @@ shows per-turn routing, intent confidence, supplied facts, generated proposals a
 their statuses. Comments still use Luna and can incur provider charges. The fixture's
 mileage has no source date and is shown as a past, approximate record.
 
-The sandbox reads `fact_db.sqlite3` as a read-only dealer directory. Compose
-mounts this file read-only; local Python may set `SANDBOX_DEALER_DB` to another
-SQLite file with `dealers(name, mailing_address)`. The directory has no
-verification date, business hours, or coordinates, so results are identified as
-an imported list rather than a verified nearest dealer. If a dealer cannot be
-matched, the reply links to the official Hyundai dealer locator; automatic
-online lookup is not configured. Other factual replies require real facts and
-do not fall back to sample data.
+The sandbox does not load local SQLite product or dealer data. Product facts are
+returned only when a supported, current source is configured; the Neon persona
+database does not currently contain product pricing or inventory.
 
 The Meta service uses the existing engine with **no sample facts**. It sends a public comment reply only when the engine allows it. Missing or conflicting facts produce a handoff draft at `GET /api/reviews`; they are never answered from demo data.
 
@@ -48,12 +43,18 @@ The Meta service uses the existing engine with **no sample facts**. It sends a p
 The local ignored `.env` contains the configured OpenRouter and Meta credentials. Do not commit it or copy it into an image. `.env.example` contains names only.
 
 ```bash
-SANDBOX_PORT=8770 SANDBOX_PERSONA_DB_CONTAINER=/app/runs/persona_simulation_demo.sqlite3 docker compose up --build -d --no-deps sandbox
+docker compose run --rm --no-deps sandbox python3 -m app.pg_adapter migrate
+SANDBOX_PORT=8770 SANDBOX_MODEL_LED_ENABLED=true SANDBOX_ENFORCE_BUDGET=true \
+  docker compose up --build -d --no-deps sandbox
 ```
 
-Open `http://127.0.0.1:8770/`. This command keeps the simulation fixture in
-`runs/persona_simulation_demo.sqlite3` and leaves the independent API and Meta
-service untouched. Without the overrides, the sandbox defaults to port 8766.
+The migration command applies the PostgreSQL schema to `DB_NEON` from `.env`;
+the sandbox then stores persona snapshots, conversations, memories, and sends
+in that database. Runtime services require PostgreSQL; SQLite is limited to
+isolated tests. `SANDBOX_MODEL_LED_ENABLED=true` selects the bounded
+model/tool loop. The sandbox uses FakeSender and does not send to Meta. The
+model-led path enforces the shared budget ledger even if legacy sandbox budget
+enforcement is disabled. Without the port override, the sandbox listens on 8766.
 
 The service API listens only on loopback. Use `http://127.0.0.1:8767/docs` for Swagger and `http://127.0.0.1:8767/admin` for the operator screen. Enter `META_SERVICE_API_KEY` in the screen to load posts, comments, inbox events, and review drafts; the key stays in page memory and is cleared when the page is closed or the key is rejected. `http://127.0.0.1:8767/health` shows service configuration and outbound status. Read routes require `Authorization: Bearer $META_SERVICE_API_KEY`; manual reply and post routes also require a unique `Idempotency-Key` header.
 
@@ -78,9 +79,9 @@ To receive webhooks, configure the Meta Page `feed` subscription to a publicly r
 
 ## OpenRouter and privacy
 
-The service calls the existing `openai/gpt-6-luna` adapter for verified new comments, including while outbound writes are disabled. It sends the post text, comment, parent text, and recent Page/actor-scoped conversation state to OpenRouter. SQLite state and the separate model budget ledger live in the ignored `runs/` directory.
+The service calls the existing `openai/gpt-6-luna` adapter for verified new comments, including while outbound writes are disabled. It sends the post text, comment, parent text, and recent Page/actor-scoped conversation state to OpenRouter. PostgreSQL stores application state; the separate model budget ledger lives in the ignored `runs/` directory.
 
-The local sandbox leaves budget enforcement off by default so unknown-cost ledger entries do not block manual testing. Provider attempts and reported costs are still appended to the shared ledger, and the UI warns that spend is uncapped. Set `SANDBOX_ENFORCE_BUDGET=true` to restore the sandbox cap and fail-closed unknown-cost check. The production intent API keeps its separate required budget limits. Facts are empty until verified facts are connected, so price, stock, warranty, and other factual requests are handed to staff rather than answered from sample values.
+Legacy sandbox calls leave budget enforcement off by default, so they are not suitable for live evaluation. Model-led calls reserve and log each provider attempt in the shared ledger. The production intent API requires its own configured call and cost limits and a server-side page allowlist before model-led processing can be enabled. Facts are empty until verified facts are connected, so price, stock, warranty, and other factual requests are handed to staff rather than answered from sample values.
 
 ## Verify
 

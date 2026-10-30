@@ -20,7 +20,6 @@
    override phải có lý do, và được liệt kê đầy đủ trong output.
 """
 from __future__ import annotations
-import json
 
 def slot_val(slot):
     if isinstance(slot, dict): return slot.get("value")

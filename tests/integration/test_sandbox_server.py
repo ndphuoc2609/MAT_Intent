@@ -807,6 +807,85 @@ class SandboxHTTPTests(unittest.TestCase):
         self.assertTrue(all(row.get("cost_usd_est") == 0.01 and
                             row.get("model") == "provider/effective-model" for row in records))
 
+    def test_generated_post_budget_reservations_are_unique_across_phases(self):
+        from app.persona_fixture import seed_nam_creta
+        repository = self.http.app.persona_repository()
+        persona_id, release_id = seed_nam_creta(repository)
+        snapshot = repository.get_release_snapshot(persona_id, release_id)
+        vehicle = next(fact for fact in snapshot['facts'] if fact['key'] == 'vehicle.current.model')
+        post_text = "Mình đang đi Hyundai Creta."
+        candidate = {'post_text': post_text, 'fact_ids': [vehicle['fact_id']], 'claims': [
+            {'text': post_text, 'subject': 'persona', 'predicate': vehicle['key'],
+             'fact_ids': [vehicle['fact_id']], 'memory_ids': [], 'message_ids': []}],
+            'fact_proposals': []}
+        calls = []
+        def call(_post, _text, **kwargs):
+            phase = kwargs['persona_phase']
+            allowed = kwargs['budget_guard']()
+            calls.append((phase, allowed))
+            if not allowed:
+                return {'ok': False, 'error_code': 'BUDGET_EXHAUSTED',
+                        'error': 'budget guard denied before HTTP attempt', 'attempts': 0,
+                        'usage': {}, 'cost_usd_est': None, 'cost_unknown': True}
+            return {'ok': True,
+                'needs': {'topics': ['vehicle_current'], 'keys': ['vehicle.current.model']}
+                    if phase == 'analysis' else None,
+                'post_candidate': candidate if phase == 'post' else None,
+                'attempts': 1, 'usage': {'prompt_tokens': 10, 'completion_tokens': 20},
+                'cost_usd_est': 0.001, 'cost_unknown': False}
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-key',
+                                     'INTENT_MODEL_MAX_CALLS': '900',
+                                     'INTENT_MODEL_MAX_COST_USD': '5'}), \
+             patch.object(self.http.app, 'enforce_budget', True), \
+             patch('sandbox.server.call_luna', side_effect=call):
+            result = self.http.app.generate_post({'name': 'Nam'}, snapshot)
+        self.assertEqual(result, post_text)
+        self.assertEqual(calls, [('analysis', True), ('post', True)])
+
+    def test_generated_post_reports_budget_exhaustion_without_writing_phase(self):
+        from app.persona_fixture import seed_nam_creta
+        repository = self.http.app.persona_repository()
+        persona_id, release_id = seed_nam_creta(repository)
+        snapshot = repository.get_release_snapshot(persona_id, release_id)
+        failure = {"ok": False, "error_code": "BUDGET_EXHAUSTED",
+                   "error": "budget guard denied before HTTP attempt", "attempts": 0,
+                   "usage": {}, "cost_usd_est": None, "cost_unknown": True}
+        metrics = {}
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), \
+             patch.object(self.http.app, "enforce_budget", True), \
+             patch("sandbox.server.call_luna", return_value=failure) as luna:
+            with self.assertRaisesRegex(ValueError, "chưa gửi yêu cầu tới OpenRouter"):
+                self.http.app.generate_post({"name": "Nam"}, snapshot, _metrics=metrics)
+        self.assertEqual(luna.call_count, 1)
+        self.assertEqual(luna.call_args.kwargs["persona_phase"], "analysis")
+        self.assertEqual(metrics["generation_validation"],
+                         {"status": "REVIEW", "reason": "BUDGET_EXHAUSTED"})
+
+    def test_persona_turn_stops_on_budget_exhaustion_without_legacy_fallback(self):
+        failure = {"ok": False, "error_code": "BUDGET_EXHAUSTED",
+                   "error": "budget guard denied before HTTP attempt", "attempts": 0,
+                   "usage": {}, "cost_usd_est": None, "cost_unknown": True}
+        conversation = {"id": "budget", "counter": 1, "actor_id": "customer",
+                        "post": {"text": "Bài thử"}, "history": [], "engine": SimpleNamespace()}
+        event = {"text": "Chào bạn"}
+        with patch.object(self.http.app, "model", return_value=failure) as model:
+            result = self.http.app._persona_two_phase(conversation, event,
+                {"recent": [], "parent_texts": []}, "", 1200)
+        self.assertEqual(model.call_count, 1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "BUDGET_EXHAUSTED")
+
+    def test_sandbox_budget_uses_shared_intent_limits(self):
+        from sandbox.server import Sandbox
+        with patch.dict(os.environ, {"SANDBOX_ENFORCE_BUDGET": "true",
+                                     "INTENT_MODEL_MAX_CALLS": "900",
+                                     "INTENT_MODEL_MAX_COST_USD": "5.00"}):
+            app = Sandbox(ledger_path=self.ledger)
+            with patch("sandbox.server.budget_ledger.guard", return_value=(False, "blocked")) as guard:
+                app.budget()
+        self.assertEqual(guard.call_args.kwargs["max_calls"], 900)
+        self.assertEqual(guard.call_args.kwargs["max_cost"], 5.0)
+
     def test_post_generation_model_falls_back_to_requested_model(self):
         from sandbox.server import MODEL
         repository = self.http.app.persona_repository()

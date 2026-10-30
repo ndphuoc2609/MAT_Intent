@@ -53,12 +53,13 @@ def required_text(data, key, maximum=10000):
 
 
 class Sandbox:
-    def __init__(self, ledger_path=None, dealer_db_path=None, persona_db_path=None):
+    def __init__(self, ledger_path=None, dealer_db_path=None, persona_db_path=None, database_url=None):
         self.ledger_path = ledger_path or budget_ledger.DEFAULT_PATH
-        self.dealer_db_path = dealer_db_path or os.environ.get("SANDBOX_DEALER_DB") or str(
-            Path(__file__).resolve().parents[1] / "fact_db.sqlite3")
+        self.dealer_db_path = dealer_db_path or os.environ.get("SANDBOX_DEALER_DB")
         self.enforce_budget = os.environ.get("SANDBOX_ENFORCE_BUDGET", "false").strip().lower() in {
             "1", "true", "yes", "on"}
+        self.budget_max_calls = int(os.environ.get("INTENT_MODEL_MAX_CALLS") or 300)
+        self.budget_max_cost = float(os.environ.get("INTENT_MODEL_MAX_COST_USD") or 2.0)
         self.conversations = {}
         self.lock = PROVIDER_LOCK
         self.jev_lock = threading.Lock()
@@ -66,18 +67,26 @@ class Sandbox:
         self.jev_trace_path = str(JEV_TRACE_PATH)
         self.jev_shadow_enabled = os.environ.get("SANDBOX_JEV_SHADOW_ENABLED", "false").strip().lower() in {
             "1", "true", "yes", "on"}
-        self.persona_db_path = persona_db_path or os.environ.get("SANDBOX_PERSONA_DB") or str(
-            Path(__file__).resolve().parents[1] / "runs" / "persona_sandbox.sqlite3")
+        self.database_url = database_url or os.environ.get("SANDBOX_DATABASE_URL") or os.environ.get("DB_NEON")
+        # A path is accepted only when a test injects an isolated fixture database.
+        self.persona_db_path = persona_db_path
         self.persona_conn = None
         self.persona_store = None
         self._database_persona_ids = {}
 
     def persona_repository(self):
         if self.persona_store is None:
-            Path(self.persona_db_path).parent.mkdir(parents=True, exist_ok=True)
-            self.persona_conn = sqlite3.connect(self.persona_db_path, check_same_thread=False, timeout=10)
-            migrate_sqlite(self.persona_conn)
-            self.persona_store = PersonaStore(self.persona_conn)
+            if self.database_url:
+                from app.pg_adapter import connect
+                self.persona_conn = connect(self.database_url)
+                self.persona_store = PersonaStore(self.persona_conn.conn)
+            elif self.persona_db_path:
+                Path(self.persona_db_path).parent.mkdir(parents=True, exist_ok=True)
+                self.persona_conn = sqlite3.connect(self.persona_db_path, check_same_thread=False, timeout=10)
+                migrate_sqlite(self.persona_conn)
+                self.persona_store = PersonaStore(self.persona_conn)
+            else:
+                raise RuntimeError("Set SANDBOX_DATABASE_URL to the Neon PostgreSQL database")
             _, self.fixture_release_id = seed_nam_creta(self.persona_store)
         return self.persona_store
 
@@ -117,13 +126,17 @@ class Sandbox:
         owner_id = owner_id or f"post-preview:{uuid.uuid4().hex}"
         reservation = f"sandbox-post:{uuid.uuid4().hex}"
         reservations, phase_calls, errors = [], [], []
+        budget_attempt = 0
 
         def guard():
+            nonlocal budget_attempt
             if not self.enforce_budget:
                 return True
-            attempt_id = f"{reservation}:{len(reservations) + 1}"
+            budget_attempt += 1
+            attempt_id = f"{reservation}:{budget_attempt}"
             allowed, _ = budget_ledger.reserve(
-                self.ledger_path, reservation_id=attempt_id, max_calls=300, max_cost=2.00,
+                self.ledger_path, reservation_id=attempt_id, max_calls=self.budget_max_calls,
+                max_cost=self.budget_max_cost,
                 reserve_cost_usd=ATTEMPT_COST_RESERVE, prior_calls=budget_ledger.SHARED_PRIOR_CALLS,
                 prior_cost=budget_ledger.SHARED_PRIOR_COST_USD)
             if allowed:
@@ -197,6 +210,9 @@ class Sandbox:
         prompt = "Viết một bài chia sẻ Facebook ngắn dưới vai persona đã gắn với bài viết này. " \
                  "Chọn chủ đề phù hợp với dữ kiện hiện có; không biến bài thành lời chào bán."
         analysis = call_phase("analysis", prompt)
+        if analysis.get("error_code") == "BUDGET_EXHAUSTED":
+            metrics_update(generation_validation={"status": "REVIEW", "reason": "BUDGET_EXHAUSTED"})
+            raise ValueError("Ngân sách gọi Luna đã hết; chưa gửi yêu cầu tới OpenRouter.")
         needs = analysis.get("needs") if analysis.get("ok") else None
         selected = select_facts(facts, needs)
         if not selected:
@@ -216,13 +232,16 @@ class Sandbox:
         generated = call_phase("post", prompt, persona_context=context)
         if generated.get("error_code") == "MODEL_PERSONA_POST_SHAPE":
             generated = call_phase("post", prompt, persona_context=context,
-                repair_note="Viết lại JSON: mỗi claim dùng predicate đúng key của fact được trích; "
+                repair_note=f"Lần trước bị validator từ chối: {generated.get('error')}. "
+                "Sửa đúng lỗi này. Mỗi claim dùng predicate đúng key của fact được trích; "
                 "chỉ dùng gen.<namespace> khi fact_id là proposal_id new1/new2. "
                 "fact_ids cấp bài phải bằng hợp các fact_ids trong claims.")
         candidate = generated.get("post_candidate") if generated.get("ok") else None
         if not isinstance(candidate, dict):
-            metrics_update(generation_validation={"status": "REVIEW", "reason": "POST_GENERATION_FAILED"})
-            raise ValueError("Luna chưa tạo được bài viết có cấu trúc và đủ nguồn.")
+            reason = generated.get("error") or generated.get("error_code") or "MODEL_ERROR"
+            metrics_update(generation_validation={"status": "REVIEW", "reason": "POST_GENERATION_FAILED",
+                "model_error_code": generated.get("error_code"), "model_error": reason})
+            raise ValueError(f"Luna chưa tạo được bài viết có cấu trúc và đủ nguồn ({reason}).")
 
         proposals = candidate.get("fact_proposals", [])
         refs = set(candidate.get("fact_ids", []))
@@ -355,8 +374,12 @@ class Sandbox:
             post["vehicles"] = [v.strip() for v in vehicles]
         cid = uuid.uuid4().hex
         try:
-            engine = make_engine(db=self.persona_db_path, clock=WallClock(), facts=Facts(facts=[]),
-                                 dealer_db_path=self.dealer_db_path)
+            if self.database_url:
+                from app.pg_adapter import connect
+                engine = make_engine(store=connect(self.database_url), clock=WallClock(), facts=Facts(facts=[]))
+            else:
+                engine = make_engine(db=self.persona_db_path, clock=WallClock(), facts=Facts(facts=[]),
+                                     dealer_db_path=self.dealer_db_path)
         except Exception:
             if fixture_binding and post_owner_id:
                 with self.persona_repository()._atomic():
@@ -366,10 +389,13 @@ class Sandbox:
         engine.persona_store = PersonaStore(engine.store.conn)
         engine.allow_persona_fixtures = True
         engine.auto_send_generated = bool(fixture_binding)
+        engine.model_led_conversation = bool(fixture_binding) and os.environ.get(
+            'SANDBOX_MODEL_LED_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
         engine.response_style = style_from_tone(persona.get("tone") if persona else None)
         conversation = dict(id=cid, page_id=post["page_id"], actor_id=actor, thread_id="root-" + cid,
                             post=post, engine=engine, history=[], counter=0, jev_shadows={},
-                            channel=channel, generation_mode="generated" if fixture_binding else "legacy")
+                            channel=channel, generation_mode="generated" if fixture_binding else "legacy",
+                            model_led=engine.model_led_conversation)
         conversation["postcard"] = dict(id=post["id"], page_id=post["page_id"],
                                         text=post["text"], title=post.get("title"),
                                         topic="vehicle", vehicles=post["vehicles"],
@@ -398,8 +424,7 @@ class Sandbox:
                     repository.activate_generated(post_owner_id,
                         generation.get('generated_fact_ids', []), datetime.now(timezone.utc).isoformat())
             except Exception:
-                if engine.store.conn.in_transaction:
-                    engine.store.conn.rollback()
+                engine.store.conn.rollback()
                 with repository._atomic():
                     repository.discard_generated(post_owner_id, datetime.now(timezone.utc).isoformat())
                 raise
@@ -474,10 +499,17 @@ class Sandbox:
     def budget(self, inflight=0):
         if not self.enforce_budget:
             return True, "budget enforcement is disabled; provider spend is not capped"
-        return budget_ledger.guard(self.ledger_path, max_calls=300, max_cost=2.00,
+        return budget_ledger.guard(self.ledger_path, max_calls=self.budget_max_calls,
+                                   max_cost=self.budget_max_cost,
                                    prior_calls=budget_ledger.SHARED_PRIOR_CALLS,
                                    prior_cost=budget_ledger.SHARED_PRIOR_COST_USD,
                                    est_attempts=inflight + 1, est_cost=ATTEMPT_COST_RESERVE * (inflight + 1))
+
+    def close(self):
+        for conversation in self.conversations.values():
+            conversation['engine'].store.conn.close()
+        if self.persona_conn:
+            getattr(self.persona_conn, 'conn', self.persona_conn).close()
 
     @staticmethod
     def prior_customer_turns(conversation, text, existing=()):
@@ -516,8 +548,9 @@ class Sandbox:
                 return True
             reservation_id = f"sandbox:{conversation['id']}:{uuid.uuid4().hex}"
             allowed, _ = budget_ledger.reserve(
-                self.ledger_path, reservation_id=reservation_id, max_calls=300,
-                max_cost=2.00, reserve_cost_usd=ATTEMPT_COST_RESERVE,
+                self.ledger_path, reservation_id=reservation_id,
+                max_calls=self.budget_max_calls, max_cost=self.budget_max_cost,
+                reserve_cost_usd=ATTEMPT_COST_RESERVE,
                 prior_calls=budget_ledger.SHARED_PRIOR_CALLS,
                 prior_cost=budget_ledger.SHARED_PRIOR_COST_USD)
             if allowed: reservations.append(reservation_id)
@@ -603,6 +636,52 @@ class Sandbox:
                 combined[key] = values[key]
         return combined
 
+    def _model_led_turn(self, conversation, event, context, max_tokens):
+        from app.adapters.luna import call_luna_tool
+        from app.model_led_pipeline import run_model_led
+        reservations, calls = [], []
+
+        def guard():
+            reservation = f"model-led:{conversation['id']}:{uuid.uuid4().hex}"
+            allowed, _ = budget_ledger.reserve(self.ledger_path, reservation_id=reservation,
+                max_calls=self.budget_max_calls, max_cost=self.budget_max_cost,
+                reserve_cost_usd=ATTEMPT_COST_RESERVE,
+                prior_calls=budget_ledger.SHARED_PRIOR_CALLS, prior_cost=budget_ledger.SHARED_PRIOR_COST_USD)
+            if allowed:
+                reservations.append(reservation)
+            return allowed
+
+        def model(public_context, transcript, schema, timeout):
+            started = time.perf_counter()
+            result = call_luna_tool(public_context, transcript, schema, timeout,
+                budget_guard=lambda: True, model=MODEL, max_tokens=max_tokens)
+            result['model_latency_ms'] = (time.perf_counter() - started) * 1000
+            calls.append(('tool', result))
+            cost = result.get('cost_usd_est') if not result.get('cost_unknown', True) else None
+            budget_ledger.record(self.ledger_path, run_id=conversation['id'], kind='model_led',
+                attempts=result.get('attempts', 0), cost_usd_est=cost, model=MODEL,
+                status=None if result.get('ok') else 'failed')
+            budget_ledger.settle_reservations(self.ledger_path, reservations)
+            reservations.clear()
+            return result
+
+        def mutation_guard(operation):
+            with conversation['engine'].store.lock:
+                with conversation['engine'].persona_store._atomic():
+                    return operation()
+
+        outcome = run_model_led(conversation['engine'], event, conversation['postcard'], context,
+            model, guard, mutation_guard=mutation_guard, bot_history=conversation['history'][-5:])
+        final = outcome.get('final') or {}
+        values = dict(semantic=final.get('semantic'), reply_candidate=final.get('reply_candidate'),
+            peer_signals=final.get('peer_signals'), diagnostics=final.get('diagnostics'),
+            generation_context=outcome.get('generation_context'),
+            phase_errors=[] if outcome.get('status') == 'FINAL' else
+                [{'phase': 'tool_loop', 'error': outcome.get('reason')}])
+        combined = self._combine_persona_calls(calls, **values)
+        combined['tool_trace'] = outcome.get('trace', [])
+        return combined
+
     def _persona_two_phase(self, conversation, event, context, repair_note, max_tokens):
         calls = []
         analysis = self.model(conversation, event["text"], context, repair_note,
@@ -617,6 +696,12 @@ class Sandbox:
         if not analysis.get("ok"):
             phase_errors.append({"phase": "analysis", "error_code": analysis.get("error_code"),
                                  "error": analysis.get("error")})
+            if analysis.get("error_code") == "BUDGET_EXHAUSTED":
+                combined = self._combine_persona_calls(calls, ok=False,
+                    error=analysis.get("error"), error_code="BUDGET_EXHAUSTED",
+                    phase_errors=phase_errors)
+                combined["ok"] = False
+                return combined
             legacy = self.model(conversation, event["text"], context, repair_note,
                                 max_tokens=max_tokens, schema_version="2")
             calls.append(("fallback_semantic", legacy))
@@ -715,7 +800,8 @@ class Sandbox:
                         return True
                     reservation_id = f"sandbox-jev:{conversation['id']}:{event_id}:{uuid.uuid4().hex}"
                     allowed, _ = budget_ledger.reserve(
-                        self.ledger_path, reservation_id=reservation_id, max_calls=300, max_cost=2.00,
+                        self.ledger_path, reservation_id=reservation_id,
+                        max_calls=self.budget_max_calls, max_cost=self.budget_max_cost,
                         reserve_cost_usd=ATTEMPT_COST_RESERVE,
                         prior_calls=budget_ledger.SHARED_PRIOR_CALLS,
                         prior_cost=budget_ledger.SHARED_PRIOR_COST_USD)
@@ -864,8 +950,12 @@ class Sandbox:
                         if truncated else "; ".join(turn["errors"]) if iteration else "")
                 token_cap = (3200 if two_phase else 1800) if truncated else 1200
                 if two_phase:
-                    api = self._persona_two_phase(conversation, event, context, note, token_cap)
+                    api = (self._model_led_turn(conversation, event, context, token_cap)
+                           if conversation.get('model_led') else
+                           self._persona_two_phase(conversation, event, context, note, token_cap))
                     generation_context = api.pop("generation_context", None)
+                    if 'tool_trace' in api:
+                        turn['tool_trace'] = api['tool_trace']
                     if api.get("phase_errors"):
                         turn["phase_errors"] = list(api["phase_errors"])
                     if isinstance(generation_context, dict):
@@ -1084,7 +1174,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self.reply(503, {"error": "Không tải được persona từ database. Kiểm tra cấu hình và kết nối."})
         elif path == "/api/posts":
-            self.reply(200, dict(posts=POSTS, sample_facts=True))
+            self.reply(200, dict(posts=POSTS, sample_facts=False))
         elif path in ("/", "/static/app.js", "/static/style.css"):
             name = {"/": "index.html", "/static/app.js": "app.js", "/static/style.css": "style.css"}[path]
             mime = {"index.html": "text/html", "app.js": "text/javascript", "style.css": "text/css"}[name]
@@ -1170,6 +1260,7 @@ class Handler(BaseHTTPRequestHandler):
 def create_server(host="127.0.0.1", port=8766, ledger_path=None):
     server = ThreadingHTTPServer((host, port), Handler)
     server.app = Sandbox(ledger_path)
+    server.app.persona_repository()
     return server
 
 
@@ -1182,6 +1273,7 @@ def main():
         pass
     finally:
         server.server_close()
+        server.app.close()
 
 
 if __name__ == "__main__":

@@ -38,6 +38,14 @@ class TestCacheKey(unittest.TestCase):
         self.assertFalse(is_legacy_checkpoint({}))
 
 class TestBudgetLedger(unittest.TestCase):
+    def test_zero_attempt_failure_does_not_count_as_unknown_spend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "budget.jsonl")
+            budget_ledger.record(path, run_id="denied", kind="post_analysis", attempts=0,
+                                 cost_usd_est=None, status="failed")
+            self.assertEqual(budget_ledger.totals(path), (0, 0.0, 0, 1))
+            self.assertTrue(budget_ledger.guard(path)[0])
+
     def test_atomic_reservations_prevent_parallel_workers_from_crossing_cap(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "budget.jsonl")

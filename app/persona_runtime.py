@@ -17,6 +17,57 @@ from .normalize import norm
 SCOPE = ('page_id', 'post_id', 'thread_root_id', 'actor_id')
 
 
+def _story_claim_compatible(text, story):
+    """Accept a conservative paraphrase without changing stored story facts."""
+    if not isinstance(text, str) or not isinstance(story.get('event'), str):
+        return False
+    source, reply = norm(story['event']), norm(text)
+    if source == reply:
+        return True
+    if re.search(r'[.!?;,]\s+\S', text.strip()[:-1]):
+        return False
+    # shortcut: lexical checks cannot prove entailment; reject added emotion, cause or excess detail.
+    from .persona_generation import _CAUSE_RE, _EMOTION_RE, _FAMILY_RE, _SPOUSE_OPINION_RE
+    for pattern in (_CAUSE_RE, _EMOTION_RE, _FAMILY_RE, _SPOUSE_OPINION_RE):
+        if pattern.search(reply) and not pattern.search(source):
+            return False
+    entity_tokens = set()
+    for key in ('vehicle', 'location'):
+        value = story.get('entities', {}).get(key)
+        if not value:
+            continue
+        aliases = {norm(value)}
+        if key == 'vehicle' and norm(value).startswith('hyundai '):
+            aliases.add(norm(value).removeprefix('hyundai '))
+        if not any(re.search(r'(?<!\w)' + re.escape(alias) + r'(?!\w)', reply) for alias in aliases):
+            return False
+        entity_tokens.update(token for alias in aliases for token in alias.split())
+    number = re.compile(r'(?<!\w)\d+(?:[.,/]\d+)*(?!\w)')
+    if set(number.findall(reply)) - set(number.findall(source)):
+        return False
+    negation = re.compile(r'\b(?:khong|chua|chang|bao gio khong|never)\b')
+    if bool(negation.search(source)) != bool(negation.search(reply)):
+        return False
+    stop = {'minh', 'toi', 'ban', 'anh', 'chi', 'em', 'bac', 'co', 'chu', 'la', 'cua',
+            'voi', 'va', 'nhung', 'thi', 'ma', 'da', 'se', 'rat', 'mot', 'nhieu',
+            'nay', 'do', 'kia', 'nhe', 'a', 'ha', 'bang', 'tren', 'duoi', 'o', 'den', 'tu'}
+    words = lambda value: {word for word in re.findall(r'\w+', value)
+                           if len(word) > 2 and word not in stop and word not in entity_tokens}
+    source_words, reply_words = words(source), words(reply)
+    overlap = source_words & reply_words
+    travel_verbs = {'di', 'den', 'toi', 'ghe', 'tham', 'lai', 'chay', 'du lich'}
+    source_verbs = {verb for verb in travel_verbs if re.search(r'(?<!\w)' + re.escape(verb) + r'(?!\w)', source)}
+    reply_verbs = {verb for verb in travel_verbs if re.search(r'(?<!\w)' + re.escape(verb) + r'(?!\w)', reply)}
+    verb_overlap = bool(source_verbs & reply_verbs or
+                        source_verbs & {'di', 'den', 'toi', 'ghe', 'tham', 'lai', 'chay', 'du lich'}
+                        and reply_verbs & {'di', 'den', 'toi', 'ghe', 'tham', 'lai', 'chay', 'du lich'})
+    extra = reply_words - source_words
+    if verb_overlap:
+        extra -= {'di', 'den', 'toi', 'ghe', 'tham', 'lai', 'chay', 'du', 'lich'}
+    return (bool(overlap or verb_overlap) and len(extra) <= 1 and
+            (not source_words or len(overlap) / len(source_words) >= 0.4 or verb_overlap))
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
 
@@ -53,7 +104,7 @@ def validated_peer_signals(signals, text):
     return dict(signals, claims=supported)
 
 
-def peer_plan_from_signals(signals, text, state, profile, pending):
+def peer_plan_from_signals(signals, text, state, profile, pending, *, model_led=False):
     """Use evidence-checked semantic interpretation; no inference from reply prose."""
     ns = dict(state)
     term = signals.get('address_term')
@@ -85,7 +136,8 @@ def peer_plan_from_signals(signals, text, state, profile, pending):
             plan['lead_updates'].append((f, value, 'ANSWERED'))
     elif intent == 'owns_vehicle':
         plan['topic'] = 'ownership_repair' if pending or ns.get('purchase_intent') == 'exploring' else 'ownership_ack'
-        ns.update(ownership_status='owns_vehicle', purchase_intent='unknown', follow_up='stopped')
+        ns.update(ownership_status='owns_vehicle', purchase_intent='unknown',
+                  follow_up=state.get('follow_up') if model_led else 'stopped')
         close('SUPERSEDED')
         if 'current_vehicle' in updates:
             plan['lead_updates'].append(('current_vehicle', updates['current_vehicle'], 'ANSWERED'))
@@ -98,18 +150,19 @@ def peer_plan_from_signals(signals, text, state, profile, pending):
         for f, value in updates.items():
             plan['lead_updates'].append((f, value, 'ANSWERED'))
         after = dict(profile, **{f: {'status': 'ANSWERED'} for f in updates})
-        if not signals.get('asks_persona_question') and ns.get('asked_total', 0) < 3:
+        if not model_led and not signals.get('asks_persona_question') and ns.get('asked_total', 0) < 3:
             field = next((f for f in ('interested_vehicle', 'purchase_timeline') if f not in after), None)
             plan['hook_field'] = field
     else:
         for f, value in updates.items():
             if f == 'current_vehicle' or pending or ns.get('purchase_intent') == 'exploring':
                 plan['lead_updates'].append((f, value, 'ANSWERED'))
-        if pending and updates:
-            close('ANSWERED')
-            field = next(iter(updates))
+        matched = [p for p in pending if p.get('expected_slot') in updates]
+        if matched:
+            plan['supersede'] = [(p, 'ANSWERED') for p in matched]
+            field = matched[0]['expected_slot']
             plan['topic'] = 'ack_' + field
-            if field == 'interested_vehicle' and ns.get('purchase_intent') == 'exploring' and 'purchase_timeline' not in profile:
+            if not model_led and field == 'interested_vehicle' and ns.get('purchase_intent') == 'exploring' and 'purchase_timeline' not in profile:
                 plan['hook_field'] = 'purchase_timeline'
         elif not signals.get('asks_persona_question'):
             plan['reason'] = 'social'
@@ -119,6 +172,57 @@ def peer_plan_from_signals(signals, text, state, profile, pending):
 
 
 class PersonaGenerationRuntime:
+    def _attach_cited_stories(self, snapshot, context, candidate):
+        """Rehydrate cited stories from the bound store; never trust model-provided IDs."""
+        if not getattr(self, 'model_led_conversation', False):
+            return snapshot, set(), None
+        supplied = context.get('stories', [])
+        if not isinstance(supplied, list) or any(not isinstance(item, dict) for item in supplied):
+            return snapshot, set(), 'STORY_CONTEXT_INVALID'
+        by_id = {item.get('memory_id'): item for item in supplied if isinstance(item.get('memory_id'), str)}
+        if len(by_id) != len(supplied):
+            return snapshot, set(), 'STORY_CONTEXT_INVALID'
+        requested = candidate.get('memory_ids', []) if isinstance(candidate, dict) else []
+        if not isinstance(requested, list) or any(not isinstance(item, str) for item in requested):
+            return snapshot, set(), 'STORY_CONTEXT_INVALID'
+        ids = set(requested) & set(by_id)
+        if not ids:
+            return snapshot, set(), None
+        from .persona_stories import StoryStore
+        from .persona_generation import _memory_checksum
+        repository = getattr(self, 'story_store', None) or StoryStore(self.persona_store)
+        facts, memories = list(snapshot.get('facts', [])), list(snapshot.get('memories', []))
+        for memory_id in sorted(ids):
+            story = repository.get(snapshot, memory_id)
+            if (not isinstance(story, dict) or story != by_id[memory_id]
+                    or story.get('status') != 'ACTIVE' or story.get('label') != 'fictional_generated'
+                    or story.get('persona_uuid') != snapshot.get('persona_uuid')
+                    or story.get('release_id') != snapshot.get('release_id')
+                    or not isinstance(story.get('event'), str) or not story['event'].strip()):
+                return snapshot, set(), 'STORY_UNAVAILABLE_OR_CHANGED'
+            paraphrases = []
+            for claim in candidate.get('claims', []):
+                if isinstance(claim, dict) and memory_id in claim.get('memory_ids', []):
+                    if (claim.get('predicate') != 'gen.memory'
+                            or not _story_claim_compatible(claim.get('text'), story)):
+                        return snapshot, set(), 'STORY_CLAIM_UNVERIFIED'
+                    if norm(claim['text']) != norm(story['event']):
+                        paraphrases.append(claim['text'])
+            fact_id = 'story:' + memory_id
+            key = 'gen.memory.s' + hashlib.sha256(memory_id.encode()).hexdigest()[:24]
+            source = 'fictional_story:' + memory_id
+            facts.append(dict(fact_id=fact_id, key=key, value=story['event'], value_type='text',
+                source_kind='generated', source_ref=source, approval='generated', generated=True,
+                aliases=paraphrases, tellable='public', persona_uuid=snapshot['persona_uuid'],
+                release_id=snapshot['release_id']))
+            memory = dict(memory_id=memory_id, persona_uuid=snapshot['persona_uuid'],
+                release_id=snapshot['release_id'], topic=story['topic'], approval='generated',
+                source_kind='generated', source_ref=source, label='fictional_generated', privacy='public',
+                tellable='public', fact_ids=[fact_id], approved_summary=story['event'])
+            memory['checksum'] = _memory_checksum(memory)
+            memories.append(memory)
+        return dict(snapshot, facts=facts, memories=memories), ids, None
+
     def _generation_story_sources(self, snapshot):
         # Retain revoked source links internally; filtered snapshots omit those memories.
         sources = self.persona_store._release_content(snapshot['release_id']).get('memories', [])
@@ -132,9 +236,32 @@ class PersonaGenerationRuntime:
         return any(set(fact_ids or []) & set(m.get('fact_ids', []))
                    for m in self._generation_story_sources(snapshot))
 
+    def _story_delivery_binding(self, payload):
+        context = payload.get('generation_context') or {}
+        stories = context.get('stories') or []
+        known_ids = {item.get('memory_id') for item in stories if isinstance(item, dict)}
+        ids = set(payload.get('memory_ids') or ()) & known_ids
+        if not ids:
+            return None, set(), None
+        scope = payload.get('persona_scope') or {}
+        snapshot = self.persona_store.get_binding_snapshot(scope.get('page_id'), scope.get('post_id'))
+        if (not snapshot or snapshot.get('persona_uuid') != payload.get('persona_uuid')
+                or snapshot.get('release_id') != payload.get('release_id')):
+            return None, ids, 'STORY_BINDING_CHANGED'
+        from .persona_stories import StoryStore
+        return snapshot, ids, getattr(self, 'story_store', None) or StoryStore(self.persona_store)
+
     def _reserve_memory_delivery(self, payload, now_iso):
         memory_ids = payload.get('memory_ids') or []
         if not memory_ids:
+            return None
+        snapshot, story_ids, repository = self._story_delivery_binding(payload)
+        if story_ids:
+            if not snapshot or len(story_ids) != 1 or len(memory_ids) != 1:
+                return 'STORY_RESERVATION_UNAVAILABLE'
+            if not repository.reserve(snapshot, payload.get('persona_scope') or {},
+                                      payload.get('dedupe_key'), next(iter(story_ids))):
+                return 'STORY_ALREADY_RESERVED_OR_REVOKED'
             return None
         reserve = getattr(self.persona_store, 'reserve_memory_delivery', None)
         if not callable(reserve):
@@ -146,6 +273,11 @@ class PersonaGenerationRuntime:
 
     def _start_memory_delivery(self, payload):
         if not payload.get('memory_ids'):
+            return None
+        snapshot, story_ids, repository = self._story_delivery_binding(payload)
+        if story_ids:
+            if not snapshot or not repository.start_delivery(snapshot, payload.get('dedupe_key')):
+                return 'STORY_REVOKED_OR_RESERVATION_CANCELLED'
             return None
         start = getattr(self.persona_store, 'start_memory_delivery', None)
         if not callable(start):
@@ -427,19 +559,39 @@ class PersonaGenerationRuntime:
                 if isinstance(claim, dict) and claim.get('subject') == 'persona':
                     cited_ids.update(claim.get('fact_ids') or ())
             cited_keys = {fact_keys[fact_id] for fact_id in cited_ids if fact_id in fact_keys}
-            if not cited_keys or any(
-                    (key.startswith('gen.') and key.split('.', 2)[1] not in proposal_namespaces)
-                    or (not key.startswith('gen.') and key not in requested_keys)
-                    for key in cited_keys):
+            def relevant(key):
+                return (key.startswith('gen.') and key.split('.', 2)[1] in proposal_namespaces
+                        or not key.startswith('gen.') and key in requested_keys)
+            model_led = getattr(self, 'model_led_conversation', False)
+            if ((not cited_keys and not model_led) or (cited_keys and
+                    (not any(map(relevant, cited_keys)) if model_led else not all(map(relevant, cited_keys))))):
                 return rejected('REPLY_TOPIC_MISMATCH')
 
         snapshot = self.persona_store.attach_generated(snapshot, event['comment_id'])
+        snapshot, story_ids, story_error = self._attach_cited_stories(snapshot, context, candidate)
+        if story_error:
+            return rejected(story_error)
         snapshot['persona_authored_post'] = context.get('persona_authored_post')
         snapshot['persona_authored_fact_ids'] = context.get('persona_authored_fact_ids', [])
         current_pending_ids = {fact['fact_id'] for fact in snapshot.get('facts', [])
             if fact.get('generated') and fact.get('source_ref') == f"luna_generated:{event['comment_id']}"}
         question = None
-        if plan.get('hook_field'):
+        if getattr(self, 'model_led_conversation', False):
+            model_question = candidate.get('question')
+            intent = (signals or {}).get('speaker_intent')
+            if (candidate.get('asks_question') and isinstance(model_question, dict)
+                    and intent not in ('declines', 'correction', 'other_person', 'ai_identity', 'transaction')
+                    and plan.get('next_state', {}).get('follow_up') != 'stopped'):
+                field, kind = model_question.get('field'), model_question.get('kind')
+                profile = self.store.lead_profile(event)
+                pending = self.store.open_pending_for(event['actor_id'], page_id=event['page_id'],
+                    post_id=event['post_id'], thread_root_id=event['thread_root_id'])
+                if ((kind in ('conversation', 'clarification') and field is None)
+                        or (kind == 'lead' and field in FIELDS
+                            and profile.get(field, {}).get('status') not in ('ASKED', 'ANSWERED', 'DECLINED')
+                            and not any(p.get('expected_slot') == field for p in pending))):
+                    question = dict(kind=kind, field=field)
+        elif plan.get('hook_field'):
             question = dict(kind='lead', field=plan['hook_field'])
         elif (signals or {}).get('speaker_intent') not in ('declines', 'correction', 'other_person', 'owns_vehicle', 'ai_identity', 'transaction') and plan.get('next_state', {}).get('follow_up') != 'stopped':
             question = dict(kind='conversation', field=None)
@@ -456,6 +608,8 @@ class PersonaGenerationRuntime:
             from .persona_query import parse_persona_questions
             topic = parse_persona_questions(event['text'], event['comment_id'], event['actor_id'])[0]['topic']
             memories &= {m['memory_id'] for m in snapshot.get('memories', []) if m.get('topic') == topic}
+        if (signals or {}).get('speaker_intent') not in ('declines', 'correction', 'other_person', 'transaction', 'ai_identity'):
+            memories.update(story_ids)
         permitted_facts = {f['fact_id'] for f in context.get('facts', [])}
         permitted_facts.update(row['fact_id'] for row in snapshot.get('facts', [])
                                if row.get('generated') and row.get('source_ref') ==
@@ -497,7 +651,8 @@ class PersonaGenerationRuntime:
         return {**result, 'persona_uuid': snapshot['persona_uuid'], 'release_id': snapshot['release_id'],
                 'utterance_ids': [], 'query': dict(topic='generated', canonical_keys=[]),
                 'fictional_fixture': snapshot.get('fixture_only', False),
-                'asked_field': plan.get('hook_field') if result.get('status') == 'OK' and candidate.get('asks_question') else None,
+                'asked_field': (question.get('field') if question and question.get('kind') == 'lead' else None)
+                    if result.get('status') == 'OK' and candidate.get('asks_question') else None,
                 'allowed_question': question, 'candidate': candidate,
                 'generated_fact_ids': used_new_fact_ids, 'proposal_results': proposal_results}
 
@@ -588,6 +743,9 @@ class PersonaGenerationRuntime:
         now_iso = self.clock.now().isoformat()
         self.persona_store.purge_generated(snapshot['persona_uuid'], now_iso, 30)
         snapshot = self.persona_store.attach_generated(snapshot, source.get('comment_id'))
+        snapshot, story_ids, story_error = self._attach_cited_stories(snapshot, original, candidate)
+        if story_error:
+            return 'BLOCKED_STORY_UNAVAILABLE_OR_CHANGED'
         snapshot['persona_authored_post'] = original.get('persona_authored_post')
         snapshot['persona_authored_fact_ids'] = original.get('persona_authored_fact_ids', [])
         available_generated = {fact['fact_id'] for fact in snapshot.get('facts', []) if fact.get('generated')}
@@ -610,6 +768,11 @@ class PersonaGenerationRuntime:
         if not payload.get('generated_candidate') and not payload.get('reviewed_fallback'):
             return
         scope = payload['persona_scope']
+        snapshot, story_ids, repository = self._story_delivery_binding(payload)
+        if story_ids:
+            if not snapshot or not repository.record_delivery(snapshot, scope, payload['dedupe_key'],
+                                                               sorted(story_ids), status='SENT'):
+                raise RuntimeError('story delivery could not be recorded')
         self.persona_store.activate_generated(payload.get('comment_id'),
             payload.get('generated_fact_ids', []), now_iso)
         if payload.get('generated_fact_ids'):
@@ -640,10 +803,13 @@ class PersonaGenerationRuntime:
                 state['asked_total'] = state.get('asked_total', 0) + 1
                 self.store.save_peer_state(scope, state, now_iso)
 
-    def _discard_generated_delivery(self, payload, now_iso):
+    def _discard_generated_delivery(self, payload, now_iso, *, delivery_status=None):
         comment_id = payload.get('comment_id')
         if comment_id and self.persona_store and hasattr(self.persona_store, 'discard_generated'):
             self.persona_store.discard_generated(comment_id, now_iso)
+        snapshot, story_ids, repository = self._story_delivery_binding(payload)
+        if snapshot and story_ids and payload.get('dedupe_key'):
+            repository.release_reservation(snapshot, payload['dedupe_key'], delivery_status=delivery_status)
         release_memory = getattr(self.persona_store, 'release_memory_reservation', None)
         if callable(release_memory) and payload.get('dedupe_key'):
             release_memory(payload['dedupe_key'])

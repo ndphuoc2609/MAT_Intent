@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 import threading
 import time
 import uuid
@@ -145,6 +144,7 @@ class MetaRuntime:
         self.verify_token = verify_token
         self.service_api_key = service_api_key
         self.outbound_enabled = bool(outbound_enabled)
+        self.model_led_enabled = os.environ.get('MAT_INTENT_MODEL_LED_ENABLED', 'false').lower() == 'true'
         self.budget_path = str(budget_path)
         self.trace_path = str(trace_path)
         self.jev_budget_path = str(jev_budget_path or budget_path)
@@ -187,13 +187,16 @@ class MetaRuntime:
     @classmethod
     def from_env(cls):
         graph = MetaGraphClient.from_env()
+        database_url = os.environ.get("META_DATABASE_URL") or os.environ.get("DB_NEON")
+        if not database_url:
+            raise RuntimeError("META_DATABASE_URL or DB_NEON is required")
         return cls(
             graph,
             app_secret=os.environ.get("META_APP_SECRET", ""),
             verify_token=os.environ.get("META_WEBHOOK_VERIFY_TOKEN", ""),
             service_api_key=os.environ.get("META_SERVICE_API_KEY", ""),
             outbound_enabled=os.environ.get("META_OUTBOUND_ENABLED", "false").lower() == "true",
-            database_url=os.environ.get("META_DATABASE_URL") or None,
+            database_url=database_url,
         )
 
     def _recover_outbox(self):
@@ -417,6 +420,9 @@ class MetaRuntime:
                 "page_id": self.page_id, "post_id": event["post_id"],
                 "thread_root_id": event["thread_root_id"], "role": "parent", "text": parent_text})
         context = self.engine.context(event, postcard, trusted_messages)
+        if self.model_led_enabled:
+            # Inbox claims have no fencing token; do not execute mutating tools on a stale claim.
+            return {'routing': ['REVIEW_MODEL_LED_FENCING_UNAVAILABLE'], '_model_traces': []}
         context["recent_bot_replies"] = self._bot_replies(
             event["actor_id"], event["post_id"], event["thread_root_id"])
         from scripts.run_multiturn_eval import fmt_context

@@ -122,6 +122,104 @@ class GeneratedSandboxTests(unittest.TestCase):
         headers, response = connection.output.getvalue().split(b"\r\n\r\n", 1)
         return int(headers.split(b" ")[1]), json.loads(response)
 
+    def test_model_led_tool_loop_persists_customer_evidence_and_interleaves_history(self):
+        from app.customer_facts import list_customer_facts
+        conversation = self.conversation
+        conversation['model_led'] = True
+        conversation['engine'].model_led_conversation = True
+        first_text = 'Nhà mình 5 người, cuối tuần hay đi xa.'
+        question = 'Nhà mình thường mang nhiều hành lý không ạ?'
+        second_text = 'Cảm ơn bạn nhé.'
+
+        def tool(action, payload):
+            return {'ok': True, 'message': {'schema_version': 'conversation_tools_v1',
+                'message': {'action': action, 'payload': payload}}, 'attempts': 1,
+                'usage': {'prompt_tokens': 10, 'completion_tokens': 12},
+                'cost_usd_est': 0.001, 'cost_unknown': False, 'model_effective': 'fixture/luna'}
+
+        def final(text, reply_text, *, asks=False, question_text=None):
+            reply = {'reply_text': reply_text, 'fact_ids': [], 'memory_ids': [], 'claims': [],
+                'asks_question': asks, 'question': {'kind': 'conversation', 'field': None,
+                    'text': question_text} if asks else None}
+            semantic = persona_semantic(text)
+            semantic['operations'][0].update(request_ref=None, source_message_id=None)
+            return tool('final', {'schema_version': 'persona_turn_v1',
+                'semantic': semantic, 'reply': reply, 'diagnostics': None,
+                'peer_interpretation': {'speaker_intent': 'social', 'address_term': None,
+                    'persona_topic': None, 'asks_persona_question': False, 'claims': [],
+                    'evidence_excerpt': text}})
+
+        facts = {'facts': [
+            {'predicate': 'family_size', 'value': '5', 'evidence_excerpt': '5 người',
+             'subject': 'customer', 'certainty': 'explicit'},
+            {'predicate': 'usage_need', 'value': 'cuối tuần hay đi xa',
+             'evidence_excerpt': 'cuối tuần hay đi xa', 'subject': 'customer',
+             'certainty': 'explicit'}]}
+        first_calls = [tool('record_customer_facts', facts),
+                       final(first_text, question, asks=True, question_text=question)]
+        seen_contexts = []
+
+        def first_model(_context, _transcript, _schema, _timeout, **_kwargs):
+            return first_calls.pop(0)
+
+        with patch('app.adapters.luna.call_luna_tool', side_effect=first_model):
+            first = self.app.turn(conversation, {'text': first_text})['turn']
+        self.assertEqual(first.get('generation_validation'), 'OK', first)
+        self.assertEqual(first['response_text'], question)
+        self.assertTrue(first['outbound_permission'])
+        self.assertEqual([row['predicate'] for row in list_customer_facts(
+            conversation['engine'].persona_store, self.app.event(conversation, first_text,
+                first['comment_id']))], ['family_size', 'usage_need'])
+
+        def second_model(context, transcript, _schema, _timeout, **_kwargs):
+            seen_contexts.append(context)
+            if not transcript:
+                return tool('retrieve', {'kind': 'product_facts', 'topic': None, 'query': None,
+                    'keys': ['list_price'], 'entities': {'vehicle': 'Creta', 'location': None, 'people': []},
+                    'time_start': None, 'time_end': None, 'variant': None})
+            self.assertEqual(transcript[-1]['tool_result']['status'], 'UNKNOWN')
+            self.assertEqual(transcript[-1]['tool_result']['reason'], 'PRODUCT_SOURCE_UNAVAILABLE')
+            return final(second_text, 'Có gì đâu, mình cùng trao đổi thôi.')
+
+        with patch('app.adapters.luna.call_luna_tool', side_effect=second_model):
+            second = self.app.turn(conversation, {'text': second_text})['turn']
+        self.assertEqual(second['generation_validation'], 'OK')
+        self.assertEqual(seen_contexts[0]['customer_facts'][0]['value'], '5')
+        self.assertEqual([item['role'] for item in seen_contexts[0]['history']],
+                         ['customer', 'assistant'])
+        self.assertEqual(seen_contexts[0]['history'][0]['text'], first_text)
+        self.assertEqual(seen_contexts[0]['history'][1]['text'], question)
+
+    def test_story_claim_allows_grounded_paraphrase_and_rejects_changed_place(self):
+        from app.persona_stories import StoryStore
+        engine = self.conversation['engine']
+        engine.model_led_conversation = True
+        repo = engine.persona_store
+        snapshot = repo.get_binding_snapshot(self.conversation['page_id'], self.conversation['post']['id'])
+        vehicle_id = next(f['fact_id'] for f in snapshot['facts']
+                          if f['key'] == 'vehicle.current.model')
+        accepted = StoryStore(repo).propose(snapshot, {
+            'proposal_id': 'new1', 'idempotency_key': 'story-paraphrase-test',
+            'persona_version': snapshot['release_id'], 'topic': 'chuyến đi',
+            'event': 'Mình đi Đà Lạt bằng Creta', 'time_start': '2025-04-01',
+            'time_end': None, 'entities': {'vehicle': 'Creta', 'location': 'Đà Lạt', 'people': []},
+            'base_fact_ids': [vehicle_id], 'new_details': [], 'relation': None})
+        self.assertEqual(accepted['status'], 'ACCEPTED', accepted)
+        memory = accepted['memory']
+        memory_id = memory['memory_id']
+
+        def attach(text):
+            candidate = {'memory_ids': [memory_id], 'claims': [{
+                'predicate': 'gen.memory', 'text': text, 'memory_ids': [memory_id]}]}
+            return engine._attach_cited_stories(snapshot, {'stories': [memory]}, candidate)
+
+        attached, ids, error = attach('Mình lái Creta tới Đà Lạt.')
+        self.assertIsNone(error)
+        self.assertEqual(ids, {memory_id})
+        self.assertTrue(any(f['fact_id'] == 'story:' + memory_id for f in attached['facts']))
+        self.assertEqual(attach('Mình lái Creta tới Vũng Tàu.')[2], 'STORY_CLAIM_UNVERIFIED')
+        self.assertEqual(attach('Mình đi Đà Lạt bằng Creta, vui lắm.')[2], 'STORY_CLAIM_UNVERIFIED')
+
     def test_persona_generation_uses_two_phases_and_sends_without_review(self):
         text = "Bác đi xe gì?"
         captured = []

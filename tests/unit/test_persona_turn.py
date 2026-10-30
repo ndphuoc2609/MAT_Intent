@@ -306,6 +306,8 @@ class LunaPersonaTurnAdapterTests(unittest.TestCase):
         wrong_predicate = json.loads(json.dumps(value))
         wrong_predicate["claims"][0]["predicate"] = "gen.car"
         self.assertIsNone(parser(wrong_predicate, persona_predicates={"identity.name"}))
+        self.assertEqual(parser(wrong_predicate, persona_predicates={"identity.name"},
+            return_reason=True)[1], "POST_PROPOSAL_PREDICATE_MISMATCH")
         value["fact_ids"] = ["new2"]
         self.assertIsNone(parser(value, persona_predicates={"identity.name"}))
 

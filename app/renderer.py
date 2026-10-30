@@ -5,7 +5,7 @@ và phải đúng đối tượng / thuộc tính / đơn vị của fact đã c
 giá trị/đơn vị -> claim."""
 from __future__ import annotations
 import re
-from .normalize import fmt_money, norm, VEHICLES
+from .normalize import norm, VEHICLES
 
 UNIT_MAP = {"VND": "đồng", "percent": "%", "percent_per_year": "%",
             "years": "năm", "L": "L", "xe": "xe", "dealer": "dealer", "spec": ""}

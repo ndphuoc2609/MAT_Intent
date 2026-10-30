@@ -812,18 +812,23 @@ def _valid_memory(memory, context, facts_by_id, allowed_ids, revoked_ids=()):
             or memory.get("persona_uuid") != context["persona_uuid"] \
             or memory.get("release_id") != context["release_id"]:
         return False
+    fictional_story = memory.get('label') == 'fictional_generated'
     expected_approval = "fixture" if context["fixture"] else "approved"
-    if memory.get("approval") != expected_approval or memory.get("source_kind") == "fictional_fixture" and not context["fixture"]:
-        return False
-    if context["fixture"] and memory.get("source_kind") != "fictional_fixture":
-        return False
+    if fictional_story:
+        if memory.get('approval') != 'generated' or memory.get('source_kind') != 'generated':
+            return False
+    else:
+        if memory.get("approval") != expected_approval or memory.get("source_kind") == "fictional_fixture" and not context["fixture"]:
+            return False
+        if context["fixture"] and memory.get("source_kind") != "fictional_fixture":
+            return False
     if memory.get("revoked") is True or memory.get("revoked_at"):
         return False
     if memory.get("tellable") not in (True, "public") or not _privacy_is_public(memory):
         return False
     if not isinstance(memory.get("source_ref"), str) or not memory["source_ref"].strip():
         return False
-    if not context["fixture"] and (not isinstance(memory.get("consent_ref"), str)
+    if not fictional_story and not context["fixture"] and (not isinstance(memory.get("consent_ref"), str)
                                     or not memory["consent_ref"].strip()):
         return False
     if not isinstance(memory.get("approved_summary"), str) or not memory["approved_summary"].strip() \

@@ -3,7 +3,7 @@ Model chỉ đề xuất operations; mọi commit đều qua validate + gate ở
 from __future__ import annotations
 import hashlib, json, uuid, re
 from datetime import datetime, timedelta, timezone
-from .normalize import VEHICLES, canon_slot, norm, parse_relative_datetime, parse_time_expression, fmt_money, yes_no
+from .normalize import VEHICLES, canon_slot, norm, parse_time_expression, fmt_money, yes_no
 from .semantics import attach_context_provenance, validate_semantic
 from .facts import (DEALER_DIRECTORY_URL, Facts, calc_otr,
                     dealer_public_address)
@@ -14,7 +14,7 @@ from .persona_query import parse_persona_questions
 from .persona_reply import render_persona_reply
 from .persona_runtime import PersonaGenerationRuntime, validated_peer_signals, peer_plan_from_signals
 from .lead_flow import (address as call_term, extract_answer, is_decline, peer_cue, plan_peer_turn, purchase_subject_correction, proxy_clarification,
-                        shallow_interest, states_ownership, social_reaction)
+                        states_ownership, social_reaction)
 
 
 def _delivery_status(result):
@@ -170,7 +170,8 @@ def _pending_id(): return "q_" + str(uuid.uuid4())[:8]
 class Engine(PersonaGenerationRuntime):
     HANDOFF_TTL_HOURS = HANDOFF_SLA_HOURS  # alias tương thích cũ (xem policy.py)
     def __init__(self, store: Store, facts: Facts, sender: FakeSender, clock: Clock,
-                 kill_switch: bool = False, auto_send_generated: bool = False):
+                 kill_switch: bool = False, auto_send_generated: bool = False,
+                 model_led_conversation: bool = False):
         self.store, self.facts, self.sender, self.clock = store, facts, sender, clock
         self.kill_switch = kill_switch
         self.dispatch_hook = None  # test hook: chạy giữa plan và dispatch
@@ -180,6 +181,7 @@ class Engine(PersonaGenerationRuntime):
         self.persona_store = None
         self.allow_persona_fixtures = False
         self.auto_send_generated = bool(auto_send_generated)
+        self.model_led_conversation = bool(model_led_conversation)
 
     def _peer_plan(self, event, semantic):
         """Read-only: what this turn means given what the person already told us."""
@@ -601,7 +603,7 @@ class Engine(PersonaGenerationRuntime):
                     if st == 'SENT':
                         self._record_generated_delivery(payload, now_iso)
                     elif st == 'FAILED':
-                        self._discard_generated_delivery(payload, now_iso)
+                        self._discard_generated_delivery(payload, now_iso, delivery_status='FAILED')
                 self.store.conn.commit()
             drained.append((key, st))
         return drained
@@ -647,7 +649,7 @@ class Engine(PersonaGenerationRuntime):
                 if status == 'SENT':
                     self._record_generated_delivery(payload, now_iso)
                 elif status == 'FAILED':
-                    self._discard_generated_delivery(payload, now_iso)
+                    self._discard_generated_delivery(payload, now_iso, delivery_status='FAILED')
             self.store.conn.commit()
         return status, res
     def _send_reply(self, event, touched, purpose, text, now_iso, payload):
@@ -1234,7 +1236,8 @@ class Engine(PersonaGenerationRuntime):
                         if isinstance(generation_context, dict) and snapshot and peer_signals is not None:
                             peer_plan = peer_plan_from_signals(peer_signals, event['text'], self.store.peer_state(event),
                                 self.store.lead_profile(event), self.store.open_pending_for(actor, page_id=page,
-                                post_id=event['post_id'], thread_root_id=event['thread_root_id']))
+                                post_id=event['post_id'], thread_root_id=event['thread_root_id']),
+                                model_led=self.model_led_conversation)
                         if isinstance(generation_context, dict) and snapshot:
                             self._generation_turn_ordinal(event, record=True)
                             peer_plan = peer_plan or self._peer_plan(event, semantic)
@@ -1276,7 +1279,7 @@ class Engine(PersonaGenerationRuntime):
                                         for item in result.get('proposal_results', [])]
                                     result['routing'].append('BLOCKED_AT_DISPATCH')
                                 elif status == 'FAILED':
-                                    self._discard_generated_delivery(payload, now_iso)
+                                    self._discard_generated_delivery(payload, now_iso, delivery_status='FAILED')
                                     result['proposal_results'] = [dict(item, status='DISCARDED',
                                         reason='SEND_FAILED') if item.get('status') == 'PENDING' else item
                                         for item in result.get('proposal_results', [])]
@@ -1289,6 +1292,13 @@ class Engine(PersonaGenerationRuntime):
                                 return result
                             if persona.get('status') != 'OK' and self.auto_send_generated:
                                 self.persona_store.discard_generated(event['comment_id'], now_iso)
+                                if self.model_led_conversation:
+                                    result.update(generation_validation=persona.get('reason') or 'NO_VALID_GENERATED_REPLY',
+                                        proposal_results=persona.get('proposal_results', []))
+                                    result['routing'].append('REVIEW_GENERATED_REPLY')
+                                    self.store.audit(event['comment_id'], 'generated_reply_blocked', dict(
+                                        reason=persona.get('reason'), proposals=persona.get('proposal_results', [])), now_iso)
+                                    commit_attempt(); return result
                                 if persona.get('reason') == 'GENERATED_FACT_EXISTS':
                                     result.update(generation_validation=persona['reason'],
                                         proposal_results=persona.get('proposal_results', []))

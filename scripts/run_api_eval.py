@@ -5,7 +5,7 @@ Checkpoint từng ca: runs/api_checkpoints/<case_id>.json (resume không gọi l
 Budget guard: pre-estimate 0.00032/call; dừng nếu vượt $2.00 hoặc 300 calls tích lũy.
 """
 from __future__ import annotations
-import json, os, sys, hashlib, uuid
+import json, os, sys, uuid
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from app.harness import make_engine

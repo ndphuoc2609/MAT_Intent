@@ -134,8 +134,7 @@ def run_case(case, variant):
             routing = result.get("routing") or []
             if not isinstance(response, str) or not response.strip():
                 response = None
-            if result.get("response_kind") == "approved_fallback" or (
-                    result.get("outbound_permission") and result.get("response_kind") == "approved_fallback"):
+            if result.get("response_kind") == "approved_fallback":
                 response_origin = "engine_approved_fallback"
             elif candidate_text and response == candidate_text:
                 response_origin = "generated_candidate"

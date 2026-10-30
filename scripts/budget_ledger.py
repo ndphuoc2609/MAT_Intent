@@ -18,10 +18,9 @@ from datetime import datetime, timezone
 
 DEFAULT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "runs", "budget_ledger.jsonl")
-# Legacy spend before the append-only ledger started. Keep it external to the
-# ledger and apply it once per admission check across the API and sandbox.
-SHARED_PRIOR_CALLS = 276
-SHARED_PRIOR_COST_USD = 0.0854
+# Operator requested a clean shared-budget reset on 2026-10-30.
+SHARED_PRIOR_CALLS = 0
+SHARED_PRIOR_COST_USD = 0.0
 
 def _valid_amount(value):
     try:
@@ -128,6 +127,8 @@ def totals_from_records(records):
             unknown += 1
             continue
         calls += rec["attempts"]
+        if rec["attempts"] == 0:
+            continue
         if not _valid_amount(rec.get("cost_usd_est")):
             key = ((rec.get("ts"), rec.get("run_id"))
                    if isinstance(rec.get("ts"), str) and isinstance(rec.get("run_id"), str) else None)

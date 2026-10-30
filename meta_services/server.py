@@ -4,7 +4,6 @@ from __future__ import annotations
 import hmac
 import json
 import os
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit

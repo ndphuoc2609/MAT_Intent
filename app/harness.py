@@ -7,17 +7,17 @@ from .facts import DealerDirectoryError, Facts, load_dealers
 from .engine import Engine, Clock
 
 def make_engine(db=":memory:", clock=None, facts=None, kill_switch=False,
-                receiver_path=None, drain_on_start=False, dealer_db_path=None):
+                receiver_path=None, drain_on_start=False, dealer_db_path=None, store=None):
     # A5c: receiver mô phỏng external system PHẢI bền qua restart khi engine
     # dùng DB file: mặc định receiver file nằm cạnh DB (db + ".receiver"),
     # để engine mới mở cùng DB vẫn thấy effect cũ (không coi receiver mới
     # rỗng là bằng chứng lần gửi cũ chưa xảy ra). DB :memory: vẫn dùng
     # receiver :memory: (không có gì bền qua restart để giữ).
     from .state import FakeReceiver
-    if receiver_path is None and db != ":memory:":
+    if receiver_path is None and store is None and db != ":memory:":
         receiver_path = db + ".receiver"
     sender = FakeSender(receiver=FakeReceiver(receiver_path) if receiver_path else FakeReceiver())
-    store = Store(db)
+    store = store or Store(db)
     directory_error = None
     if dealer_db_path is not None:
         try:

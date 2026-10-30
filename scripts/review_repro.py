@@ -14,7 +14,7 @@ Chạy: python3 scripts/review_repro.py [--only R01] [--list]
 """
 from __future__ import annotations
 import glob, json, os, sys, tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)

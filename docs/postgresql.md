@@ -1,9 +1,11 @@
 # PostgreSQL state backend
 
-The Meta runtime can use the shared engine state operations on PostgreSQL via
-`META_DATABASE_URL`. SQLite remains the default for existing callers and the
-local sandbox. PostgreSQL changes are applied only by the explicit migration
-command; starting the service never migrates a database.
+Meta, the intent API, the event harness, and the sandbox use the shared engine
+state operations on PostgreSQL via `META_DATABASE_URL`, `MAT_INTENT_DATABASE_URL`,
+and `SANDBOX_DATABASE_URL` (each falls back to `DB_NEON` in Compose). Runtime
+services do not fall back to SQLite; SQLite remains available to isolated tests.
+PostgreSQL changes are applied only by the explicit migration command; starting
+a service never migrates a database.
 
 Install the extra with `pip install '.[postgres]'`. In a disposable local
 environment, start PostgreSQL 16 on a loopback-only port:
@@ -26,9 +28,9 @@ MAT_INTENT_TEST_DATABASE_URL="$MAT_INTENT_DATABASE_URL" \
 
 The integration suite refuses database names without the `_test` suffix. It
 creates a uniquely named schema, applies migrations there, and drops only that
-schema during cleanup. For the service, set `META_DATABASE_URL` to a database
-that was migrated explicitly. An empty setting leaves the existing SQLite
-path active. Do not point the test variable at a shared or production database.
+schema during cleanup. For each service, set its database URL to a database
+that was migrated explicitly. Do not point the test variable at a shared or
+production database.
 
 Migrations live in `migrations/postgresql/` and are recorded in
 `schema_migrations`. Event processing uses a transaction-scoped advisory lock
