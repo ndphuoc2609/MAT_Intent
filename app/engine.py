@@ -1,17 +1,20 @@
 """Flow/state engine + gate. Python sở hữu state, policy, facts, outbox.
 Model chỉ đề xuất operations; mọi commit đều qua validate + gate ở đây."""
 from __future__ import annotations
-import hashlib, json, uuid
+import hashlib, json, uuid, re
 from datetime import datetime, timedelta, timezone
-from .normalize import canon_slot, norm, parse_relative_datetime, parse_time_expression, fmt_money, yes_no
+from .normalize import VEHICLES, canon_slot, norm, parse_relative_datetime, parse_time_expression, fmt_money, yes_no
 from .semantics import attach_context_provenance, validate_semantic
 from .facts import (DEALER_DIRECTORY_URL, Facts, calc_otr,
                     dealer_public_address)
 from .renderer import render, claim_check, claim_check_typed
 from .state import EventPayloadConflict, Store, FakeSender
 from .policy import AUTO_ACTIONS, HANDOFF_SLA_HOURS, PENDING_TTL_HOURS
-from .persona_query import parse_persona_query
+from .persona_query import parse_persona_questions
 from .persona_reply import render_persona_reply
+from .persona_runtime import PersonaGenerationRuntime, validated_peer_signals, peer_plan_from_signals
+from .lead_flow import (address as call_term, extract_answer, is_decline, peer_cue, plan_peer_turn, purchase_subject_correction, proxy_clarification,
+                        shallow_interest, states_ownership, social_reaction)
 
 
 def _delivery_status(result):
@@ -23,6 +26,12 @@ def _delivery_status(result):
     return "UNKNOWN"
 
 def _social_reply(text):
+    if is_decline(text):
+        return 'Ừ, mình không hỏi thêm nhé.'
+    reaction = social_reaction(text)
+    if reaction:
+        return {'praise': 'Ừ, nhìn cũng thích mắt nhỉ.', 'laughter': 'Haha, vui mà.',
+                'tag_friend': 'Cứ rủ bạn vào cùng trao đổi nhé.'}[reaction]
     message = norm(text or "")
     words = set(message.split())
     if words & {"chao", "hello", "hi"}:
@@ -35,7 +44,9 @@ def _social_reply(text):
         return "Không có gì, bạn nhé!"
     if words & {"ok", "oke", "okay", "oki"}:
         return "Oke bạn nhé."
-    return "Cảm ơn bạn nhé!"
+    if message and not message.strip('👍👌😊🙂❤️❤👏🙏😍🎉! .'):
+        return 'Mình nhận được rồi nhé.'
+    return None
 
 def _color_advice(vehicle=None):
     available_for = f" cho {vehicle}" if vehicle else ""
@@ -156,10 +167,10 @@ def _new_req(page_id, post_id, thread_root_id, actor_id, topic, outcome, comment
 
 def _pending_id(): return "q_" + str(uuid.uuid4())[:8]
 
-class Engine:
+class Engine(PersonaGenerationRuntime):
     HANDOFF_TTL_HOURS = HANDOFF_SLA_HOURS  # alias tương thích cũ (xem policy.py)
     def __init__(self, store: Store, facts: Facts, sender: FakeSender, clock: Clock,
-                 kill_switch: bool = False):
+                 kill_switch: bool = False, auto_send_generated: bool = False):
         self.store, self.facts, self.sender, self.clock = store, facts, sender, clock
         self.kill_switch = kill_switch
         self.dispatch_hook = None  # test hook: chạy giữa plan và dispatch
@@ -168,14 +179,140 @@ class Engine:
         self.worker_id = uuid.uuid4().hex[:12]
         self.persona_store = None
         self.allow_persona_fixtures = False
+        self.auto_send_generated = bool(auto_send_generated)
 
-    def _persona_reply(self, event, postcard, semantic):
+    def _peer_plan(self, event, semantic):
+        """Read-only: what this turn means given what the person already told us."""
+        text = event.get('text', '')
+        state = self.store.peer_state(event)
+        pending = [p for p in self.store.open_pending_for(event['actor_id'], page_id=event['page_id'],
+                   post_id=event['post_id'], thread_root_id=event['thread_root_id']) if p['qtype'] == 'open']
+        query = parse_persona_questions(text, event.get('comment_id'), event.get('actor_id'), semantic=semantic)[0]
+        social = bool(_social_reply(text)) and not peer_cue(text) and not is_decline(text)
+        plan = plan_peer_turn(text, state, self.store.lead_profile(event), pending, event['comment_id'],
+                              social=social, persona_question=query['topic'] != 'none')
+        plan['recent'] = list(state.get('last_utterances') or [])
+        return plan
+
+    def _peer_reply(self, event, snapshot, query, plan=None):
+        """Pick approved utterances that answer what was just said. Nothing fits -> REVIEW, not a generic line."""
+        if plan is None:
+            plan = dict(call=call_term(event.get('text', ''), self.store.peer_state(event).get('address_term')),
+                        topic=None, hook_field=None, reason='', recent=[])
+        call = plan['call']
+        utterances = snapshot['utterances']
+        facts = {f['fact_id']: f for f in snapshot['facts']}
+        hook_field = None
+        selected = []
+        if query['topic'] != 'none':
+            for question in query.get('questions', [query]):
+                keys = set(question.get('canonical_keys') or [])
+                if keys == {'purchase.year'}: keys = {'purchase.date'}
+                if keys == {'purchase.finance_method'}: keys = {'purchase.down_payment_percent', 'purchase.loan_term_years'}
+                candidates = [u for u in utterances if u.get('topic') == question['topic'] and keys
+                              and {facts.get(f, {}).get('key') for f in u.get('required_fact_ids', [])} == keys]
+                if question['topic'] == 'opinion':
+                    mentioned = {name for word, name in VEHICLES.items() if re.search(r'\b' + re.escape(word) + r'\b', norm(question.get('evidence_excerpt') or event['text']))}
+                    own = norm(next((f['value'] for f in facts.values() if f.get('key') == 'vehicle.current.model'), ''))
+                    if mentioned and any(norm(name) not in own for name in mentioned):
+                        candidates = [u for u in utterances if u.get('topic') == 'opinion_other_vehicle' and u.get('style') == call]
+                        if not candidates:
+                            return dict(status='REVIEW', reason='NO_MATCHING_VEHICLE_EXPERIENCE', query=query)
+                if not candidates:
+                    fallback = ('unknown_purchase_dealer' if keys == {'purchase.dealer'} else
+                                'unknown_vehicle_color' if keys == {'vehicle.current.color'} else
+                                'unknown_vehicle_opinion' if question['topic'] == 'opinion' else
+                                'unknown_' + question['topic'])
+                    candidates = [u for u in utterances if u.get('topic') == fallback and u.get('style') == call]
+                if not candidates:
+                    return dict(status='REVIEW', reason='NO_PEER_UTTERANCE', query=query)
+                chosen = min(candidates, key=lambda u: u['utterance_id'])['utterance_id']
+                if chosen not in selected:
+                    selected.append(chosen)
+            candidates = []
+        else:
+            topic = plan.get('topic')
+            if not topic and plan.get('reason') == 'social':
+                said = norm(event.get('text', ''))
+                topic = social_reaction(event.get('text', '')) or (
+                    'thanks' if 'cam on' in said else
+                    'greeting' if any(w in said.split() for w in ('chao', 'hello', 'hi')) else 'ack')
+            candidates = [u for u in utterances if topic and u.get('topic') == topic and u.get('style') == call]
+            if topic == 'ack_interested_vehicle':
+                vehicle = (self.store.lead_profile(event).get('interested_vehicle') or {}).get('value') or extract_answer('interested_vehicle', event.get('text', ''))
+                vehicle = extract_answer('interested_vehicle', vehicle or '')
+                stories = [u for u in utterances if vehicle and u.get('topic') == 'share_vehicle' and any(
+                    facts.get(fid, {}).get('key') == 'vehicle.current.model'
+                    and extract_answer('interested_vehicle', facts[fid]['value']) == vehicle
+                    for fid in u.get('required_fact_ids', []))]
+                candidates = stories or candidates
+            hook_field = plan.get('hook_field')
+        if not candidates and not selected:
+            return dict(status='REVIEW', reason='NO_PEER_UTTERANCE', query=query)
+        recent = set((plan.get('recent') or [])[-2:])  # what was said last turn: do not repeat it verbatim
+        fresh = [u for u in candidates if u['utterance_id'] not in recent]
+        pool = sorted(fresh or candidates, key=lambda u: u['utterance_id'])
+        if not selected:
+            selected = [pool[0]['utterance_id']]
+        asked = None
+        hook = next((u for u in utterances if hook_field and u.get('topic') == f'lead:{hook_field}:{call}'), None)
+        if hook:
+            selected.append(hook['utterance_id'])
+            asked = hook_field
+        result = render_persona_reply(snapshot, plan=dict(schema_version='persona_reply_plan_v1', utterance_ids=selected, hook_id=None),
+            revoked_ids=self.persona_store.revoked_fact_ids(snapshot['persona_uuid'], snapshot['release_id']),
+            allow_fictional_fixture=self.allow_persona_fixtures)
+        return {**result, 'query': query, 'persona_uuid': snapshot['persona_uuid'], 'release_id': snapshot['release_id'],
+                'asked_field': asked if result.get('status') == 'OK' else None}
+
+    def _apply_peer_plan(self, event, plan, persona, now_iso):
+        """Commit what the person said (state, lead answers, closed questions) and any new question."""
+        store = self.store
+        ok = bool(persona) and persona.get('status') == 'OK'
+        for pending, status in plan['supersede']:
+            current = store.get_pending(pending['id']) or pending
+            current['status'] = status; current['version'] += 1; store.update_pending(current)
+            req = store.get_request(current['request_id'])
+            if req and req['status'] not in ('COMPLETED', 'CANCELLED', 'HANDED_OFF'):
+                req['status'] = 'COMPLETED'; req['version'] += 1; store.save_request(req)
+        for field, value, status in plan['lead_updates']:
+            if purchase_subject_correction(event['text']) or plan.get('reason') == 'semantic_other_person':
+                old = store.lead_profile(event).get(field) or {}
+                source = store.conn.execute('SELECT payload FROM events WHERE comment_id=? AND actor_id=?',
+                    (old.get('source_message_id'), event['actor_id'])).fetchone()
+                source_event = json.loads(source[0]) if source else {}
+                if any(source_event.get(k) != event.get(k) for k in ('page_id','post_id','thread_root_id')):
+                    continue
+                store.audit(event['comment_id'], 'lead_subject_corrected', {'field': field, 'previous': old}, now_iso)
+            store.save_lead_field(event, field, value, status, now_iso)
+        state = dict(plan['next_state'])
+        asked = persona.get('asked_field') if ok else None
+        if asked:
+            req = _new_req(event['page_id'], event['post_id'], event['thread_root_id'], event['actor_id'],
+                           'social', 'lead_draft', event['comment_id'], now_iso)
+            store.insert_request(req)
+            self._ask(req, event, 'open', asked, [], asked, now_iso)
+            store.save_lead_field(event, asked, None, 'ASKED', now_iso)
+            state['asked_total'] = state.get('asked_total', 0) + 1
+        if ok:
+            state['last_utterances'] = (list(state.get('last_utterances') or []) + list(persona['utterance_ids']))[-6:]
+        if state != store.peer_state(event):
+            store.save_peer_state(event, state, now_iso)
+        if plan['lead_updates'] or asked:
+            self._outbox(event, [], 'lead_draft', '', 'NEEDS_REVIEW', now_iso,
+                         payload=dict(profile=store.lead_profile(event), peer_state=state))
+
+    def _persona_reply(self, event, postcard, semantic, plan=None):
         """Resolve a social question only against the release pinned to this post."""
         store = self.persona_store
         if not postcard.get("persona_binding") or store is None:
             return None
-        query = parse_persona_query(event.get("text", ""), event.get("comment_id"),
-                                    event.get("actor_id"), semantic=semantic)
+        questions = parse_persona_questions(event.get("text", ""), event.get("comment_id"),
+                                             event.get("actor_id"), semantic=semantic)
+        query = dict(questions[0], questions=questions) if len(questions) > 1 else questions[0]
+        snapshot = store.get_binding_snapshot(event['page_id'], event.get('post_id'))
+        if snapshot and (len(questions) > 1 or (snapshot.get('snapshot', {}).get('release', {}).get('style', {}).get('fixture_revision', 0) >= 3)):
+            return self._peer_reply(event, snapshot, query, plan or self._peer_plan(event, semantic))
         if query["topic"] == "none":
             if "?" in event.get("text", "") or "？" in event.get("text", ""):
                 return {"status": "REVIEW", "reason": "UNRESOLVED_QUERY", "query": query}
@@ -185,6 +322,22 @@ class Engine:
             return {"status": "REVIEW", "reason": "BINDING_NOT_FOUND", "query": query}
         required_keys = set(query.get("canonical_keys") or ())
         facts_by_id = {f.get("fact_id"): f for f in snapshot.get("facts", []) if isinstance(f, dict)}
+        utterance_keys = {frozenset(facts_by_id.get(fid, {}).get("key")
+                            for fid in u.get("required_fact_ids", []))
+                          for u in snapshot.get("utterances", []) if isinstance(u, dict)}
+        legacy_aliases = {
+            frozenset({"purchase.year"}): frozenset({"purchase.date"}),
+            frozenset({"purchase.date"}): frozenset({"purchase.year"}),
+            frozenset({"purchase.finance_method"}): frozenset({
+                "purchase.down_payment_percent", "purchase.loan_term_years"}),
+        }
+        legacy = frozenset(required_keys)
+        current = legacy_aliases.get(legacy)
+        month_question = "thang may" in norm(event.get("text", ""))
+        if (current and legacy not in utterance_keys and current in utterance_keys
+                and not (current == frozenset({"purchase.year"}) and month_question)):
+            required_keys = set(current)
+            query = {**query, "canonical_keys": sorted(required_keys)}
         filtered = dict(snapshot)
         filtered["utterances"] = [u for u in snapshot.get("utterances", []) if isinstance(u, dict) and
             required_keys and {facts_by_id.get(fid, {}).get("key") for fid in u.get("required_fact_ids", [])} == required_keys]
@@ -199,6 +352,8 @@ class Engine:
                 "release_id": snapshot.get("release_id")}
 
     def _persona_dispatch_precheck(self, payload):
+        if "answer_persona" not in AUTO_ACTIONS:
+            return "BLOCKED_POLICY"
         scope = payload.get("persona_scope")
         if any(not isinstance(payload.get(k), str) or not payload[k] for k in ("persona_uuid", "release_id")):
             return "BLOCKED_PERSONA_SCOPE"
@@ -206,13 +361,18 @@ class Engine:
                 for k in ("page_id", "post_id", "thread_root_id", "actor_id")):
             return "BLOCKED_PERSONA_SCOPE"
         row = self.store.conn.execute(
-            "SELECT payload FROM events WHERE comment_id=? AND actor_id=? AND retracted=0 ORDER BY rowid DESC LIMIT 1",
-            (payload.get("comment_id"), scope["actor_id"])).fetchone()
+            "SELECT payload,retracted FROM events WHERE comment_id=? ORDER BY rowid DESC LIMIT 1",
+            (payload.get("comment_id"),)).fetchone()
         try:
             source = json.loads(row[0]) if row else {}
         except (TypeError, ValueError):
             return "BLOCKED_PERSONA_SCOPE"
-        if any(source.get(key) != value for key, value in scope.items()):
+        digest = hashlib.sha256(json.dumps(source, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+        if (not row or not isinstance(source, dict) or row[1]
+                or source.get("comment_id") != payload.get("comment_id")
+                or source.get("event_type") not in ("create", "edit")
+                or digest != payload.get("persona_event_token")
+                or any(source.get(key) != value for key, value in scope.items())):
             return "BLOCKED_PERSONA_SCOPE"
         if self.kill_switch or self.store.blocks(scope["page_id"], scope["actor_id"]) & {"all", "public_reply"}:
             return "BLOCKED_AT_DISPATCH"
@@ -231,16 +391,47 @@ class Engine:
             snapshot = store.get_binding_snapshot(scope["page_id"], scope["post_id"]) if store else None
             if not snapshot or any(snapshot.get(k) != payload.get(k) for k in ("persona_uuid", "release_id")):
                 return "BLOCKED_STALE_PERSONA"
+            if payload.get('reviewed_fallback') and payload.get('generation_state_token') != self._generation_state_digest(source):
+                return 'BLOCKED_STALE_GENERATION_STATE'
+            if payload.get('generated_candidate') is not None:
+                return self._generated_dispatch_validation(payload, snapshot, source)
             result = render_persona_reply(snapshot, plan={"schema_version": "persona_reply_plan_v1",
                 "utterance_ids": payload.get("utterance_ids"), "hook_id": None},
                 revoked_ids=store.revoked_fact_ids(payload["persona_uuid"], payload["release_id"]),
                 allow_fictional_fixture=self.allow_persona_fixtures)
+            if payload.get('reviewed_fallback') and self._uses_story_facts(snapshot, result.get('fact_ids')):
+                return 'BLOCKED_MEMORY_CITATION_REQUIRED'
             if (result.get("status") != "OK" or result.get("text") != payload.get("text") or
                     result.get("fact_ids") != payload.get("fact_ids")):
                 return "BLOCKED_STALE_PERSONA"
         except Exception:
             return "BLOCKED_STALE_PERSONA"
         return None
+
+    def _upgrade_legacy_persona_event_token(self, key, payload):
+        """Bind a pre-token intent only when its comment has exactly one event row."""
+        scope = payload.get("persona_scope")
+        if not isinstance(scope, dict):
+            return False
+        rows = self.store.conn.execute(
+            "SELECT payload,retracted FROM events WHERE comment_id=?",
+            (payload.get("comment_id"),)).fetchall()
+        if len(rows) != 1 or rows[0][1]:
+            return False
+        try:
+            source = json.loads(rows[0][0])
+        except (TypeError, ValueError):
+            return False
+        if (not isinstance(source, dict) or source.get("comment_id") != payload.get("comment_id")
+                or source.get("event_type") != "create"
+                or any(source.get(name) != value for name, value in scope.items())):
+            return False
+        payload["persona_event_token"] = hashlib.sha256(json.dumps(
+            source, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+        updated = self.store.conn.execute(
+            "UPDATE outbox SET payload=? WHERE dedupe_key=? AND status='CLAIMED'",
+            (json.dumps(payload, ensure_ascii=False), key))
+        return updated.rowcount == 1
     def _sweep_expired(self, event, now_iso):
         """Hết hạn: pending quá expires_at -> EXPIRED (request về OPEN nếu
         không còn pending mở); handoff quá SLA -> OVERDUE (escalation nội bộ),
@@ -298,7 +489,11 @@ class Engine:
                 "SELECT dedupe_key, status, claimed_at FROM outbox WHERE status IN ('UNKNOWN','CLAIMED')").fetchall():
             key, status, claimed_at = row[0], row[1], row[2]
             if self.sender.receiver.has_effect(key):
-                self.store.conn.execute("UPDATE outbox SET status='SENT' WHERE dedupe_key=?", (key,))
+                saved = self.store.get_outbox(key)
+                with self.store.lock, self._generation_delivery_transaction(saved['payload'] if saved else {}):
+                    self.store.conn.execute("UPDATE outbox SET status='SENT' WHERE dedupe_key=?", (key,))
+                    if saved:
+                        self._record_generated_delivery(saved['payload'], now.isoformat())
                 done.append((key, "SENT"))
             elif status == "CLAIMED":
                 expired = True
@@ -351,7 +546,8 @@ class Engine:
                 if status == "INTENDED":
                     ok = self.store.claim_outbox(key, self.worker_id, now_iso)
                 else:
-                    ok = self.store.reclaim_outbox(key, self.worker_id, now_iso)
+                    ok = self.store.reclaim_outbox(key, self.worker_id, now_iso,
+                                                   expected_claimed_at=claimed_at)
                 self.store.conn.commit()
                 if not ok:
                     continue
@@ -374,9 +570,21 @@ class Engine:
                     drained.append((key, "BLOCKED")); continue
                 is_persona = purpose == "persona_reply" or any(k in payload for k in ("persona_uuid", "release_id", "persona_scope", "utterance_ids", "fact_ids"))
                 if is_persona:
+                    if not payload.get("persona_event_token"):
+                        if not self._upgrade_legacy_persona_event_token(key, payload):
+                            self.store.set_outbox_status(key, "NEEDS_REVIEW")
+                            self.store.audit(key, "legacy_persona_intent_needs_review",
+                                             {"key": key, "reason": "UNVERIFIABLE_EVENT_TOKEN"}, now_iso)
+                            self.store.conn.commit()
+                            drained.append((key, "NEEDS_REVIEW")); continue
                     err = self._persona_dispatch_precheck(payload)
+                    if err is None:
+                        err = self._reserve_memory_delivery(payload, now_iso)
+                    if err is None:
+                        err = self._start_memory_delivery(payload)
                     if err:
                         self.store.set_outbox_status(key, "BLOCKED")
+                        self._discard_generated_delivery(payload, now_iso)
                         self.store.audit(key, "drain_blocked", {"reason": err}, now_iso)
                         self.store.conn.commit()
                         drained.append((key, "BLOCKED")); continue
@@ -386,10 +594,14 @@ class Engine:
                     drained.append((key, "SKIPPED_KILL_SWITCH")); continue
             res = self.sender.send(payload)
             st = _delivery_status(res)
-            with self.store.lock:
+            with self.store.lock, self._generation_delivery_transaction(payload):
                 cur = self.store.get_outbox(key)
                 if cur and cur["status"] == "CLAIMED":
                     self.store.set_outbox_status(key, st)
+                    if st == 'SENT':
+                        self._record_generated_delivery(payload, now_iso)
+                    elif st == 'FAILED':
+                        self._discard_generated_delivery(payload, now_iso)
                 self.store.conn.commit()
             drained.append((key, st))
         return drained
@@ -416,17 +628,26 @@ class Engine:
             if recheck is not None or is_persona:
                 err = self._persona_dispatch_precheck(payload) if is_persona else None
                 err = err or (recheck() if recheck is not None else None)
+                if err is None and is_persona:
+                    err = self._reserve_memory_delivery(payload, now_iso)
+                if err is None and is_persona:
+                    err = self._start_memory_delivery(payload)
                 if err:
                     self.store.set_outbox_status(key, "BLOCKED")
+                    self._discard_generated_delivery(payload, now_iso)
                     self.store.audit(event["comment_id"], "dispatch_blocked", {"key": key, "reason": err}, now_iso)
                     self.store.conn.commit()
                     return "BLOCKED", None
         res = self.sender.send(payload)
         status = _delivery_status(res)
-        with self.store.lock:
+        with self.store.lock, self._generation_delivery_transaction(payload):
             cur = self.store.get_outbox(key)
             if cur and cur["status"] == "CLAIMED":
                 self.store.set_outbox_status(key, status)
+                if status == 'SENT':
+                    self._record_generated_delivery(payload, now_iso)
+                elif status == 'FAILED':
+                    self._discard_generated_delivery(payload, now_iso)
             self.store.conn.commit()
         return status, res
     def _send_reply(self, event, touched, purpose, text, now_iso, payload):
@@ -648,7 +869,17 @@ class Engine:
     # ---------- main ----------
     def process(self, event, postcard, semantic, now_dt=None, trusted_context_texts=None,
                 trusted_source_ids=None, expected_state_token=None,
-                trusted_context_messages=None, attempt_token=None, attempt_result_callback=None):
+                trusted_context_messages=None, attempt_token=None, attempt_result_callback=None,
+                reply_candidate=None, generation_context=None, peer_signals=None):
+        peer_signals = validated_peer_signals(peer_signals, event.get('text', ''))
+        if (postcard.get('persona_binding') and isinstance(semantic, dict)
+                and semantic.get('scope') == 'in_scope' and semantic.get('sarcasm') == 'absent'
+                and peer_signals is None and peer_cue(event.get('text', ''))
+                and all(r.get('topic') in ('social', 'buy') for r in semantic.get('requests', []))
+                and all(o.get('op') in ('START_REQUEST', 'UPDATE_SLOT', 'SOCIAL_ACK') for o in semantic.get('operations', []))):
+            semantic = dict(semantic, requests=[dict(topic='social', desired_outcome='ack', polarity='positive')],
+                operations=[dict(op='SOCIAL_ACK', evidence_excerpt=event['text'])])
+            if 'intent_labels' in semantic: semantic.update(intent_labels=['social'], category='social')
         trusted_source_ids = dict(trusted_source_ids or {})
         if event.get("post_id") and (postcard.get("text") or postcard.get("vehicles")):
             post_source = trusted_source_ids.get(event["post_id"])
@@ -715,7 +946,8 @@ class Engine:
                             "UPDATE events SET retracted=1 WHERE comment_id=? AND json_extract(payload, '$.page_id')=?",
                             (event["comment_id"], page))
                     sent_before = self.store.conn.execute(
-                        "SELECT 1 FROM outbox WHERE json_extract(payload, '$.comment_id')=? AND status='SENT'",
+                        "SELECT 1 FROM outbox WHERE json_extract(payload, '$.comment_id')=? "
+                        "AND status IN ('SENT','CLAIMED','UNKNOWN','NEEDS_REVIEW')",
                         (event["comment_id"],)).fetchone()
                     if sent_before:
                         result["routing"].append("REVIEW_EDIT_AFTER_REPLY" if event["event_type"] == "edit" else "RETRACTED")
@@ -725,6 +957,22 @@ class Engine:
                         result["routing"].append("RETRACTED"); commit_attempt(); return result
                 if event.get("actor_role") == "page_self":
                     result["routing"].append("PAGE_SELF_IGNORED"); commit_attempt(); return result
+                # A narrowly matched persona question can be misclassified as out of scope.
+                if (postcard.get('persona_binding') and self.allow_persona_fixtures and self.persona_store
+                        and isinstance(semantic, dict) and semantic.get('scope') == 'out_of_scope'
+                        and semantic.get('sarcasm') == 'absent' and not semantic.get('uncertainties')
+                        and not semantic.get('requests') and len(semantic.get('operations', [])) == 1
+                        and semantic['operations'][0].get('op') == 'UNRESOLVED'
+                        and semantic['operations'][0].get('evidence_excerpt') == event.get('text')
+                        and semantic['operations'][0].get('source_message_id') in (None, event.get('comment_id'))
+                        and re.fullmatch(r'(?:ban|bac|chu|co|chi|anh|ad) lam nghe gi[?!. ]*', norm(event.get('text', '')))
+                        and not validate_semantic(semantic, event.get('text', ''), [])):
+                    binding = self.persona_store.get_binding_snapshot(page, event.get('post_id'))
+                    if binding:
+                        self.store.audit(event['comment_id'], 'persona_scope_override', {'original_scope': 'out_of_scope'}, now_iso)
+                        semantic = dict(semantic, scope='in_scope', requests=[dict(topic='social', desired_outcome='persona_question', polarity='unknown')],
+                                        operations=[dict(op='SOCIAL_ACK', evidence_excerpt=event['text'])])
+                        if 'intent_labels' in semantic: semantic.update(intent_labels=['social'], category='social')
                 if isinstance(semantic, dict) and semantic.get("scope") in ("out_of_scope", "unknown"):
                     scope_errors = validate_semantic(semantic, event.get("text", ""), [])
                     if scope_errors:
@@ -829,6 +1077,28 @@ class Engine:
                 # business state. Trả thêm: indices của ops bị HANDOFF-block
                 # (được tách khỏi main_ops để phần còn lại vẫn xử lý được)
                 # và canonical source cho từng op.
+                if postcard.get('persona_binding') and self.persona_store and len(main_ops) == 1:
+                    binding = self.persona_store.get_binding_snapshot(page, event.get('post_id'))
+                    fixture = (binding or {}).get('source_kind') == 'fictional_fixture' and self.allow_persona_fixtures
+                    op = main_ops[0]
+                    excerpt = op.get('evidence_excerpt') or ''
+                    source = op.get('source_message_id')
+                    pending = [p for p in self.store.open_pending_for(actor, page_id=page,
+                        post_id=event.get('post_id'), thread_root_id=event.get('thread_root_id')) if p['qtype'] == 'open']
+                    correction = op.get('op') == 'UNRESOLVED' and (purchase_subject_correction(event.get('text', '')) or proxy_clarification(event.get('text', '')))
+                    decline = (op.get('op') == 'CANCEL_REQUEST' and op.get('request_ref') == 'topic:social'
+                        and len(pending) == 1 and is_decline(event.get('text', '')))
+                    unresolved_decline = op.get('op') == 'UNRESOLVED' and len(pending) <= 1 and is_decline(event.get('text', ''))
+                    unresolved_ownership = (op.get('op') == 'UNRESOLVED' and len(pending) <= 1
+                        and states_ownership(event.get('text', '')) and peer_cue(event.get('text', '')))
+                    volunteered = (op.get('op') == 'UPDATE_SLOT' and op.get('request_ref') == 'topic:social'
+                        and len(pending) == 1 and pending[0]['expected_slot'] != 'purchase_timeline'
+                        and (op.get('slot') or {}).get('kind') == 'purchase_timeline'
+                        and extract_answer('purchase_timeline', event.get('text', '')) is not None)
+                    if (fixture and (correction or decline or unresolved_decline or unresolved_ownership or volunteered) and excerpt and excerpt in event.get('text', '')
+                            and source in (None, event.get('comment_id'))
+                            and all(r.get('topic') == 'social' for r in semantic.get('requests', []))):
+                        main_ops = [dict(op='SOCIAL_ACK', evidence_excerpt=excerpt, source_message_id=source)]
                 verr, ambig, blocked_idx, canon = self._validate_ops(
                     event, postcard, semantic, main_ops, now_iso, trusted_source_ids)
                 if ambig is not None:
@@ -934,10 +1204,178 @@ class Engine:
                     # không gửi gì, chỉ audit + commit.
                     self.store.audit(event["comment_id"], "blocked", result, now_iso)
                     commit_attempt(); return result
+                if isinstance(generation_context, dict) and postcard.get('persona_binding'):
+                    self._generation_turn_ordinal(event, record=True)
+                if touched and all(r.get('desired_outcomes') == ['lead_draft'] for r in touched):
+                    for req in touched:
+                        for field, slot in req['slots'].items():
+                            if field in ('current_vehicle','interested_vehicle','purchase_timeline','budget','usage_need','finance_intent'):
+                                value = slot.get('value') if isinstance(slot, dict) else slot
+                                if (field in ('interested_vehicle', 'current_vehicle')
+                                        and extract_answer(field, event.get('text', '')) is None):
+                                    continue
+                                self.store.save_lead_field(event, field, str(value), 'ANSWERED', now_iso)
+                        req['status'] = 'COMPLETED'; req['version'] += 1; self.store.save_request(req)
+                    touched = []
+                    result['routing'].append('SOCIAL_ACK')
                 if not touched:
                     self.store.conn.execute("RELEASE SAVEPOINT business")
                     if "SOCIAL_ACK" in result["routing"]:
-                        persona = self._persona_reply(event, postcard, semantic)
+                        peer_plan = None
+                        snapshot = None
+                        if postcard.get('persona_binding') and self.persona_store:
+                            snapshot = self.persona_store.get_binding_snapshot(event['page_id'], event['post_id'])
+                            peer = (snapshot or {}).get('snapshot', {}).get('release', {}).get('style', {}).get('fixture_revision', 0) >= 3
+                            handoff = self.store.conn.execute("SELECT 1 FROM handoffs h JOIN requests r ON r.id=h.request_id WHERE h.released_at IS NULL AND r.page_id=? AND r.post_id=? AND r.actor_id=?", (page, event['post_id'], actor)).fetchone()
+                            if handoff:
+                                result['routing'].append('BLOCKED_HANDOFF'); commit_attempt(); return result
+                            if peer:
+                                peer_plan = self._peer_plan(event, semantic)
+                        if isinstance(generation_context, dict) and snapshot and peer_signals is not None:
+                            peer_plan = peer_plan_from_signals(peer_signals, event['text'], self.store.peer_state(event),
+                                self.store.lead_profile(event), self.store.open_pending_for(actor, page_id=page,
+                                post_id=event['post_id'], thread_root_id=event['thread_root_id']))
+                        if isinstance(generation_context, dict) and snapshot:
+                            self._generation_turn_ordinal(event, record=True)
+                            peer_plan = peer_plan or self._peer_plan(event, semantic)
+                            persona = self._generated_reply(event, postcard, semantic, peer_plan,
+                                                            reply_candidate, generation_context, peer_signals)
+                            # Customer corrections take effect now; an unsent question creates no pending.
+                            self._apply_peer_plan(event, peer_plan, None, now_iso)
+                            if persona.get('status') == 'OK' and self.auto_send_generated:
+                                candidate = persona.get('candidate', reply_candidate)
+                                draft_id = self._queue_generated_draft(event, candidate, generation_context,
+                                    persona, peer_plan, now_iso, peer_signals=peer_signals)
+                                payload = self._generated_outbox_payload(event, draft_id, candidate,
+                                    generation_context, persona, peer_plan)
+                                self._outbox_intended(event, [], 'persona_reply', payload, now_iso)
+                                self.store.conn.execute("UPDATE generated_reply_drafts SET status='APPROVED',reviewer='sandbox-auto',updated_at=? WHERE draft_id=?",
+                                    (now_iso, draft_id))
+                                result.update(draft_id=draft_id, response_text=None,
+                                    candidate_text=persona['text'], response_kind='generated_reply',
+                                    generation_validation='OK', proposal_results=persona.get('proposal_results', []))
+                                result['response_plan'] = dict(actions=['generated_persona'], fact_ids=persona.get('fact_ids', []),
+                                    memory_ids=persona.get('memory_ids', []), validator_version='persona_generation_v1')
+                                result['routing'].append('GENERATED_REPLY_READY')
+                                self.store.audit(event['comment_id'], 'generated_reply_staged', dict(draft_id=draft_id,
+                                    fact_ids=persona.get('fact_ids', []), proposals=persona.get('proposal_results', [])), now_iso)
+                                commit_attempt()
+                                status, send = self._dispatch(event, [], 'persona_reply', persona['text'], now_iso, payload)
+                                result['outbound_permission'] = status == 'SENT'
+                                if status == 'SENT':
+                                    result['response_text'] = persona['text']
+                                    result['sends'].append(send)
+                                    result['routing'].append('AUTO_REPLY')
+                                    result['proposal_results'] = [dict(item, status='ACTIVE')
+                                        if item.get('status') == 'PENDING' else item
+                                        for item in result.get('proposal_results', [])]
+                                elif status == 'BLOCKED':
+                                    self._discard_generated_delivery(payload, now_iso)
+                                    result['proposal_results'] = [dict(item, status='DISCARDED',
+                                        reason='BLOCKED_AT_DISPATCH') if item.get('status') == 'PENDING' else item
+                                        for item in result.get('proposal_results', [])]
+                                    result['routing'].append('BLOCKED_AT_DISPATCH')
+                                elif status == 'FAILED':
+                                    self._discard_generated_delivery(payload, now_iso)
+                                    result['proposal_results'] = [dict(item, status='DISCARDED',
+                                        reason='SEND_FAILED') if item.get('status') == 'PENDING' else item
+                                        for item in result.get('proposal_results', [])]
+                                    result['routing'].append('SEND_FAILED')
+                                else:
+                                    result['routing'].append('SEND_UNKNOWN')
+                                self.store.conn.execute('UPDATE generated_reply_drafts SET status=?,updated_at=? WHERE draft_id=?',
+                                    (status, now_iso, draft_id))
+                                self.store.conn.commit()
+                                return result
+                            if persona.get('status') != 'OK' and self.auto_send_generated:
+                                self.persona_store.discard_generated(event['comment_id'], now_iso)
+                                if persona.get('reason') == 'GENERATED_FACT_EXISTS':
+                                    result.update(generation_validation=persona['reason'],
+                                        proposal_results=persona.get('proposal_results', []))
+                                    result['routing'].append('REVIEW_GENERATED_FACT_RACE')
+                                    self.store.audit(event['comment_id'], 'generated_reply_blocked', dict(
+                                        reason=persona['reason'], proposals=persona.get('proposal_results', [])), now_iso)
+                                    commit_attempt(); return result
+                                fallback = self._persona_reply(event, postcard, semantic, plan=peer_plan)
+                                if fallback and fallback.get('status') == 'OK':
+                                    if self._uses_story_facts(snapshot, fallback.get('fact_ids')):
+                                        fallback.update(status='REVIEW', reason='MEMORY_CITATION_REQUIRED')
+                                    else:
+                                        fallback['reply_kind'] = 'approved_fallback'
+                                if fallback and fallback.get('status') == 'OK':
+                                    fallback_candidate = dict(reply_text=fallback['text'])
+                                    draft_id = self._queue_generated_draft(event, fallback_candidate, generation_context,
+                                        fallback, peer_plan, now_iso, peer_signals=peer_signals)
+                                    payload = self._generated_outbox_payload(event, draft_id, fallback_candidate,
+                                        generation_context, fallback, peer_plan, approved_fallback=True)
+                                    self._outbox_intended(event, [], 'persona_reply', payload, now_iso)
+                                    self.store.conn.execute("UPDATE generated_reply_drafts SET status='APPROVED',reviewer='sandbox-fallback',updated_at=? WHERE draft_id=?",
+                                        (now_iso, draft_id))
+                                    result.update(draft_id=draft_id, response_text=None,
+                                        candidate_text=fallback['text'],
+                                        response_kind='approved_fallback', generation_validation=persona.get('reason'))
+                                    result['routing'].append('APPROVED_FALLBACK_READY')
+                                    commit_attempt()
+                                    status, send = self._dispatch(event, [], 'persona_reply', fallback['text'], now_iso, payload)
+                                    result['outbound_permission'] = status == 'SENT'
+                                    if status == 'SENT':
+                                        result['response_text'] = fallback['text']
+                                        result['sends'].append(send)
+                                        result['routing'].append('AUTO_REPLY')
+                                    elif status in ('BLOCKED', 'FAILED'):
+                                        self._discard_generated_delivery(payload, now_iso)
+                                        result['routing'].append('BLOCKED_AT_DISPATCH' if status == 'BLOCKED' else 'SEND_FAILED')
+                                    else:
+                                        result['routing'].append('SEND_UNKNOWN')
+                                    self.store.conn.execute('UPDATE generated_reply_drafts SET status=?,updated_at=? WHERE draft_id=?',
+                                        (status, now_iso, draft_id))
+                                    self.store.conn.commit()
+                                    return result
+                                result.update(generation_validation=persona.get('reason') or 'NO_VALID_GENERATED_REPLY',
+                                    proposal_results=persona.get('proposal_results', []))
+                                result['routing'].append('REVIEW_GENERATED_REPLY')
+                                self.store.audit(event['comment_id'], 'generated_reply_blocked', dict(
+                                    reason=persona.get('reason'), fact_ids=persona.get('fact_ids', []),
+                                    proposals=persona.get('proposal_results', [])), now_iso)
+                                commit_attempt(); return result
+                            if not isinstance(persona.get('candidate', reply_candidate), dict):
+                                result.update(generation_validation=persona.get('reason') or 'INVALID_CANDIDATE',
+                                    proposal_results=persona.get('proposal_results', []))
+                                result['routing'].append('REVIEW_GENERATED_REPLY')
+                                self.store.audit(event['comment_id'], 'generated_reply_blocked', dict(
+                                    reason=persona.get('reason') or 'INVALID_CANDIDATE',
+                                    proposals=persona.get('proposal_results', [])), now_iso)
+                                commit_attempt(); return result
+                            draft_candidate = persona.get('candidate', reply_candidate)
+                            draft_id = self._queue_generated_draft(event, draft_candidate, generation_context,
+                                persona, peer_plan, now_iso, peer_signals=peer_signals)
+                            result.update(draft_id=draft_id, response_text=None,
+                                draft_text=draft_candidate.get('reply_text'), response_kind='generated_draft',
+                                generation_validation=persona.get('status'),
+                                proposal_results=persona.get('proposal_results', []))
+                            result['response_plan'] = dict(actions=['draft_persona'], fact_ids=persona.get('fact_ids', []),
+                                memory_ids=persona.get('memory_ids', []), reason=persona.get('reason'), validator_version='persona_generation_v1')
+                            result['routing'].append('GENERATED_DRAFT_READY' if persona.get('status') == 'OK' else 'REVIEW_GENERATED_REPLY')
+                            self.store.audit(event['comment_id'], 'generated_reply_processed', dict(draft_id=draft_id,
+                                fact_ids=persona.get('fact_ids', []), proposals=persona.get('proposal_results', [])), now_iso)
+                            commit_attempt(); return result
+                        persona = self._persona_reply(event, postcard, semantic, plan=peer_plan)
+                        if (isinstance(generation_context, dict) and event.get('generation_mode') in ('generated', 'draft')):
+                            self._generation_turn_ordinal(event, record=True)
+                            peer_plan = peer_plan or self._peer_plan(event, semantic)
+                            self._apply_peer_plan(event, peer_plan, None, now_iso)
+                            fallback = dict(persona or dict(status='REVIEW', reason='NO_VALID_GENERATED_REPLY'), reply_kind='approved_fallback')
+                            snapshot = self.persona_store.get_binding_snapshot(event['page_id'], event['post_id'])
+                            if snapshot and self._uses_story_facts(snapshot, fallback.get('fact_ids')):
+                                fallback.update(status='REVIEW', reason='MEMORY_CITATION_REQUIRED')
+                            draft_id = self._queue_generated_draft(event, dict(reply_text=fallback.get('text') or ''),
+                                generation_context, fallback, peer_plan, now_iso, peer_signals=peer_signals)
+                            result.update(draft_id=draft_id, draft_text=fallback.get('text'), response_kind='fallback_draft')
+                            result['routing'].append('FALLBACK_DRAFT_READY' if fallback.get('status') == 'OK' else 'REVIEW_GENERATED_REPLY')
+                            result['response_plan'] = dict(reason=fallback.get('reason'), fact_ids=fallback.get('fact_ids', []))
+                            commit_attempt(); return result
+                        if peer_plan is not None:
+                            self._apply_peer_plan(event, peer_plan, persona, now_iso)
                         if persona and persona.get("status") != "OK":
                             reason = persona.get("reason") or "UNKNOWN"
                             result["routing"].append("REVIEW_PERSONA_" + reason)
@@ -946,7 +1384,13 @@ class Engine:
                             self.store.audit(event["comment_id"], "persona_reply_review", result, now_iso)
                             commit_attempt(); return result
                         action = "answer_persona" if persona else "social_ack"
+                        if action not in AUTO_ACTIONS:
+                            result["routing"].append("BLOCKED_POLICY")
+                            self.store.audit(event["comment_id"], "blocked_policy", result, now_iso)
+                            commit_attempt(); return result
                         result["response_text"] = persona["text"] if persona else _social_reply(event.get("text"))
+                        if not result['response_text']:
+                            result['routing'].append('REVIEW_UNRESOLVED'); commit_attempt(); return result
                         result["response_plan"] = dict(parts=[result["response_text"]], actions=[action])
                         if persona:
                             result["response_plan"].update(persona_query=persona["query"],
@@ -962,6 +1406,8 @@ class Engine:
                                            fact_ids=persona["fact_ids"])
                             payload["persona_scope"] = {k: event.get(k) for k in
                                 ("page_id", "post_id", "thread_root_id", "actor_id")}
+                            payload["persona_event_token"] = hashlib.sha256(json.dumps(
+                                event, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
                             state = self._trace_state_snapshot(event)
                             payload["persona_state_token"] = hashlib.sha256(json.dumps(
                                 state, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
@@ -980,7 +1426,7 @@ class Engine:
                         self.store.audit(event["comment_id"], "processed", result, now_iso)
                         commit_attempt()
                         def persona_recheck():
-                            current = self._persona_reply(event, postcard, semantic)
+                            current = self._persona_reply(event, postcard, semantic, plan=peer_plan)
                             if not persona:
                                 return None
                             if not current or current.get("status") != "OK" or any(
@@ -1252,6 +1698,8 @@ class Engine:
         if pend["status"] == "EXPIRED" or (pend["expires_at"] and now_iso > pend["expires_at"]):
             return "REVIEW_PENDING_EXPIRED"
         if pend["status"] != "OPEN": return "REVIEW_BAD_PENDING"
+        if pend['qtype'] == 'open' and pend.get('basis_version') != req['version']:
+            return 'REVIEW_STALE_PROPOSITION'
         if t in ("CONFIRM_PENDING", "REJECT_PENDING"):
             if pend["qtype"] != "yes_no": return "REVIEW_BAD_PENDING"
             yn = yes_no(event.get("text", ""))
@@ -1278,9 +1726,9 @@ class Engine:
                    json.dumps(pend["basis_slots"], ensure_ascii=False, sort_keys=True, default=str):
                     return "REVIEW_STALE_PROPOSITION"
         elif t == "ANSWER_PENDING":
-            if pend["qtype"] not in ("slot", "choice"): return "REVIEW_BAD_PENDING"
+            if pend["qtype"] not in ("slot", "choice", "open"): return "REVIEW_BAD_PENDING"
             slot = op.get("slot") or {}
-            if pend["qtype"] == "slot":
+            if pend["qtype"] in ("slot", "open"):
                 if slot.get("kind") != pend["expected_slot"]: return "REVIEW_BAD_PENDING"
             else:
                 # A2: choice cũng phải đúng expected_slot, không chỉ đúng
@@ -1466,7 +1914,7 @@ class Engine:
         return result
     def _outbox(self, event, touched, purpose, text, status, now_iso, payload=None):
         if not touched:
-            key = f"{event['comment_id']}:reply"
+            key = f"{event['comment_id']}:lead_draft" if purpose == 'lead_draft' else f"{event['comment_id']}:reply"
             row = self.store.conn.execute("SELECT status FROM outbox WHERE dedupe_key=?", (key,)).fetchone()
             if row and row[0] == "SENT": return  # không ghi đè row đã SENT
             self.store.conn.execute(
@@ -1495,6 +1943,15 @@ class Engine:
         commit durable point; dispatcher claim rồi mới gửi (R03)."""
         key = payload["dedupe_key"]
         req = touched[0] if touched else None
+        row = self.store.conn.execute("SELECT status FROM outbox WHERE dedupe_key=?", (key,)).fetchone()
+        if (event.get("event_type") == "edit" and purpose == "persona_reply"
+                and payload.get("persona_event_token") and row and row[0] == "INTENDED"):
+            self.store.conn.execute(
+                "UPDATE outbox SET request_id=?,purpose=?,version=?,status='INTENDED',payload=?,"
+                "created_at=?,claimed_at=NULL,claimed_by=NULL WHERE dedupe_key=? AND status='INTENDED'",
+                (req["id"] if req else None, purpose, req["version"] if req else 1,
+                 json.dumps(payload, ensure_ascii=False), now_iso, key))
+            return
         self.store.insert_outbox_intended(key, req["id"] if req else None, purpose,
                                           req["version"] if req else 1, payload, now_iso)
     # ---------- ops ----------
@@ -2107,6 +2564,13 @@ class Engine:
             # Mua/đặt cọc cần người xác nhận cuối — không auto confirm.
             req["status"] = "HANDED_OFF"; req["version"] += 1; self.store.save_request(req)
             self.store.add_handoff(req["id"], "staff", "buy_confirmation", req["version"], now_iso)
+            if postcard.get('persona_binding') and self.persona_store:
+                snapshot = self.persona_store.get_binding_snapshot(event['page_id'], event['post_id'])
+                if (snapshot or {}).get('snapshot', {}).get('release', {}).get('style', {}).get('fixture_revision', 0) >= 3:
+                    reply = self._peer_reply(event, snapshot, dict(topic='none', canonical_keys=[]), dict(
+                        call=call_term(event.get('text', ''), self.store.peer_state(event).get('address_term')),
+                        topic='purchase_boundary', hook_field=None, reason='boundary', recent=[]))
+                    if reply.get('status') == 'OK': return ([reply['text']], nums, 'HANDOFF')
             return (["Mình chưa thể xác nhận việc mua hoặc đặt cọc qua cuộc trò chuyện này."],
                     nums, "HANDOFF")
         if topic == "service":
@@ -2131,5 +2595,6 @@ class Engine:
             return ([f"Phí đăng ký mẫu tại {loc} là {fmt_money(fl[0]['value'])} (SAMPLE, theo tài liệu mẫu)."],
                     nums, "answer_price")
         if topic == "social":
-            return ([_social_reply(event.get("text"))], nums, "social_ack")
+            text = _social_reply(event.get('text'))
+            return ([text], nums, 'social_ack') if text else ([], nums, 'REVIEW_UNRESOLVED')
         return (["Mình chưa đủ thông tin để trả lời câu này chính xác."], nums, "HANDOFF")

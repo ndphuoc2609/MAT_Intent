@@ -16,6 +16,125 @@ class PersonaStoreTests(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
+    def _production_voice_release(self, voice_guide, *, private_fact=False):
+        persona = self.store.create_persona(
+            "voice-test", "Voice Test", source_kind="user_provided")
+        self.store.approve_persona(persona, "persona-owner")
+        self.store.register_key("identity", "voice_test", value_type="text")
+        public_fact = self.store.add_fact(persona, "identity", "voice_test", "public detail",
+            source_ref="user:voice-test", source_kind="user_provided", tellable="public")
+        self.store.approve_fact(public_fact, "persona-owner")
+        release = self.store.create_release(persona, style={"voice_guide": voice_guide})
+        self.store.add_release_fact(release, public_fact)
+        if private_fact:
+            self.store.register_key("identity", "voice_private", value_type="text")
+            hidden_fact = self.store.add_fact(persona, "identity", "voice_private", "private detail",
+                source_ref="user:voice-test-private", source_kind="user_provided", tellable="never",
+            )
+            self.store.approve_fact(hidden_fact, "persona-owner")
+            self.store.add_release_fact(release, hidden_fact)
+            return persona, release, public_fact, hidden_fact
+        return persona, release, public_fact, None
+
+    @staticmethod
+    def _approved_voice_guide():
+        examples = [{"example_id": f"approved-{index:02d}", "topic": "greeting",
+            "customer_text": "Chào bạn.", "reply_text": "Chào bạn nhé.",
+            "fact_ids": [], "approval": "approved", "privacy": "public",
+            "consent_ref": f"consent:example:{index:02d}"}
+            for index in range(10)]
+        return {"approval": "approved", "privacy": "public", "consent_ref": "consent:voice:v1",
+                "provenance": "human-authored", "speaker_habits": ["Short replies."],
+                "few_shots": examples}
+
+    def test_publish_release_requires_a_nonempty_approver(self):
+        release = self.store.create_release(self.persona)
+
+        with self.assertRaisesRegex(ValueError, "release approval requires reviewer identity"):
+            self.store.publish_release(release, "  ")
+
+        self.assertEqual(self.db.execute(
+            "SELECT status FROM persona_releases WHERE release_id=?", (release,)).fetchone()[0], "DRAFT")
+
+    def test_publish_rejects_production_voice_guide_without_explicit_public_consent(self):
+        guide = self._approved_voice_guide()
+        del guide["privacy"]
+        _, release, _, _ = self._production_voice_release(guide)
+
+        with self.assertRaisesRegex(ValueError, "voice guide requires approval=approved, privacy=public and consent_ref"):
+            self.store.publish_release(release, "release-reviewer")
+
+    def test_publish_requires_explicit_approval_and_consent_on_production_voice_guide(self):
+        guide = self._approved_voice_guide()
+        del guide["approval"]
+        _, release, _, _ = self._production_voice_release(guide)
+        with self.assertRaisesRegex(ValueError, "voice guide requires approval=approved"):
+            self.store.publish_release(release, "release-reviewer")
+
+        guide["approval"] = "approved"
+        guide["consent_ref"] = " "
+        self.store.update_release(release, style={"voice_guide": guide})
+        with self.assertRaisesRegex(ValueError, "voice guide requires approval=approved"):
+            self.store.publish_release(release, "release-reviewer")
+
+    def test_publish_rejects_unknown_voice_guide_fields(self):
+        guide = self._approved_voice_guide()
+        guide["private_notes"] = "do not send this"
+        _, release, _, _ = self._production_voice_release(guide)
+
+        with self.assertRaisesRegex(ValueError, "voice guide contains unsupported fields"):
+            self.store.publish_release(release, "release-reviewer")
+
+    def test_publish_requires_explicit_public_consent_on_each_production_example(self):
+        guide = self._approved_voice_guide()
+        del guide["few_shots"][0]["privacy"]
+        _, release, _, _ = self._production_voice_release(guide)
+
+        with self.assertRaisesRegex(ValueError, "voice example requires approval=approved, privacy=public and consent_ref"):
+            self.store.publish_release(release, "release-reviewer")
+
+    def test_publish_requires_approval_and_consent_on_each_production_example(self):
+        guide = self._approved_voice_guide()
+        del guide["few_shots"][0]["approval"]
+        _, release, _, _ = self._production_voice_release(guide)
+        with self.assertRaisesRegex(ValueError, "voice example requires approval=approved"):
+            self.store.publish_release(release, "release-reviewer")
+
+        guide["few_shots"][0]["approval"] = "approved"
+        guide["few_shots"][0]["consent_ref"] = " "
+        self.store.update_release(release, style={"voice_guide": guide})
+        with self.assertRaisesRegex(ValueError, "voice example requires approval=approved"):
+            self.store.publish_release(release, "release-reviewer")
+
+    def test_publish_rejects_voice_example_fields_not_in_the_allowlist(self):
+        guide = self._approved_voice_guide()
+        guide["few_shots"][0]["raw_transcript"] = "private conversation"
+        _, release, _, _ = self._production_voice_release(guide)
+
+        with self.assertRaisesRegex(ValueError, "voice example contains unsupported fields"):
+            self.store.publish_release(release, "release-reviewer")
+
+    def test_publish_limits_voice_examples_to_public_release_facts(self):
+        guide = self._approved_voice_guide()
+        persona, release, _, hidden_fact = self._production_voice_release(guide, private_fact=True)
+        guide["few_shots"][0]["fact_ids"] = [hidden_fact]
+        self.store.update_release(release, style={"voice_guide": guide})
+
+        with self.assertRaisesRegex(ValueError, "voice example references a fact outside the public release"):
+            self.store.publish_release(release, "release-reviewer")
+
+    def test_publish_accepts_complete_approved_voice_guide(self):
+        guide = self._approved_voice_guide()
+        persona, release, fact, _ = self._production_voice_release(guide)
+        guide["few_shots"][0]["fact_ids"] = [fact]
+        self.store.update_release(release, style={"voice_guide": guide})
+
+        self.store.publish_release(release, "release-reviewer")
+
+        snapshot = self.store.get_release_snapshot(persona, release)
+        self.assertEqual(snapshot["release"]["status"], "PUBLISHED")
+        self.assertTrue(snapshot["release"]["approved"])
+
     def test_release_rejects_approval_for_another_fact_and_later_rejection(self):
         a = self.store.add_fact(self.persona, "identity", "age_years", 31,
                                 source_ref="fixture:a", source_kind="fictional_fixture", tellable="public")

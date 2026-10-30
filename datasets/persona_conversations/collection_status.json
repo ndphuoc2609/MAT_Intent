@@ -1,0 +1,8 @@
+{
+  "real_conversations_target": {"minimum": 30, "maximum": 50},
+  "real_conversations_collected": 0,
+  "collection_status": "missing",
+  "human_evaluation_status": "not_started",
+  "human_evaluation_labels_completed": 0,
+  "note": "The frozen 12-case set is synthetic regression data. No real conversations or human scores have been supplied."
+}

@@ -1,0 +1,115 @@
+{
+  "sandbox_url": "http://127.0.0.1:8771/",
+  "synthetic_only": true,
+  "real_conversations": 0,
+  "human_evaluation": "not_started",
+  "python_tests": {
+    "passed": 656,
+    "skipped": 0,
+    "log": "/private/tmp/grounded-shipped-final-tests.log"
+  },
+  "contract_tests": {
+    "passed": 199,
+    "total": 199
+  },
+  "js_tests": {
+    "passed": 1,
+    "failed": 0
+  },
+  "browser": {
+    "conversation_id": "1a7bc89560f246f598511b2b66f71e1c",
+    "edit_saved_without_send": true,
+    "approved_fake_sends": 1,
+    "rejection": "REJECTED",
+    "desktopOverflow": false,
+    "mobileOverflow": false,
+    "errors": []
+  },
+  "review": {
+    "subagents": 3,
+    "model": "gpt-6-luna",
+    "reasoning": "max",
+    "root_review": true
+  },
+  "deployed_source_sha256": {
+    "app/engine.py": "48b3ac85232c6b26b2d86cdc50c870a21f7703d1985fbcfb708cc4553a34126d",
+    "app/persona_runtime.py": "371ab90c6d7ee006084afdb9032937eb669833f8519c7c75d08fce46407a84eb",
+    "app/persona_generation.py": "ffe6b8f00e69b7fa8e7bfacc0ad12dd863276df26d2a164a5ff731a3a61364c6",
+    "app/adapters/luna.py": "36dc6b55efc918000209242c67b6ea44747cf3b5c93baebf3d9782e8742c3427",
+    "app/persona_turn.py": "149e1cd92f9a812e060ad0214e8758d621be3cfde1ceecc727dded9a7b0c453b",
+    "app/persona_store.py": "a3b28f256f8c240ec32e5653a912288c0a968aed133b13d167bcf251b2198ae6",
+    "sandbox/server.py": "0cacb7a69879fcab0a272853ffa4ee4fb93a15c8ae736364623b8db08d77907d",
+    "sandbox/static/app.js": "e8b809669cadd1cfdd6e08417d6af77e5e5b486c838ad8a0d5b23aef5b4f247a",
+    "scripts/run_persona_conversations.py": "06b00ea2392eaf5cba536381e1b272f95bfc4c1c7a7eda20fb39241b6653f65c",
+    "datasets/persona_conversations/frozen12.json": "b6fe236c427169b6289ad736a65fa1b2470641adeb0672aaed7ee7a16c652727"
+  },
+  "deployed_sources_match_local": true,
+  "jev_shadow_enabled_in_review_sandbox": true,
+  "real_meta_sends": false,
+  "synthetic_ab_v2": {
+    "legacy": {
+      "conversations": 12,
+      "turns": 48,
+      "responses_or_candidates": 16,
+      "review_status": {
+        "FAKE_SENT": 13,
+        "REVIEW": 35
+      },
+      "validation_status": {
+        "None": 48
+      },
+      "validation_errors": {
+        "operations[0] inferred slot needs message, actor and state provenance": 1,
+        "operations[1] inferred slot needs message, actor and state provenance": 1
+      },
+      "review_reasons": {
+        "model output truncated at max_tokens": 3
+      },
+      "cost_usd": 0.01737256,
+      "attempts": 48,
+      "model_latency_p50_ms": 6514.323,
+      "model_latency_p95_ms": 15416.58,
+      "response_origins": {
+        "legacy_engine": 16,
+        "null": 32
+      }
+    },
+    "generated": {
+      "conversations": 12,
+      "turns": 48,
+      "responses_or_candidates": 48,
+      "review_status": {
+        "SENT": 13,
+        "PENDING": 29,
+        "REVIEW": 6
+      },
+      "validation_status": {
+        "OK": 13,
+        "REVIEW": 29,
+        "None": 6
+      },
+      "validation_errors": {
+        "operations[0] inferred slot needs message, actor and state provenance": 1,
+        "operations[1] inferred slot needs message, actor and state provenance": 1,
+        "operations[0] extra slot duplicates primary kind 'vehicle'": 1,
+        "operations[0] extra slot evidence does not support vehicle": 1
+      },
+      "review_reasons": {
+        "UNSUPPORTED_SPECIFIC_DETAIL": 1,
+        "UNSUPPORTED_PERSONAL_DETAIL": 17,
+        "QUESTION_NOT_ALLOWED": 5,
+        "CLAIM_VALUE_MISMATCH": 2,
+        "MESSAGE_EVIDENCE_MISMATCH": 2,
+        "CLAIM_NEGATION_MISMATCH": 2
+      },
+      "cost_usd": 0.04473844499999999,
+      "attempts": 48,
+      "model_latency_p50_ms": 11171.502499999999,
+      "model_latency_p95_ms": 23244.26,
+      "response_origins": {
+        "engine_approved_fallback": 1,
+        "generated_candidate": 47
+      }
+    }
+  }
+}

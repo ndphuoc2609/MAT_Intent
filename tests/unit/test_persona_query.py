@@ -7,6 +7,22 @@ class TestPersonaQuery(unittest.TestCase):
     def query(self, text, **kwargs):
         return parse_persona_query(text, "message-1", "actor-1", **kwargs)
 
+    def test_persona_address_and_color_questions(self):
+        for text, topic, key in (
+            ("Bác mua xe ở đâu cầu giấy", "purchase_finance", "purchase.dealer"),
+            ("Bác đi màu gì", "vehicle_current", "vehicle.current.color"),
+            ("Chú đi xe gì", "vehicle_current", "vehicle.current.model"),
+            ("Anh mua xe ở đại lý nào", "purchase_finance", "purchase.dealer"),
+        ):
+            with self.subTest(text=text):
+                result = self.query(text)
+                self.assertEqual((result["topic"], result["canonical_keys"]), (topic, [key]))
+        self.assertEqual(self.query("đừng hỏi bác mua xe ở đâu")["topic"], "none")
+
+    def test_addressed_occupation_and_dealer_followup(self):
+        self.assertEqual(self.query('anh làm nghề gì')['canonical_keys'], ['occupation.title'])
+        self.assertEqual(self.query('xe đó bác mua ở đâu')['canonical_keys'], ['purchase.dealer'])
+
     def test_age_question_uses_registered_identity_key_and_exact_current_evidence(self):
         result = self.query("Bạn bao nhiêu tuổi rồi?")
         self.assertEqual(result, {
@@ -33,6 +49,26 @@ class TestPersonaQuery(unittest.TestCase):
         result = self.query("Bạn mua xe ở đại lý nào?")
         self.assertEqual(result["topic"], "purchase_finance")
         self.assertEqual(result["canonical_keys"], ["purchase.dealer"])
+
+    def test_persona_purchase_questions_keep_legacy_keys(self):
+        year = self.query("Bạn mua xe năm nào?")
+        finance = self.query("Bạn mua xe trả thẳng không?")
+        self.assertEqual(year["canonical_keys"], ["purchase.year"])
+        self.assertEqual(finance["canonical_keys"], ["purchase.finance_method"])
+        self.assertEqual(self.query("Bạn mua xe tháng mấy?")["canonical_keys"], ["purchase.date"])
+
+    def test_first_car_statement_about_the_user_is_not_a_persona_query(self):
+        for text in ("Xe mình là chiếc xe đầu tiên, bạn thấy sao?",
+                     "Xe của tôi là chiếc xe đầu tiên, bạn nghĩ gì?"):
+            with self.subTest(text=text):
+                self.assertEqual(self.query(text)["topic"], "none")
+
+    def test_first_car_question_must_point_to_the_persona(self):
+        for text in ("Xe của bạn có phải xe đầu đời không?", "Xe bạn có phải xe đầu đời không?"):
+            with self.subTest(text=text):
+                result = self.query(text)
+                self.assertEqual(result["topic"], "vehicle_current")
+                self.assertEqual(result["canonical_keys"], ["vehicle.current.first_car"])
 
     def test_customer_question_and_product_question_do_not_become_persona_queries(self):
         for text in ("Tôi mua Creta ở đại lý nào?", "Creta có mấy túi khí?"):
@@ -101,6 +137,22 @@ class TestPersonaQuery(unittest.TestCase):
         self.assertEqual(result["topic"], "unknown")
         self.assertIsNone(result["evidence_excerpt"])
         self.assertTrue(result["needs_clarification"])
+
+    def test_multiple_questions_preserve_original_evidence_and_subject(self):
+        from app.persona_query import parse_persona_questions
+        text = "Bác đi con gì, làm nghề gì?"
+        questions = parse_persona_questions(text, "m", "a")
+        self.assertEqual([q['topic'] for q in questions], ['vehicle_current', 'occupation'])
+        self.assertTrue(all(q['evidence_excerpt'] in text for q in questions))
+        self.assertTrue(all(q['evidence_actor_id'] == 'a' for q in questions))
+
+    def test_multiple_question_parser_keeps_size_and_semantic_gates(self):
+        from app.persona_query import parse_persona_questions
+        questions = parse_persona_questions('x' * 10001 + ', Bạn làm nghề gì?', 'm', 'a')
+        self.assertEqual(questions[0]['topic'], 'unknown')
+        questions = parse_persona_questions('Bạn đi xe gì, làm nghề gì?', 'm', 'a',
+                                           semantic={'scope': 'out_of_scope'})
+        self.assertEqual(questions[0]['topic'], 'none')
 
     def test_registry_is_closed_and_covers_all_persona_topics(self):
         expected = {"identity", "family", "occupation", "residence", "vehicle_current",

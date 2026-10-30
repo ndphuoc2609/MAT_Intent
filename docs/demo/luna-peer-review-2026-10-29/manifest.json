@@ -1,0 +1,200 @@
+{
+  "started_at": "2026-10-29T13:23:22+0700",
+  "base": "http://127.0.0.1:8771",
+  "cases": [
+    {
+      "id": "original",
+      "turns": [
+        [
+          "Bác chạy bao lâu rồi",
+          "a"
+        ],
+        [
+          "Creta giống bác",
+          "a"
+        ],
+        [
+          "tôi có xe rồi",
+          "a"
+        ],
+        [
+          "Cảm ơn bác",
+          "a"
+        ]
+      ]
+    },
+    {
+      "id": "owner",
+      "turns": [
+        [
+          "Chào bác, tôi có xe rồi",
+          "a"
+        ],
+        [
+          "Bác đang đi xe gì",
+          "a"
+        ],
+        [
+          "Bác đi màu gì",
+          "a"
+        ],
+        [
+          "ok bác",
+          "a"
+        ]
+      ]
+    },
+    {
+      "id": "buying",
+      "turns": [
+        [
+          "Bác ơi, tôi cũng tính mua xe",
+          "a"
+        ],
+        [
+          "Creta",
+          "a"
+        ],
+        [
+          "tháng sau",
+          "a"
+        ],
+        [
+          "trả góp",
+          "a"
+        ],
+        [
+          "cảm ơn bác",
+          "a"
+        ]
+      ]
+    },
+    {
+      "id": "switch",
+      "turns": [
+        [
+          "Tôi có xe rồi nhưng muốn đổi",
+          "a"
+        ],
+        [
+          "Tucson",
+          "a"
+        ],
+        [
+          "cuối năm nay",
+          "a"
+        ],
+        [
+          "tôi chưa quyết định trả góp hay trả thẳng",
+          "a"
+        ]
+      ]
+    },
+    {
+      "id": "third_party",
+      "turns": [
+        [
+          "Anh tôi tính mua Creta",
+          "a"
+        ],
+        [
+          "Tôi chỉ hỏi hộ thôi",
+          "a"
+        ],
+        [
+          "Bác chạy bao lâu rồi",
+          "a"
+        ],
+        [
+          "Cảm ơn bác",
+          "a"
+        ]
+      ]
+    },
+    {
+      "id": "decline",
+      "turns": [
+        [
+          "Tôi cũng tính mua xe",
+          "a"
+        ],
+        [
+          "không cần đâu, đừng hỏi nữa",
+          "a"
+        ],
+        [
+          "Bác đi màu gì",
+          "a"
+        ],
+        [
+          "thôi nhé",
+          "a"
+        ]
+      ]
+    },
+    {
+      "id": "correction",
+      "turns": [
+        [
+          "Mình cũng tính mua Creta",
+          "a"
+        ],
+        [
+          "Không phải tôi mua, tôi hỏi hộ anh tôi",
+          "a"
+        ],
+        [
+          "Bác dùng xe bao lâu rồi",
+          "a"
+        ],
+        [
+          "hôm nay mưa to ghê",
+          "a"
+        ]
+      ]
+    },
+    {
+      "id": "two_actors",
+      "turns": [
+        [
+          "Bác chạy bao lâu rồi",
+          "a"
+        ],
+        [
+          "Tôi cũng tính mua xe",
+          "b"
+        ],
+        [
+          "tôi có xe rồi",
+          "a"
+        ],
+        [
+          "Creta",
+          "b"
+        ],
+        [
+          "Cảm ơn bác",
+          "a"
+        ],
+        [
+          "tháng sau",
+          "b"
+        ]
+      ]
+    }
+  ],
+  "sha256": {
+    "app/engine.py": "4b0a03d74e9cfe3fb46b56bab51ce9b37be6a4fe7a0d7e64db02bae734d54278",
+    "app/lead_flow.py": "53cf7c43803c7768cfc9edcb444d213333ac67d6f574e47bf39cc53527b2c94e",
+    "app/persona_fixture.py": "f2893c7c5f76cbc6dca718a3292bc2802909dd9f22212689be12bb4c3bef0196",
+    "app/persona_query.py": "ab22e88604bd6f6aeecfe3ef27980a536bf8697c5b687726dcad4af9672aa15d",
+    "app/adapters/luna.py": "8df9a8619d971a9a888e626619062ff61969fbd8495f8af0edc1438f5e636cb5",
+    "sandbox/server.py": "2c33b6ebe16e3fe7d8e52c11d4272ec8a0ec1dd575394519ad4f08adab396b56"
+  },
+  "finished_at": "2026-10-29T13:27:33+0700",
+  "recorded_turns": 35,
+  "luna_attempts": 36,
+  "known_luna_cost": 0.013476025,
+  "unknown_cost_turns": 0,
+  "source_unchanged_after_run": true
+}

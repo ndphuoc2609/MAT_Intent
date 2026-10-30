@@ -1,0 +1,67 @@
+{
+  "schema_version": "persona_evaluation_summary_v1",
+  "human_evaluation": {
+    "status": "incomplete",
+    "distinct_labelers_per_item": 2,
+    "independence_attestation_required": true,
+    "independence_identity_verified": false,
+    "labeled_items": 0,
+    "expected_items": 12,
+    "missing_items": [
+      "item-001",
+      "item-002",
+      "item-003",
+      "item-004",
+      "item-005",
+      "item-006",
+      "item-007",
+      "item-008",
+      "item-009",
+      "item-010",
+      "item-011",
+      "item-012"
+    ],
+    "labeler_count": 0,
+    "criteria": null,
+    "candidate_naturalness_better_pairs": null,
+    "candidate_naturalness_tied_pairs": null,
+    "candidate_naturalness_worse_pairs": null,
+    "critical_flags": null
+  },
+  "variants": {
+    "legacy-v2-combined-20261030": {
+      "model_version": "openai/gpt-6-luna",
+      "prompt_version": "luna_system_v2",
+      "response_count": 48,
+      "latency_ms_p50": 6514.323,
+      "latency_ms_p95": 15416.58,
+      "missing_response_count": 32,
+      "known_cost_total_usd": 0.01737256,
+      "cost_unknown_count": 0,
+      "cost_total_usd": 0.01737256,
+      "fallback_count": 0,
+      "fallback_rate": 0.0,
+      "review_count": 35,
+      "known_attempts_total": 48,
+      "attempts_unknown_count": 0,
+      "attempts_total": 48
+    },
+    "generated-v2-combined-20261030": {
+      "model_version": "openai/gpt-6-luna",
+      "prompt_version": "persona_turn_v1",
+      "response_count": 48,
+      "latency_ms_p50": 11171.502499999999,
+      "latency_ms_p95": 23244.26,
+      "missing_response_count": 0,
+      "known_cost_total_usd": 0.04473844,
+      "cost_unknown_count": 0,
+      "cost_total_usd": 0.04473844,
+      "fallback_count": 1,
+      "fallback_rate": 0.020833333333333332,
+      "review_count": 35,
+      "known_attempts_total": 48,
+      "attempts_unknown_count": 0,
+      "attempts_total": 48
+    }
+  }
+}

@@ -1,0 +1,90 @@
+[
+  {
+    "case": "correction",
+    "text": "Mình cũng tính mua Creta",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Bạn cũng đang tính mua xe à, mình cùng trao đổi nhé.\n\nBạn tính khoảng khi nào sẽ mua xe?",
+    "pending": [
+      "purchase_timeline"
+    ],
+    "lead": {
+      "interested_vehicle": {
+        "value": "Creta",
+        "evidence": "Mình cũng tính mua Creta",
+        "source_message_id": "e331bb7050aa487698c86f22a3d5bce2-1",
+        "updated_at": "2026-10-29T06:36:02.580628+00:00",
+        "status": "ANSWERED"
+      },
+      "purchase_timeline": {
+        "value": null,
+        "evidence": null,
+        "source_message_id": "e331bb7050aa487698c86f22a3d5bce2-1",
+        "updated_at": "2026-10-29T06:36:02.580628+00:00",
+        "status": "ASKED"
+      }
+    },
+    "attempts": 1,
+    "cost": 0.00025036,
+    "errors": []
+  },
+  {
+    "case": "correction",
+    "text": "Không phải tôi mua, tôi hỏi hộ anh tôi",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Ừ bạn, mình hiểu nhầm rồi, xin lỗi nhé.",
+    "pending": [],
+    "lead": {
+      "interested_vehicle": {
+        "value": null,
+        "evidence": "Không phải tôi mua, tôi hỏi hộ anh tôi",
+        "source_message_id": "e331bb7050aa487698c86f22a3d5bce2-2",
+        "updated_at": "2026-10-29T06:36:09.246709+00:00",
+        "status": "DECLINED"
+      },
+      "purchase_timeline": {
+        "value": null,
+        "evidence": "Không phải tôi mua, tôi hỏi hộ anh tôi",
+        "source_message_id": "e331bb7050aa487698c86f22a3d5bce2-2",
+        "updated_at": "2026-10-29T06:36:09.246709+00:00",
+        "status": "DECLINED"
+      }
+    },
+    "attempts": 1,
+    "cost": 0.00042961,
+    "errors": []
+  },
+  {
+    "case": "proxy",
+    "text": "Anh tôi tính mua Creta",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "Ừ, mình cùng bạn tìm hiểu cho người nhà nhé.",
+    "pending": [],
+    "lead": {},
+    "attempts": 1,
+    "cost": 0.00032561,
+    "errors": []
+  },
+  {
+    "case": "proxy",
+    "text": "Tôi chỉ hỏi hộ thôi",
+    "routing": [
+      "SOCIAL_ACK",
+      "answer_persona"
+    ],
+    "response": "À, bạn đang hỏi giúp người nhà à.",
+    "pending": [],
+    "lead": {},
+    "attempts": 1,
+    "cost": 0.00024761,
+    "errors": []
+  }
+]

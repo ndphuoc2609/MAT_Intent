@@ -8,26 +8,27 @@
   <script src="/static/app.js" defer></script>
 </head>
 <body>
-  <header><div><p class="eyebrow">HYUNDAI · INTENT SANDBOX</p><h1>Chọn persona, tạo bài viết, rồi trò chuyện.</h1><p>Luna phân tích comment; engine giữ state, kiểm tra dữ kiện và trả hướng xử lý.</p></div><span class="badge">Chỉ gửi mô phỏng</span></header>
-  <aside class="disclosure"><strong>Hội thoại thử nghiệm.</strong> Chọn persona và mẫu xe để tạo bài viết bằng OpenRouter. Nội dung persona, bài viết và comment được gửi tới OpenRouter; Luna và Jev phân tích comment song song và có thể phát sinh phí riêng. Không gửi Facebook, tạo lịch hẹn, lead hay đặt cọc thật.</aside>
+  <header><div><p class="eyebrow">PERSONA · INTENT SANDBOX</p><h1>Chọn persona, tạo bài viết, rồi trò chuyện.</h1><p>Luna phân tích comment; engine giữ state, kiểm tra dữ kiện và trả hướng xử lý.</p></div><span class="badge">Chỉ gửi mô phỏng</span></header>
+  <aside class="disclosure"><strong>Sandbox dùng FakeSender.</strong> Nội dung được tạo bằng OpenRouter; không gửi lên Facebook thật. Fact mới do Luna đề xuất được lưu riêng theo persona và luôn gắn nhãn <code>generated</code>. Fact này có thể hư cấu; kiểm tra nhất quán không chứng minh nó đúng ngoài đời. Fact chỉ dùng tiếp sau khi bài được tạo hoặc câu trả lời được gửi mô phỏng thành công, và có thể thu hồi ở phần thông tin persona.</aside>
   <p id="model-status" class="status" role="status">Đang kiểm tra kết nối máy chủ…</p>
   <main>
     <section class="setup panel" aria-labelledby="setup-title">
       <p class="eyebrow">01 · BỐI CẢNH</p><h2 id="setup-title">Bắt đầu hội thoại</h2>
       <form id="setup-form">
         <label for="persona-select">Persona viết bài</label><select id="persona-select"><option value="">Đang tải…</option></select>
-        <label for="vehicle-select">Mẫu xe trong bài</label><select id="vehicle-select"><option value="">Đang tải…</option></select>
+        <label for="channel-select">Kênh comment</label><select id="channel-select"><option value="public">Bình luận công khai</option><option value="private">Tin nhắn riêng</option></select>
+        <p class="muted">Ở bình luận công khai, persona không hỏi số điện thoại hoặc địa chỉ riêng.</p>
         <button type="submit" id="start">Tạo bài viết</button>
       </form>
       <label for="conversation-select">Hội thoại trong phiên này</label><select id="conversation-select"><option value="">Chưa có hội thoại</option></select>
       <div class="post-preview"><h3>Bài viết hiện tại</h3><p id="post-preview">Chọn bài viết rồi tạo hội thoại.</p><p id="post-timing" class="muted"></p><p id="scope" class="muted"></p>
-        <details id="persona-release-box" hidden><summary>Fact và câu được phép dùng cho persona</summary><p id="persona-release-note" class="muted"></p><ul id="persona-facts"></ul><ul id="persona-utterances"></ul></details>
+        <details id="persona-release-box" hidden><summary>Fact persona</summary><p id="persona-release-note" class="muted"></p><ul id="persona-facts"></ul><h4>Fact mới do Luna tạo · <code>generated</code></h4><ul id="generated-facts"></ul></details>
       </div>
     </section>
     <section class="chat panel" aria-labelledby="chat-title">
       <p class="eyebrow">02 · HỘI THOẠI</p><h2 id="chat-title">Bạn muốn hỏi gì?</h2>
       <div id="history" class="history" aria-live="polite"><p class="empty">Tạo bài viết theo persona trước, sau đó nhập comment ở đây.</p></div>
-      <form id="turn-form"><label for="turn-text">Comment của bạn</label><textarea id="turn-text" rows="3" maxlength="10000" placeholder="Ví dụ: Giá lăn bánh Creta bao nhiêu?" required disabled></textarea><div class="composer-footer"><span class="muted">Enter xuống dòng · Shift+Enter để xuống dòng</span><button id="send" type="submit" disabled>Gửi comment</button></div></form>
+      <form id="turn-form"><label for="actor-select">Người bình luận</label><select id="actor-select"><option value="customer-1">Người 1</option><option value="customer-2">Người 2</option></select><label for="turn-text">Comment của bạn</label><textarea id="turn-text" rows="3" maxlength="10000" placeholder="Ví dụ: Giá lăn bánh Creta bao nhiêu?" required disabled></textarea><div class="composer-footer"><span class="muted">Enter xuống dòng · Shift+Enter để xuống dòng</span><button id="send" type="submit" disabled>Gửi comment</button></div></form>
       <p id="progress" class="muted" role="timer" aria-live="off"></p>
       <p id="error" class="error" role="alert"></p>
     </section>
@@ -37,6 +38,7 @@
       <h3>Semantic operations</h3><pre id="semantic">Chưa có diễn giải</pre>
       <h3>Requests đang mở & slots</h3><pre id="requests">[]</pre>
       <h3>Câu hỏi / đề xuất đang chờ</h3><pre id="pending">[]</pre>
+      <h3>Hồ sơ lead · bằng chứng từ comment</h3><pre id="lead-profile">{}</pre>
       <details><summary>Fake-send ledger · chỉ mô phỏng</summary><pre id="fake-sends">[]</pre></details>
       <details><summary>Outbox</summary><pre id="outbox">[]</pre></details>
     </section>
