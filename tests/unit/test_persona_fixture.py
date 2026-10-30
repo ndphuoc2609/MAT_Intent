@@ -77,6 +77,19 @@ class PersonaFixtureTests(unittest.TestCase):
         other = seed_database_persona(self.store, dict(source, id='person-18', name='An'))
         self.assertNotEqual(first[0], other[0])
 
+    def test_database_description_is_retained_and_changes_release_on_update(self):
+        from app.persona_fixture import seed_database_persona
+        source = dict(id='description-test', name='Linh', occupation='Giáo viên',
+            car_owned='Hyundai Tucson', category='Gia đình', role='Người viết bài',
+            perspective='Chia sẻ ngắn gọn', sample_quote='Chào bạn nhé', tone='warm')
+        first = seed_database_persona(self.store, source)
+        snapshot = self.store.get_release_snapshot(*first)
+        self.assertEqual(snapshot['release']['style']['persona_description'],
+            {key: source[key] for key in ('category', 'role', 'perspective', 'sample_quote')})
+        second = seed_database_persona(self.store, dict(source, perspective='Thích câu trả lời ngắn'))
+        self.assertEqual(first[0], second[0])
+        self.assertNotEqual(first[1], second[1])
+
     def test_fixture_contains_draft_details_without_inventing_dates(self):
         persona_id, release_id = seed_nam_creta(self.store)
         facts = {f["key"]: f for f in self.store.get_release_snapshot(persona_id, release_id)["facts"]}

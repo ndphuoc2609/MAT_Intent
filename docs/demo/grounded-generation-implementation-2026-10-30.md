@@ -65,3 +65,11 @@ Artifacts chỉ ở `/tmp`: `/tmp/persona-legacy-current.json` và `/tmp/persona
 - Không có transcript khách thật hoặc chấm mù bởi người; số liệu A/B đo routing/gate, không chứng minh hội thoại tự nhiên hơn.
 - Generated story là nội dung tổng hợp, có thể sai sự thật dù qua kiểm tra. Auto-send hiện chỉ tới FakeSender. Nếu sau này bật Meta thật, cần hiểu rằng fact do Luna tạo có thể bị gửi ra ngoài như lời persona; hiện cổng Meta vẫn tắt.
 - Không kiểm thử tải production, Meta Graph API hoặc chi phí Jev shadow.
+
+## Bổ sung sau lỗi tạo bài
+
+Đã nhập các trường `category`, `role`, `perspective`, `sample_quote` của persona DB vào release và ngữ cảnh tạo bài/trả lời. Thay đổi các trường này tạo release mới; ID nguồn DB không đưa sang model. Câu mẫu hướng dẫn giọng nói và không tự trở thành bằng chứng cho trải nghiệm cá nhân.
+
+Tạo bài cấp các fact hợp lệ khi needs chọn rỗng; prompt phân biệt predicate fact có sẵn với `gen.*`, giới hạn lời thêm không nguồn và có một lần thử lại khi post JSON sai hợp đồng. Giữ nguyên validator nguồn.
+
+Kiểm chứng mới: 608 unit tests và 92 integration tests OK; syntax/compilation/diff check đạt. Hai lần tạo bài bằng Luna thật trên Nam và Linh synthetic qua validator. Sau khi khởi động lại sandbox 8770, tạo bài qua HTTP API trả 201 và validation OK. Số liệu A/B phía trên thuộc phiên bản trước bổ sung này; chưa chạy lại A/B hoặc chấm người cho bổ sung này.

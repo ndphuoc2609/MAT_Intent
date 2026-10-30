@@ -282,6 +282,7 @@ class PersonaGenerationRuntime:
             result = dict(peer_state=peer_state, persona_uuid=snapshot['persona_uuid'], release_id=snapshot['release_id'],
                 fixture_only=snapshot.get('fixture_only', False), source_kind=snapshot.get('source_kind'),
                 facts=facts, memories=memories, voice_guide=voice, messages=messages,
+                persona_description=copy.deepcopy(snapshot.get('snapshot', {}).get('release', {}).get('style', {}).get('persona_description', {})),
                 persona_authored_post=authored_post if isinstance(authored_post, dict) else None,
                 persona_authored_fact_ids=sorted(authored_ids & {fact['fact_id'] for fact in facts}),
                 needs=copy.deepcopy(needs) if isinstance(needs, dict) else None, gaps=gaps,
